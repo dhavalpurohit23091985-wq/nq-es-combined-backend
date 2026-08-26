@@ -10,16 +10,17 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
-# Latest delta received from each instrument
 latest_delta = {
     "NQ": None,
     "ES": None
 }
 
-# Current combined trading state
-# 0 = neutral
-# 1 = BUY
-# -1 = SELL
+latest_price = {
+    "NQ": None,
+    "ES": None,
+    "JPN": None
+}
+
 state = 0
 
 THRESHOLD = 1000
@@ -53,6 +54,8 @@ def home():
         "threshold": THRESHOLD,
         "nq_delta": latest_delta["NQ"],
         "es_delta": latest_delta["ES"],
+        "nq_price": latest_price["NQ"],
+        "jpn_price": latest_price["JPN"],
         "state": state
     })
 
@@ -74,6 +77,33 @@ def webhook():
     symbol = str(data.get("symbol", "")).upper()
 
     try:
+        price = float(data.get("price"))
+    except (TypeError, ValueError):
+        return jsonify({
+            "ok": False,
+            "error": "invalid price"
+        }), 400
+
+    # -------------------------
+    # JPN PRICE UPDATE ONLY
+    # -------------------------
+
+    if "JPN" in symbol or "NIY" in symbol:
+
+        latest_price["JPN"] = price
+
+        return jsonify({
+            "ok": True,
+            "instrument_updated": "JPN",
+            "jpn_price": price,
+            "signal": None
+        })
+
+    # -------------------------
+    # NQ / ES DELTA UPDATE
+    # -------------------------
+
+    try:
         delta = float(data.get("delta"))
     except (TypeError, ValueError):
         return jsonify({
@@ -81,29 +111,29 @@ def webhook():
             "error": "invalid delta"
         }), 400
 
-    # Accept NQ / NQ1! and ES / ES1!
     if "NQ" in symbol:
         instrument = "NQ"
+
     elif "ES" in symbol:
         instrument = "ES"
+
     else:
         return jsonify({
             "ok": False,
-            "error": "symbol must be NQ or ES"
+            "error": "symbol must be NQ, ES or JPN"
         }), 400
 
     latest_delta[instrument] = delta
+    latest_price[instrument] = price
 
-    # Wait until both have sent at least one update
+    # Wait until both NQ and ES have values
     if (
         latest_delta["NQ"] is None
         or latest_delta["ES"] is None
     ):
         return jsonify({
             "ok": True,
-            "message": "waiting for both instruments",
-            "nq_delta": latest_delta["NQ"],
-            "es_delta": latest_delta["ES"]
+            "message": "waiting for NQ and ES"
         })
 
     nq_delta = latest_delta["NQ"]
@@ -113,22 +143,40 @@ def webhook():
 
     signal = None
 
-    # BUY only when combined crosses/qualifies +1000
     if combined >= THRESHOLD and state != 1:
         state = 1
         signal = "BUY"
 
-    # SELL only when combined crosses/qualifies -1000
     elif combined <= -THRESHOLD and state != -1:
         state = -1
         signal = "SELL"
 
     if signal:
+
+        nq_price = latest_price["NQ"]
+        jpn_price = latest_price["JPN"]
+
+        nq_price_text = (
+            f"{nq_price:.2f}"
+            if nq_price is not None
+            else "NA"
+        )
+
+        jpn_price_text = (
+            f"{jpn_price:.2f}"
+            if jpn_price is not None
+            else "NA"
+        )
+
         title = f"NQ + ES {signal}"
 
         message = (
-            f"{signal} | Combined Delta {combined:.0f} | "
-            f"NQ {nq_delta:.0f} | ES {es_delta:.0f}"
+            f"{signal} | "
+            f"Combined Delta {combined:.0f} | "
+            f"NQ Delta {nq_delta:.0f} | "
+            f"ES Delta {es_delta:.0f} | "
+            f"NQ {nq_price_text} | "
+            f"JPN {jpn_price_text}"
         )
 
         send_pushover(title, message)
@@ -139,12 +187,15 @@ def webhook():
         "nq_delta": nq_delta,
         "es_delta": es_delta,
         "combined_delta": combined,
+        "nq_price": latest_price["NQ"],
+        "jpn_price": latest_price["JPN"],
         "signal": signal,
         "state": state
     })
 
 
 if __name__ == "__main__":
+
     port = int(os.environ.get("PORT", 10000))
 
     app.run(
