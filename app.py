@@ -27,14 +27,9 @@ latest_price = {
 
 # --------------------------------------------------
 # COMBINED SIGNAL STATE
-#
-# 0  = no signal yet
-# 1  = BUY
-# -1 = SELL
 # --------------------------------------------------
 
 state = 0
-
 THRESHOLD = 1000
 
 # --------------------------------------------------
@@ -121,6 +116,29 @@ def webhook():
     # --------------------------------------------------
 
     data = request.get_json(silent=True) or {}
+
+    # --------------------------------------------------
+    # DIRECT PUSHOVER MODE
+    #
+    # Accepts TradingView payload like:
+    # {"title":"NQ CLUSTER SELL","message":"SELL ENTRY | ..."}
+    # --------------------------------------------------
+
+    if "title" in data and "message" in data:
+
+        ok = send_pushover(
+            str(data.get("title", "TradingView Alert")),
+            str(data.get("message", ""))
+        )
+
+        return jsonify({
+            "ok": ok,
+            "mode": "direct_pushover"
+        }), 200 if ok else 500
+
+    # --------------------------------------------------
+    # COMBINED NQ / ES / JPN MODE
+    # --------------------------------------------------
 
     symbol = str(
         data.get("symbol", "")
