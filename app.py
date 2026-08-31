@@ -49,7 +49,7 @@ entry_jpn_price = None
 # BTC LIQUIDATION STATE
 # ==================================================
 
-BTC_LIQ_THRESHOLD = 1_000_000
+BTC_LIQ_THRESHOLD = 10_000_000
 
 # 0 = WAIT
 # 1 = BUY already alerted
