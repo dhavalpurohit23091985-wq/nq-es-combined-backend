@@ -543,6 +543,103 @@ def test_btc_symbols():
         return jsonify({
             "error": str(e)
         }), 500
+        @app.route("/test-btc-aggregate", methods=["GET"])
+def test_btc_aggregate():
+    import time
+
+    now = int(time.time())
+    one_hour_ago = now - 3600
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+        # 1) Get all supported futures markets
+        markets_response = requests.get(
+            "https://api.coinalyze.net/v1/future-markets",
+            headers=headers,
+            timeout=10
+        )
+
+        markets = markets_response.json()
+
+        # 2) Keep only BTC perpetual contracts
+        btc_symbols = []
+
+        if markets_response.status_code == 200:
+            for market in markets:
+                if (
+                    market.get("base_asset") == "BTC"
+                    and market.get("is_perpetual") is True
+                ):
+                    symbol = market.get("symbol")
+                    if symbol:
+                        btc_symbols.append(symbol)
+
+        # Remove duplicates
+        btc_symbols = list(dict.fromkeys(btc_symbols))
+
+        long_total = 0.0
+        short_total = 0.0
+
+        liquidation_url = "https://api.coinalyze.net/v1/liquidation-history"
+
+        # Coinalyze allows max 20 symbols per request
+        for i in range(0, len(btc_symbols), 20):
+            batch = btc_symbols[i:i + 20]
+
+            params = {
+                "symbols": ",".join(batch),
+                "interval": "1min",
+                "from": one_hour_ago,
+                "to": now,
+                "convert_to_usd": "true"
+            }
+
+            response = requests.get(
+                liquidation_url,
+                params=params,
+                headers=headers,
+                timeout=15
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+
+            for symbol_data in data:
+                history = symbol_data.get("history", [])
+
+                for row in history:
+                    long_total += float(row.get("l", 0) or 0)
+                    short_total += float(row.get("s", 0) or 0)
+
+        # 3) Net difference
+        net = short_total - long_total
+
+        if net >= 1_000_000:
+            signal = "BUY"
+        elif net <= -1_000_000:
+            signal = "SELL"
+        else:
+            signal = "WAIT"
+
+        return jsonify({
+            "status_code": 200,
+            "window": "rolling_last_60_minutes",
+            "btc_perpetual_symbols": len(btc_symbols),
+            "long_liquidations_usd": round(long_total, 2),
+            "short_liquidations_usd": round(short_total, 2),
+            "net_short_minus_long_usd": round(net, 2),
+            "signal": signal
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
 if __name__ == "__main__":
 
 
