@@ -1,16 +1,8 @@
 import os
-import time
-
 from flask import Flask, request, jsonify
 import requests
 
-
 app = Flask(__name__)
-
-
-# ==================================================
-# ENVIRONMENT
-# ==================================================
 
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
@@ -21,7 +13,7 @@ PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
 # ==================================================
-# NQ / ES LIVE DATA
+# LIVE DATA
 # ==================================================
 
 latest_delta = {
@@ -37,11 +29,16 @@ latest_price = {
 
 
 # ==================================================
-# NQ + ES STATE
+# NQ + ES COMBINED SIGNAL STATE
 # ==================================================
 
 state = 0
 THRESHOLD = 1000
+
+
+# ==================================================
+# TRADE JOURNAL STATE
+# ==================================================
 
 entry_side = None
 entry_nq_price = None
@@ -49,15 +46,14 @@ entry_jpn_price = None
 
 
 # ==================================================
-# BTC LIQUIDATION SETTINGS
+# BTC LIQUIDATION STATE
 # ==================================================
 
 BTC_LIQ_THRESHOLD = 1_000_000
 
-# 0 = neutral / WAIT
+# 0 = WAIT
 # 1 = BUY already alerted
 # -1 = SELL already alerted
-
 btc_liq_state = 0
 
 
@@ -66,9 +62,6 @@ btc_liq_state = 0
 # ==================================================
 
 def send_pushover(title, message):
-
-    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
-        return False
 
     payload = {
         "token": PUSHOVER_TOKEN,
@@ -104,10 +97,8 @@ def home():
 
     return jsonify({
         "status": "ok",
-        "service": "NQ + ES + BTC Liquidation Backend",
-
-        "nq_es_threshold": THRESHOLD,
-        "btc_liquidation_threshold": BTC_LIQ_THRESHOLD,
+        "service": "NQ + ES Combined Delta Backend",
+        "threshold": THRESHOLD,
 
         "nq_delta": latest_delta["NQ"],
         "es_delta": latest_delta["ES"],
@@ -116,12 +107,14 @@ def home():
         "es_price": latest_price["ES"],
         "jpn_price": latest_price["JPN"],
 
-        "nq_es_state": state,
-        "btc_liq_state": btc_liq_state,
+        "state": state,
 
         "entry_side": entry_side,
         "entry_nq_price": entry_nq_price,
-        "entry_jpn_price": entry_jpn_price
+        "entry_jpn_price": entry_jpn_price,
+
+        "btc_liq_threshold": BTC_LIQ_THRESHOLD,
+        "btc_liq_state": btc_liq_state
     })
 
 
@@ -137,6 +130,10 @@ def webhook():
     global entry_nq_price
     global entry_jpn_price
 
+    # --------------------------------------------------
+    # SECURITY
+    # --------------------------------------------------
+
     secret = request.args.get("secret", "")
 
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
@@ -146,9 +143,11 @@ def webhook():
             "error": "unauthorized"
         }), 401
 
+    # --------------------------------------------------
+    # READ JSON
+    # --------------------------------------------------
 
     data = request.get_json(silent=True) or {}
-
 
     # --------------------------------------------------
     # DIRECT PUSHOVER MODE
@@ -166,11 +165,17 @@ def webhook():
             "mode": "direct_pushover"
         }), 200 if ok else 500
 
+    # --------------------------------------------------
+    # COMBINED NQ / ES / JPN MODE
+    # --------------------------------------------------
 
     symbol = str(
         data.get("symbol", "")
     ).upper()
 
+    # --------------------------------------------------
+    # PRICE
+    # --------------------------------------------------
 
     try:
 
@@ -185,9 +190,8 @@ def webhook():
             "error": "invalid price"
         }), 400
 
-
     # --------------------------------------------------
-    # JPN
+    # JPN PRICE UPDATE ONLY
     # --------------------------------------------------
 
     if "JPN" in symbol or "NIY" in symbol:
@@ -201,9 +205,8 @@ def webhook():
             "signal": None
         })
 
-
     # --------------------------------------------------
-    # NQ / ES DELTA
+    # NQ / ES NEED DELTA
     # --------------------------------------------------
 
     try:
@@ -219,6 +222,9 @@ def webhook():
             "error": "invalid delta"
         }), 400
 
+    # --------------------------------------------------
+    # IDENTIFY INSTRUMENT
+    # --------------------------------------------------
 
     if "NQ" in symbol:
 
@@ -235,10 +241,16 @@ def webhook():
             "error": "symbol must be NQ, ES or JPN"
         }), 400
 
+    # --------------------------------------------------
+    # SAVE LATEST VALUES
+    # --------------------------------------------------
 
     latest_delta[instrument] = delta
     latest_price[instrument] = price
 
+    # --------------------------------------------------
+    # WAIT UNTIL BOTH DELTAS EXIST
+    # --------------------------------------------------
 
     if (
         latest_delta["NQ"] is None
@@ -252,6 +264,9 @@ def webhook():
             "es_delta": latest_delta["ES"]
         })
 
+    # --------------------------------------------------
+    # COMBINED DELTA
+    # --------------------------------------------------
 
     nq_delta = latest_delta["NQ"]
     es_delta = latest_delta["ES"]
@@ -260,27 +275,38 @@ def webhook():
 
     signal = None
 
+    # --------------------------------------------------
+    # SIGNAL CHANGE ONLY
+    # --------------------------------------------------
 
-    if combined >= THRESHOLD and state != 1:
+    if (
+        combined >= THRESHOLD
+        and state != 1
+    ):
 
         state = 1
         signal = "BUY"
 
-    elif combined <= -THRESHOLD and state != -1:
+    elif (
+        combined <= -THRESHOLD
+        and state != -1
+    ):
 
         state = -1
         signal = "SELL"
 
+    # --------------------------------------------------
+    # IF SIGNAL CHANGED
+    # --------------------------------------------------
 
     if signal:
 
         current_nq = latest_price["NQ"]
         current_jpn = latest_price["JPN"]
 
-
-        # --------------------------------------------------
-        # CLOSE PREVIOUS
-        # --------------------------------------------------
+        # ==================================================
+        # CLOSE PREVIOUS TRADE
+        # ==================================================
 
         if (
             entry_side is not None
@@ -294,30 +320,25 @@ def webhook():
 
                 nq_points = (
                     current_nq
-                    -
-                    entry_nq_price
+                    - entry_nq_price
                 )
 
                 jpn_points = (
                     current_jpn
-                    -
-                    entry_jpn_price
+                    - entry_jpn_price
                 )
 
             else:
 
                 nq_points = (
                     entry_nq_price
-                    -
-                    current_nq
+                    - current_nq
                 )
 
                 jpn_points = (
                     entry_jpn_price
-                    -
-                    current_jpn
+                    - current_jpn
                 )
-
 
             nq_result = (
                 "PROFIT"
@@ -335,10 +356,11 @@ def webhook():
                 else "FLAT"
             )
 
+            close_title = (
+                f"NQ + ES CLOSED {entry_side}"
+            )
 
-            send_pushover(
-                f"NQ + ES CLOSED {entry_side}",
-
+            close_message = (
                 f"CLOSED {entry_side} | "
                 f"NQ {nq_result} {nq_points:+.2f} pts | "
                 f"JPN {jpn_result} {jpn_points:+.2f} pts | "
@@ -346,6 +368,14 @@ def webhook():
                 f"JPN {current_jpn:.2f}"
             )
 
+            send_pushover(
+                close_title,
+                close_message
+            )
+
+        # ==================================================
+        # SEND NEW BUY / SELL SIGNAL
+        # ==================================================
 
         nq_price_text = (
             f"{current_nq:.2f}"
@@ -359,10 +389,11 @@ def webhook():
             else "NA"
         )
 
+        signal_title = (
+            f"NQ + ES {signal}"
+        )
 
-        send_pushover(
-            f"NQ + ES {signal}",
-
+        signal_message = (
             f"{signal} | "
             f"Combined Delta {combined:.0f} | "
             f"NQ Delta {nq_delta:.0f} | "
@@ -371,11 +402,22 @@ def webhook():
             f"JPN {jpn_price_text}"
         )
 
+        send_pushover(
+            signal_title,
+            signal_message
+        )
+
+        # ==================================================
+        # SAVE NEW ENTRY
+        # ==================================================
 
         entry_side = signal
         entry_nq_price = current_nq
         entry_jpn_price = current_jpn
 
+    # --------------------------------------------------
+    # RESPONSE TO TRADINGVIEW
+    # --------------------------------------------------
 
     return jsonify({
         "ok": True,
@@ -399,35 +441,224 @@ def webhook():
 
 
 # ==================================================
-# GET BTC PERPETUAL SYMBOLS
+# COINALYZE API TEST
 # ==================================================
 
-def get_btc_perpetual_symbols():
+@app.route("/test-coinalyze", methods=["GET"])
+def test_coinalyze():
 
-    response = requests.get(
+    url = "https://api.coinalyze.net/v1/exchanges"
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        return jsonify({
+            "status_code": response.status_code,
+            "response": response.json()
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ==================================================
+# SINGLE BTC SYMBOL LIQUIDATION TEST
+# ==================================================
+
+@app.route("/test-btc-liquidation", methods=["GET"])
+def test_btc_liquidation():
+
+    import time
+
+    now = int(time.time())
+    one_hour_ago = now - 3600
+
+    url = "https://api.coinalyze.net/v1/liquidation-history"
+
+    params = {
+        "symbols": "BTCUSDT_PERP.A",
+        "interval": "1min",
+        "from": one_hour_ago,
+        "to": now,
+        "convert_to_usd": "true"
+    }
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+
+        data = response.json()
+
+        long_total = 0.0
+        short_total = 0.0
+
+        if response.status_code == 200 and data:
+
+            history = data[0].get(
+                "history",
+                []
+            )
+
+            for row in history:
+
+                long_total += float(
+                    row.get("l", 0) or 0
+                )
+
+                short_total += float(
+                    row.get("s", 0) or 0
+                )
+
+        net = short_total - long_total
+
+        if net >= BTC_LIQ_THRESHOLD:
+
+            signal = "BUY"
+
+        elif net <= -BTC_LIQ_THRESHOLD:
+
+            signal = "SELL"
+
+        else:
+
+            signal = "WAIT"
+
+        return jsonify({
+            "status_code": response.status_code,
+            "window": "rolling_last_60_minutes",
+            "long_liquidations_usd": round(
+                long_total,
+                2
+            ),
+            "short_liquidations_usd": round(
+                short_total,
+                2
+            ),
+            "net_short_minus_long_usd": round(
+                net,
+                2
+            ),
+            "signal": signal
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ==================================================
+# GET ALL BTC SYMBOLS
+# ==================================================
+
+@app.route("/test-btc-symbols", methods=["GET"])
+def test_btc_symbols():
+
+    url = "https://api.coinalyze.net/v1/future-markets"
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        data = response.json()
+
+        btc_markets = []
+
+        if response.status_code == 200:
+
+            for market in data:
+
+                if market.get("base_asset") == "BTC":
+
+                    btc_markets.append({
+                        "symbol": market.get("symbol"),
+                        "exchange": market.get("exchange"),
+                        "is_perpetual": market.get("is_perpetual")
+                    })
+
+        return jsonify({
+            "status_code": response.status_code,
+            "count": len(btc_markets),
+            "btc_markets": btc_markets
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ==================================================
+# BTC ALL-EXCHANGE AGGREGATION
+# ==================================================
+
+def get_btc_aggregate():
+
+    import time
+
+    now = int(time.time())
+    one_hour_ago = now - 3600
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    # --------------------------------------------------
+    # GET FUTURES MARKETS
+    # --------------------------------------------------
+
+    markets_response = requests.get(
         "https://api.coinalyze.net/v1/future-markets",
-
-        headers={
-            "api_key": COINALYZE_API_KEY
-        },
-
+        headers=headers,
         timeout=10
     )
 
+    if markets_response.status_code != 200:
 
-    if response.status_code != 200:
-
-        return None, {
+        return {
+            "ok": False,
             "stage": "future-markets",
-            "status_code": response.status_code,
-            "response": response.text
+            "status_code": markets_response.status_code
         }
 
+    markets = markets_response.json()
 
-    markets = response.json()
+    # --------------------------------------------------
+    # BTC PERPETUAL ONLY
+    # --------------------------------------------------
 
     btc_symbols = []
-
 
     for market in markets:
 
@@ -442,43 +673,20 @@ def get_btc_perpetual_symbols():
 
                 btc_symbols.append(symbol)
 
-
+    # Remove duplicates
     btc_symbols = list(
         dict.fromkeys(btc_symbols)
     )
 
-
-    return btc_symbols, None
-
-
-# ==================================================
-# CALCULATE ROLLING LAST 60 MIN BTC LIQUIDATIONS
-# ==================================================
-
-def calculate_btc_liquidations():
-
-    now = int(time.time())
-    one_hour_ago = now - 3600
-
-
-    btc_symbols, error = get_btc_perpetual_symbols()
-
-    if error:
-
-        return None, error
-
-
     long_total = 0.0
     short_total = 0.0
 
-    successful_batches = 0
+    successful_batch_count = 0
     failed_batches = []
-
 
     liquidation_url = (
         "https://api.coinalyze.net/v1/liquidation-history"
     )
-
 
     # --------------------------------------------------
     # MAX 20 SYMBOLS PER REQUEST
@@ -494,41 +702,34 @@ def calculate_btc_liquidations():
             i:i + 20
         ]
 
+        params = {
+            "symbols": ",".join(batch),
+            "interval": "1min",
+            "from": one_hour_ago,
+            "to": now,
+            "convert_to_usd": "true"
+        }
 
         response = requests.get(
             liquidation_url,
-
-            params={
-                "symbols": ",".join(batch),
-                "interval": "1min",
-                "from": one_hour_ago,
-                "to": now,
-                "convert_to_usd": "true"
-            },
-
-            headers={
-                "api_key": COINALYZE_API_KEY
-            },
-
+            params=params,
+            headers=headers,
             timeout=15
         )
-
 
         if response.status_code != 200:
 
             failed_batches.append({
                 "status_code": response.status_code,
                 "symbols": batch,
-                "response": response.text
+                "response": response.text[:500]
             })
 
             continue
 
-
-        successful_batches += 1
+        successful_batch_count += 1
 
         data = response.json()
-
 
         for symbol_data in data:
 
@@ -536,7 +737,6 @@ def calculate_btc_liquidations():
                 "history",
                 []
             )
-
 
             for row in history:
 
@@ -548,27 +748,33 @@ def calculate_btc_liquidations():
                     row.get("s", 0) or 0
                 )
 
-
     # --------------------------------------------------
     # DO NOT USE PARTIAL DATA
     # --------------------------------------------------
 
     if failed_batches:
 
-        return None, {
+        return {
+            "ok": False,
             "stage": "liquidation-history",
             "error": "one_or_more_batches_failed",
-            "successful_batches": successful_batches,
+            "btc_perpetual_symbols": len(
+                btc_symbols
+            ),
+            "successful_batch_count": (
+                successful_batch_count
+            ),
+            "failed_batch_count": len(
+                failed_batches
+            ),
             "failed_batches": failed_batches
         }
 
+    # --------------------------------------------------
+    # NET
+    # --------------------------------------------------
 
-    net = (
-        short_total
-        -
-        long_total
-    )
-
+    net = short_total - long_total
 
     if net >= BTC_LIQ_THRESHOLD:
 
@@ -582,61 +788,53 @@ def calculate_btc_liquidations():
 
         signal = "WAIT"
 
-
-    result = {
+    return {
+        "ok": True,
+        "status_code": 200,
         "window": "rolling_last_60_minutes",
-
-        "btc_perpetual_symbols":
-            len(btc_symbols),
-
-        "successful_batch_count":
-            successful_batches,
-
-        "long_liquidations_usd":
-            round(long_total, 2),
-
-        "short_liquidations_usd":
-            round(short_total, 2),
-
-        "net_short_minus_long_usd":
-            round(net, 2),
-
-        "threshold_usd":
-            BTC_LIQ_THRESHOLD,
-
-        "signal":
-            signal
+        "btc_perpetual_symbols": len(
+            btc_symbols
+        ),
+        "successful_batch_count": (
+            successful_batch_count
+        ),
+        "long_liquidations_usd": round(
+            long_total,
+            2
+        ),
+        "short_liquidations_usd": round(
+            short_total,
+            2
+        ),
+        "net_short_minus_long_usd": round(
+            net,
+            2
+        ),
+        "threshold_usd": BTC_LIQ_THRESHOLD,
+        "signal": signal
     }
 
 
-    return result, None
-
-
 # ==================================================
-# MANUAL BTC TEST
+# MANUAL BTC AGGREGATE TEST
 # ==================================================
 
-@app.get("/test-btc-aggregate")
+@app.route("/test-btc-aggregate", methods=["GET"])
 def test_btc_aggregate():
 
     try:
 
-        result, error = calculate_btc_liquidations()
+        result = get_btc_aggregate()
 
+        if not result.get("ok"):
 
-        if error:
+            return jsonify(
+                result
+            ), 503
 
-            return jsonify({
-                "ok": False,
-                "error": error
-            }), 429
-
-
-        return jsonify({
-            "ok": True,
-            **result
-        })
-
+        return jsonify(
+            result
+        )
 
     except Exception as e:
 
@@ -647,139 +845,167 @@ def test_btc_aggregate():
 
 
 # ==================================================
-# BTC EVERY-MINUTE ALERT ENDPOINT
+# BTC AUTOMATIC MINUTE ALERT
 # ==================================================
 
-@app.get("/btc-minute-alert")
+@app.route("/btc-minute-alert", methods=["GET"])
 def btc_minute_alert():
 
     global btc_liq_state
 
-
     try:
 
-        result, error = calculate_btc_liquidations()
+        # ----------------------------------------------
+        # GET CURRENT ROLLING 60-MINUTE DATA
+        # ----------------------------------------------
 
+        data = get_btc_aggregate()
 
-        # --------------------------------------------------
-        # API ERROR = DO NOTHING
-        # --------------------------------------------------
+        # ----------------------------------------------
+        # NEVER ALERT FROM PARTIAL / FAILED DATA
+        # ----------------------------------------------
 
-        if error:
+        if not data.get("ok"):
 
             return jsonify({
                 "ok": False,
-                "pushover_sent": False,
-                "btc_liq_state": btc_liq_state,
-                "error": error
-            }), 429
+                "alert_sent": False,
+                "error": "BTC aggregation failed",
+                "details": data
+            }), 503
 
+        long_total = float(
+            data.get(
+                "long_liquidations_usd",
+                0
+            ) or 0
+        )
 
-        signal = result["signal"]
+        short_total = float(
+            data.get(
+                "short_liquidations_usd",
+                0
+            ) or 0
+        )
 
-        long_total = result[
-            "long_liquidations_usd"
-        ]
+        net = (
+            short_total
+            - long_total
+        )
 
-        short_total = result[
-            "short_liquidations_usd"
-        ]
+        signal = "WAIT"
+        alert_sent = False
 
-        net = result[
-            "net_short_minus_long_usd"
-        ]
-
-
-        pushover_sent = False
-        new_alert = False
-
-
-        # --------------------------------------------------
+        # ----------------------------------------------
         # BUY
-        # --------------------------------------------------
+        #
+        # Short liquidations exceed long liquidations
+        # by at least $1,000,000
+        # ----------------------------------------------
 
-        if signal == "BUY":
+        if net >= BTC_LIQ_THRESHOLD:
+
+            signal = "BUY"
 
             if btc_liq_state != 1:
 
                 btc_liq_state = 1
-                new_alert = True
 
+                alert_sent = send_pushover(
+                    "BTC LIQUIDATION BUY",
+                    (
+                        f"BUY | Rolling 1H | "
+                        f"Short Liq ${short_total:,.0f} | "
+                        f"Long Liq ${long_total:,.0f} | "
+                        f"Net +${net:,.0f}"
+                    )
+                )
 
-        # --------------------------------------------------
+        # ----------------------------------------------
         # SELL
-        # --------------------------------------------------
+        #
+        # Long liquidations exceed short liquidations
+        # by at least $1,000,000
+        # ----------------------------------------------
 
-        elif signal == "SELL":
+        elif net <= -BTC_LIQ_THRESHOLD:
+
+            signal = "SELL"
 
             if btc_liq_state != -1:
 
                 btc_liq_state = -1
-                new_alert = True
 
+                alert_sent = send_pushover(
+                    "BTC LIQUIDATION SELL",
+                    (
+                        f"SELL | Rolling 1H | "
+                        f"Long Liq ${long_total:,.0f} | "
+                        f"Short Liq ${short_total:,.0f} | "
+                        f"Net -${abs(net):,.0f}"
+                    )
+                )
 
-        # --------------------------------------------------
-        # WAIT = RESET
-        # --------------------------------------------------
+        # ----------------------------------------------
+        # BACK BELOW THRESHOLD
+        #
+        # Reset so next fresh ±$1M crossing can alert.
+        # ----------------------------------------------
 
         else:
 
             btc_liq_state = 0
 
-
-        # --------------------------------------------------
-        # SEND ONLY ON NEW CROSS / FLIP
-        # --------------------------------------------------
-
-        if new_alert:
-
-            title = (
-                f"BTC 1H LIQUIDATION {signal}"
-            )
-
-
-            message = (
-                f"{signal} | ROLLING 60 MIN | "
-                f"LONG ${long_total:,.0f} | "
-                f"SHORT ${short_total:,.0f} | "
-                f"NET ${net:,.0f} | "
-                f"{result['btc_perpetual_symbols']} BTC PERP MARKETS"
-            )
-
-
-            pushover_sent = send_pushover(
-                title,
-                message
-            )
-
-
         return jsonify({
             "ok": True,
 
-            "new_alert":
-                new_alert,
+            "window": (
+                "rolling_last_60_minutes"
+            ),
 
-            "pushover_sent":
-                pushover_sent,
+            "btc_perpetual_symbols": data.get(
+                "btc_perpetual_symbols"
+            ),
 
-            "btc_liq_state":
-                btc_liq_state,
+            "successful_batch_count": data.get(
+                "successful_batch_count"
+            ),
 
-            **result
+            "long_liquidations_usd": round(
+                long_total,
+                2
+            ),
+
+            "short_liquidations_usd": round(
+                short_total,
+                2
+            ),
+
+            "net_short_minus_long_usd": round(
+                net,
+                2
+            ),
+
+            "threshold_usd": (
+                BTC_LIQ_THRESHOLD
+            ),
+
+            "signal": signal,
+            "alert_sent": alert_sent,
+            "alert_state": btc_liq_state
         })
-
 
     except Exception as e:
 
         return jsonify({
             "ok": False,
-            "pushover_sent": False,
+            "alert_sent": False,
             "error": str(e)
         }), 500
 
 
 # ==================================================
-# START SERVER
+# RUN APP
 # ==================================================
 
 if __name__ == "__main__":
