@@ -437,7 +437,50 @@ def test_coinalyze():
             "error": str(e)
         }), 500
 
+
+
+@app.route("/test-btc-liquidation", methods=["GET"])
+def test_btc_liquidation():
+    import time
+
+    now = int(time.time())
+    one_hour_ago = now - 3600
+
+    url = "https://api.coinalyze.net/v1/liquidation-history"
+
+    params = {
+        "symbols": "BTCUSDT_PERP.A",
+        "interval": "1min",
+        "from": one_hour_ago,
+        "to": now,
+        "convert_to_usd": "true"
+    }
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+
+        return jsonify({
+            "status_code": response.status_code,
+            "response": response.json()
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
 if __name__ == "__main__":
+
 
     port = int(
         os.environ.get(
