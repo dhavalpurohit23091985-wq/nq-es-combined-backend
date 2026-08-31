@@ -7,7 +7,7 @@ app = Flask(__name__)
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-
+COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY")
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 # --------------------------------------------------
@@ -407,7 +407,35 @@ def webhook():
         "entry_nq_price": entry_nq_price,
         "entry_jpn_price": entry_jpn_price
     })
+# --------------------------------------------------
+# COINALYZE API TEST
+# --------------------------------------------------
 
+@app.route("/test-coinalyze", methods=["GET"])
+def test_coinalyze():
+
+    url = "https://api.coinalyze.net/v1/exchanges"
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        return jsonify({
+            "status_code": response.status_code,
+            "response": response.json()
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
 
