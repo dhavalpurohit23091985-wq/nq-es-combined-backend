@@ -468,15 +468,40 @@ def test_btc_liquidation():
             timeout=10
         )
 
+        data = response.json()
+
+        long_total = 0.0
+        short_total = 0.0
+
+        if response.status_code == 200 and data:
+            history = data[0].get("history", [])
+
+            for row in history:
+                long_total += float(row.get("l", 0) or 0)
+                short_total += float(row.get("s", 0) or 0)
+
+        net = short_total - long_total
+
+        if net >= 1_000_000:
+            signal = "BUY"
+        elif net <= -1_000_000:
+            signal = "SELL"
+        else:
+            signal = "WAIT"
+
         return jsonify({
             "status_code": response.status_code,
-            "response": response.json()
+            "window": "rolling_last_60_minutes",
+            "long_liquidations_usd": round(long_total, 2),
+            "short_liquidations_usd": round(short_total, 2),
+            "net_short_minus_long_usd": round(net, 2),
+            "signal": signal
         })
 
     except Exception as e:
         return jsonify({
             "error": str(e)
-        }), 500
+        }), 500   
 
 
 if __name__ == "__main__":
