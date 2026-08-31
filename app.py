@@ -543,7 +543,7 @@ def test_btc_symbols():
         return jsonify({
             "error": str(e)
         }), 500
-        @app.route("/test-btc-aggregate", methods=["GET"])
+@app.route("/test-btc-aggregate", methods=["GET"])
 def test_btc_aggregate():
     import time
 
