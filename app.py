@@ -504,6 +504,45 @@ def test_btc_liquidation():
         }), 500   
 
 
+
+@app.route("/test-btc-symbols", methods=["GET"])
+def test_btc_symbols():
+    url = "https://api.coinalyze.net/v1/future-markets"
+
+    headers = {
+        "api_key": COINALYZE_API_KEY
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        data = response.json()
+
+        btc_markets = []
+
+        if response.status_code == 200:
+            for market in data:
+                if market.get("base_asset") == "BTC":
+                    btc_markets.append({
+                        "symbol": market.get("symbol"),
+                        "exchange": market.get("exchange"),
+                        "is_perpetual": market.get("is_perpetual")
+                    })
+
+        return jsonify({
+            "status_code": response.status_code,
+            "count": len(btc_markets),
+            "btc_markets": btc_markets
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
 if __name__ == "__main__":
 
 
