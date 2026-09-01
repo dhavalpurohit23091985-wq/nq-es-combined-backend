@@ -1015,31 +1015,30 @@ def get_fresh_liquidations(
                     continue
 
 
-                try:
+           try:
+    long_value = float(
+        row.get(
+            "l",
+            0
+        ) or 0
+    )
 
-                   long_value = float(
-    row.get(
-        "l",
-        0
-    ) or 0
-)
+    short_value = float(
+        row.get(
+            "s",
+            0
+        ) or 0
+    )
 
-short_value = float(
-    row.get(
-        "s",
-        0
-    ) or 0
-)
+    fresh_long += long_value
+    fresh_short += short_value
 
-fresh_long += long_value
-fresh_short += short_value
+    symbol_name = (
+        symbol_data.get("symbol")
+        or asset
+    )
 
-symbol_name = (
-    symbol_data.get("symbol")
-    or asset
-)
-
-if (
+    if (
     asset == "BTC"
     and long_value >= 100000
 ):
@@ -1051,21 +1050,21 @@ if (
     })
 
 if (
-    asset == "BTC"
-    and short_value >= 100000
-):
-    large_events.append({
-        "t": row_ts,
-        "symbol": symbol_name,
-        "value": short_value,
-        "side": "SHORT",
-    })
-                except (
-                    TypeError,
-                    ValueError
-                ):
-                    continue
+        asset == "BTC"
+        and short_value >= 100000
+    ):
+        large_events.append({
+            "t": row_ts,
+            "symbol": symbol_name,
+            "value": short_value,
+            "side": "SHORT",
+        })
 
+except (
+    TypeError,
+    ValueError
+):
+    continue
 
     if failed_batches:
 
