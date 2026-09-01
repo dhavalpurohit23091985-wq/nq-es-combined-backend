@@ -1430,4 +1430,468 @@ def process_btc(
                 2
             ),
 
-        "fresh
+        "fresh_long_usd":
+            fresh_long,
+
+        "fresh_short_usd":
+            fresh_short,
+
+        "cycle_long_before_reset":
+            round(
+                cycle_long,
+                2
+            ),
+
+        "cycle_short_before_reset":
+            round(
+                cycle_short,
+                2
+            ),
+
+        "cycle_gap_usd":
+            round(
+                cycle_gap,
+                2
+            ),
+
+        "long_cumulative_usd":
+            round(
+                btc_long_cumulative,
+                2
+            ),
+
+        "short_cumulative_usd":
+            round(
+                btc_short_cumulative,
+                2
+            ),
+
+        "threshold_usd":
+            BTC_LIQ_THRESHOLD,
+
+        "cycle_winner":
+            cycle_winner,
+
+        "alert_sent":
+            alert_sent,
+
+        "price_move_points":
+            (
+                round(
+                    btc_price_move,
+                    2
+                )
+                if btc_price_move
+                is not None
+                else None
+            ),
+
+        "low_move":
+            low_move,
+
+        "cycle_reference_price":
+            btc_cycle_ref_price,
+
+        "last_processed_liq_ts":
+            btc_last_processed_liq_ts
+    }
+
+
+# ==================================================
+# XAU PROCESSOR
+# ==================================================
+
+def process_xau(closed_minute_ts):
+
+    global xau_long_cumulative
+    global xau_short_cumulative
+    global xau_cycle_ref_price
+    global xau_last_processed_liq_ts
+
+
+    xau_price, price_error = get_xau_price()
+
+
+    if price_error:
+
+        return {
+            "ok": False,
+            "asset": "XAU",
+            "alert_sent": False,
+            "error": price_error
+        }
+
+
+    # ----------------------------------------------
+    # FIRST RUN
+    # ----------------------------------------------
+
+    if xau_last_processed_liq_ts is None:
+
+        xau_last_processed_liq_ts = closed_minute_ts
+        xau_cycle_ref_price = xau_price
+
+        xau_long_cumulative = 0.0
+        xau_short_cumulative = 0.0
+
+
+        return {
+            "ok": True,
+            "asset": "XAU",
+            "initialized": True,
+
+            "xau_price":
+                round(
+                    xau_price,
+                    2
+                ),
+
+            "long_cumulative_usd": 0,
+            "short_cumulative_usd": 0,
+
+            "cycle_reference_price":
+                xau_cycle_ref_price,
+
+            "last_processed_liq_ts":
+                xau_last_processed_liq_ts
+        }
+
+
+    # ----------------------------------------------
+    # NOTHING NEW YET
+    # ----------------------------------------------
+
+    if closed_minute_ts <= xau_last_processed_liq_ts:
+
+        return {
+            "ok": True,
+            "asset": "XAU",
+            "new_closed_minute": False,
+
+            "xau_price":
+                round(
+                    xau_price,
+                    2
+                ),
+
+            "long_cumulative_usd":
+                round(
+                    xau_long_cumulative,
+                    2
+                ),
+
+            "short_cumulative_usd":
+                round(
+                    xau_short_cumulative,
+                    2
+                ),
+
+            "cycle_reference_price":
+                xau_cycle_ref_price,
+
+            "last_processed_liq_ts":
+                xau_last_processed_liq_ts
+        }
+
+
+    # ----------------------------------------------
+    # GET FRESH XAU LIQUIDATIONS
+    # ----------------------------------------------
+
+    fresh, error = get_fresh_liquidations(
+        "XAU",
+        xau_last_processed_liq_ts,
+        closed_minute_ts
+    )
+
+
+    if error:
+
+        return {
+            "ok": False,
+            "asset": "XAU",
+            "alert_sent": False,
+
+            "long_cumulative_usd":
+                round(
+                    xau_long_cumulative,
+                    2
+                ),
+
+            "short_cumulative_usd":
+                round(
+                    xau_short_cumulative,
+                    2
+                ),
+
+            "last_processed_liq_ts":
+                xau_last_processed_liq_ts,
+
+            "error": error
+        }
+
+
+    fresh_long = fresh["fresh_long_usd"]
+    fresh_short = fresh["fresh_short_usd"]
+
+
+    # ----------------------------------------------
+    # ADD BOTH SIDES
+    # ----------------------------------------------
+
+    xau_long_cumulative += fresh_long
+    xau_short_cumulative += fresh_short
+
+    xau_last_processed_liq_ts = closed_minute_ts
+
+
+    cycle_long = xau_long_cumulative
+    cycle_short = xau_short_cumulative
+
+    cycle_gap = abs(
+        cycle_long - cycle_short
+    )
+
+
+    # ----------------------------------------------
+    # CHECK $1M RACE
+    # ----------------------------------------------
+
+    long_hit = (
+        cycle_long >= XAU_LIQ_THRESHOLD
+    )
+
+    short_hit = (
+        cycle_short >= XAU_LIQ_THRESHOLD
+    )
+
+
+    alert_sent = False
+    cycle_winner = None
+
+    xau_price_move = None
+
+
+    if xau_cycle_ref_price is not None:
+
+        xau_price_move = abs(
+            xau_price - xau_cycle_ref_price
+        )
+
+
+    # ----------------------------------------------
+    # CYCLE COMPLETE
+    # ----------------------------------------------
+
+    if long_hit or short_hit:
+
+        if long_hit and short_hit:
+
+            cycle_winner = "BOTH HIT SAME MINUTE"
+            alert_title = "XAU BOTH HIT +1M"
+
+        elif long_hit:
+
+            cycle_winner = "LONG"
+            alert_title = "XAU LONG WINS +1M"
+
+        else:
+
+            cycle_winner = "SHORT"
+            alert_title = "XAU SHORT WINS +1M"
+
+
+        move_text = (
+            f"{xau_price_move:,.2f} pts"
+            if xau_price_move is not None
+            else "NA"
+        )
+
+
+        alert_sent = send_pushover(
+            alert_title,
+            (
+                f"WINNER {cycle_winner} | "
+                f"LONG ${cycle_long:,.0f} | "
+                f"SHORT ${cycle_short:,.0f} | "
+                f"GAP ${cycle_gap:,.0f} | "
+                f"XAU {xau_price:,.2f} | "
+                f"XAU MOVE {move_text}"
+            )
+        )
+
+
+        # ------------------------------------------
+        # RESET BOTH SIDES
+        # ------------------------------------------
+
+        xau_long_cumulative = 0.0
+        xau_short_cumulative = 0.0
+
+        xau_cycle_ref_price = xau_price
+
+
+    return {
+        "ok": True,
+        "asset": "XAU",
+        "initialized": False,
+
+        "perpetual_symbols":
+            fresh["perpetual_symbols"],
+
+        "successful_batch_count":
+            fresh["successful_batch_count"],
+
+        "price":
+            round(
+                xau_price,
+                2
+            ),
+
+        "price_symbol":
+            xau_price_symbol_cache,
+
+        "fresh_long_usd":
+            fresh_long,
+
+        "fresh_short_usd":
+            fresh_short,
+
+        "cycle_long_before_reset":
+            round(
+                cycle_long,
+                2
+            ),
+
+        "cycle_short_before_reset":
+            round(
+                cycle_short,
+                2
+            ),
+
+        "cycle_gap_usd":
+            round(
+                cycle_gap,
+                2
+            ),
+
+        "long_cumulative_usd":
+            round(
+                xau_long_cumulative,
+                2
+            ),
+
+        "short_cumulative_usd":
+            round(
+                xau_short_cumulative,
+                2
+            ),
+
+        "threshold_usd":
+            XAU_LIQ_THRESHOLD,
+
+        "cycle_winner":
+            cycle_winner,
+
+        "alert_sent":
+            alert_sent,
+
+        "price_move_points":
+            (
+                round(
+                    xau_price_move,
+                    2
+                )
+                if xau_price_move is not None
+                else None
+            ),
+
+        "cycle_reference_price":
+            xau_cycle_ref_price,
+
+        "last_processed_liq_ts":
+            xau_last_processed_liq_ts
+    }
+
+
+# ==================================================
+# BTC + XAU EVERY-MINUTE ALERT
+# SAME OLD URL - CRON DOES NOT CHANGE
+# ==================================================
+
+@app.get("/btc-minute-alert")
+def btc_minute_alert():
+
+    try:
+
+        now = int(time.time())
+
+        current_minute_start = (
+            now // 60
+        ) * 60
+
+        closed_minute_ts = (
+            current_minute_start - 60
+        )
+
+
+        # BTC
+        btc_result = process_btc(
+            closed_minute_ts
+        )
+
+
+        # XAU
+        xau_result = process_xau(
+            closed_minute_ts
+        )
+
+
+        overall_ok = (
+            btc_result.get("ok", False)
+            and
+            xau_result.get("ok", False)
+        )
+
+
+        return jsonify({
+            "ok": overall_ok,
+
+            "closed_minute_ts":
+                closed_minute_ts,
+
+            "btc":
+                btc_result,
+
+            "xau":
+                xau_result
+
+        }), 200 if overall_ok else 429
+
+
+    except Exception as e:
+
+        return jsonify({
+            "ok": False,
+            "alert_sent": False,
+            "error": str(e)
+        }), 500
+
+
+# ==================================================
+# START SERVER
+# ==================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
