@@ -49,29 +49,26 @@ entry_jpn_price = None
 
 
 # ==================================================
-# BTC LIQUIDATION SETTINGS
+# BTC CUMULATIVE LIQUIDATION SETTINGS
 # ==================================================
 
-# Main BTC trend threshold
 BTC_LIQ_THRESHOLD = 10_000_000
+BTC_LOW_MOVE_POINTS = 500
 
-# Special LOW-MOVE alert
-# $10M liquidation-net change
-# while BTC price moves less than 500 points
-BTC_SPECIAL_LIQ_CHANGE = 10_000_000
-BTC_SPECIAL_MAX_PRICE_MOVE = 500
+# Fresh liquidation accumulated AFTER latest reset
+btc_cumulative_net = 0.0
+btc_cumulative_long = 0.0
+btc_cumulative_short = 0.0
 
+# Price when current $10M block started
+btc_event_ref_price = None
 
-# Main BTC state
-# 0  = no valid signal yet
-# 1  = BUY
-# -1 = SELL
-btc_liq_state = 0
+# Last fully processed 1-minute liquidation timestamp
+last_processed_liq_ts = None
 
-
-# Special LOW-MOVE reference
-special_ref_net = None
-special_ref_price = None
+# Cache BTC perpetual symbols so future-markets
+# does not need to be called every minute
+btc_symbols_cache = None
 
 
 # ==================================================
@@ -94,7 +91,6 @@ def send_pushover(title, message):
     }
 
     try:
-
         response = requests.post(
             PUSHOVER_URL,
             data=payload,
@@ -104,7 +100,6 @@ def send_pushover(title, message):
         return response.ok
 
     except requests.RequestException:
-
         return False
 
 
@@ -117,13 +112,31 @@ def home():
 
     return jsonify({
         "status": "ok",
-        "service": "NQ + ES + BTC Liquidation Backend",
+        "service": "NQ + ES + BTC Cumulative Liquidation Backend",
 
         "nq_es_threshold": THRESHOLD,
-        "btc_liquidation_threshold": BTC_LIQ_THRESHOLD,
 
-        "btc_special_liq_change": BTC_SPECIAL_LIQ_CHANGE,
-        "btc_special_max_price_move": BTC_SPECIAL_MAX_PRICE_MOVE,
+        "btc_liquidation_mode": "fresh_cumulative_no_time_limit",
+        "btc_liquidation_threshold": BTC_LIQ_THRESHOLD,
+        "btc_low_move_points": BTC_LOW_MOVE_POINTS,
+
+        "btc_cumulative_net": round(
+            btc_cumulative_net,
+            2
+        ),
+
+        "btc_cumulative_long": round(
+            btc_cumulative_long,
+            2
+        ),
+
+        "btc_cumulative_short": round(
+            btc_cumulative_short,
+            2
+        ),
+
+        "btc_event_ref_price": btc_event_ref_price,
+        "last_processed_liq_ts": last_processed_liq_ts,
 
         "nq_delta": latest_delta["NQ"],
         "es_delta": latest_delta["ES"],
@@ -133,10 +146,6 @@ def home():
         "jpn_price": latest_price["JPN"],
 
         "nq_es_state": state,
-        "btc_liq_state": btc_liq_state,
-
-        "special_ref_net": special_ref_net,
-        "special_ref_price": special_ref_price,
 
         "entry_side": entry_side,
         "entry_nq_price": entry_nq_price,
@@ -159,25 +168,29 @@ def webhook():
     secret = request.args.get("secret", "")
 
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
-
         return jsonify({
             "ok": False,
             "error": "unauthorized"
         }), 401
 
-
     data = request.get_json(silent=True) or {}
 
-
-    # --------------------------------------------------
     # DIRECT PUSHOVER MODE
-    # --------------------------------------------------
-
     if "title" in data and "message" in data:
 
         ok = send_pushover(
-            str(data.get("title", "TradingView Alert")),
-            str(data.get("message", ""))
+            str(
+                data.get(
+                    "title",
+                    "TradingView Alert"
+                )
+            ),
+            str(
+                data.get(
+                    "message",
+                    ""
+                )
+            )
         )
 
         return jsonify({
@@ -185,20 +198,18 @@ def webhook():
             "mode": "direct_pushover"
         }), 200 if ok else 500
 
-
     symbol = str(
-        data.get("symbol", "")
+        data.get(
+            "symbol",
+            ""
+        )
     ).upper()
 
-
-    # --------------------------------------------------
-    # PRICE
-    # --------------------------------------------------
-
     try:
-
         price = float(
-            data.get("price")
+            data.get(
+                "price"
+            )
         )
 
     except (TypeError, ValueError):
@@ -208,11 +219,7 @@ def webhook():
             "error": "invalid price"
         }), 400
 
-
-    # --------------------------------------------------
-    # JPN UPDATE ONLY
-    # --------------------------------------------------
-
+    # JPN PRICE UPDATE
     if "JPN" in symbol or "NIY" in symbol:
 
         latest_price["JPN"] = price
@@ -224,15 +231,11 @@ def webhook():
             "signal": None
         })
 
-
-    # --------------------------------------------------
-    # NQ / ES DELTA
-    # --------------------------------------------------
-
     try:
-
         delta = float(
-            data.get("delta")
+            data.get(
+                "delta"
+            )
         )
 
     except (TypeError, ValueError):
@@ -242,26 +245,20 @@ def webhook():
             "error": "invalid delta"
         }), 400
 
-
     if "NQ" in symbol:
-
         instrument = "NQ"
 
     elif "ES" in symbol:
-
         instrument = "ES"
 
     else:
-
         return jsonify({
             "ok": False,
             "error": "symbol must be NQ, ES or JPN"
         }), 400
 
-
     latest_delta[instrument] = delta
     latest_price[instrument] = price
-
 
     if (
         latest_delta["NQ"] is None
@@ -275,11 +272,6 @@ def webhook():
             "es_delta": latest_delta["ES"]
         })
 
-
-    # --------------------------------------------------
-    # COMBINED DELTA
-    # --------------------------------------------------
-
     nq_delta = latest_delta["NQ"]
     es_delta = latest_delta["ES"]
 
@@ -287,30 +279,26 @@ def webhook():
 
     signal = None
 
-
-    if combined >= THRESHOLD and state != 1:
-
+    if (
+        combined >= THRESHOLD
+        and state != 1
+    ):
         state = 1
         signal = "BUY"
 
-    elif combined <= -THRESHOLD and state != -1:
-
+    elif (
+        combined <= -THRESHOLD
+        and state != -1
+    ):
         state = -1
         signal = "SELL"
-
-
-    # --------------------------------------------------
-    # SIGNAL CHANGE
-    # --------------------------------------------------
 
     if signal:
 
         current_nq = latest_price["NQ"]
         current_jpn = latest_price["JPN"]
 
-
-        # CLOSE PREVIOUS TRADE
-
+        # CLOSE PREVIOUS
         if (
             entry_side is not None
             and entry_nq_price is not None
@@ -321,14 +309,27 @@ def webhook():
 
             if entry_side == "BUY":
 
-                nq_points = current_nq - entry_nq_price
-                jpn_points = current_jpn - entry_jpn_price
+                nq_points = (
+                    current_nq
+                    - entry_nq_price
+                )
+
+                jpn_points = (
+                    current_jpn
+                    - entry_jpn_price
+                )
 
             else:
 
-                nq_points = entry_nq_price - current_nq
-                jpn_points = entry_jpn_price - current_jpn
+                nq_points = (
+                    entry_nq_price
+                    - current_nq
+                )
 
+                jpn_points = (
+                    entry_jpn_price
+                    - current_jpn
+                )
 
             nq_result = (
                 "PROFIT"
@@ -346,17 +347,18 @@ def webhook():
                 else "FLAT"
             )
 
-
             send_pushover(
                 f"NQ + ES CLOSED {entry_side}",
-
-                f"CLOSED {entry_side} | "
-                f"NQ {nq_result} {nq_points:+.2f} pts | "
-                f"JPN {jpn_result} {jpn_points:+.2f} pts | "
-                f"Exit NQ {current_nq:.2f} | "
-                f"JPN {current_jpn:.2f}"
+                (
+                    f"CLOSED {entry_side} | "
+                    f"NQ {nq_result} "
+                    f"{nq_points:+.2f} pts | "
+                    f"JPN {jpn_result} "
+                    f"{jpn_points:+.2f} pts | "
+                    f"Exit NQ {current_nq:.2f} | "
+                    f"JPN {current_jpn:.2f}"
+                )
             )
-
 
         nq_price_text = (
             f"{current_nq:.2f}"
@@ -370,27 +372,24 @@ def webhook():
             else "NA"
         )
 
-
         send_pushover(
             f"NQ + ES {signal}",
-
-            f"{signal} | "
-            f"Combined Delta {combined:.0f} | "
-            f"NQ Delta {nq_delta:.0f} | "
-            f"ES Delta {es_delta:.0f} | "
-            f"NQ {nq_price_text} | "
-            f"JPN {jpn_price_text}"
+            (
+                f"{signal} | "
+                f"Combined Delta {combined:.0f} | "
+                f"NQ Delta {nq_delta:.0f} | "
+                f"ES Delta {es_delta:.0f} | "
+                f"NQ {nq_price_text} | "
+                f"JPN {jpn_price_text}"
+            )
         )
-
 
         entry_side = signal
         entry_nq_price = current_nq
         entry_jpn_price = current_jpn
 
-
     return jsonify({
         "ok": True,
-
         "instrument_updated": instrument,
 
         "nq_delta": nq_delta,
@@ -415,16 +414,18 @@ def webhook():
 
 def get_btc_perpetual_symbols():
 
+    global btc_symbols_cache
+
+    if btc_symbols_cache:
+        return btc_symbols_cache, None
+
     response = requests.get(
         "https://api.coinalyze.net/v1/future-markets",
-
         headers={
             "api_key": COINALYZE_API_KEY
         },
-
         timeout=10
     )
-
 
     if response.status_code != 200:
 
@@ -434,11 +435,9 @@ def get_btc_perpetual_symbols():
             "response": response.text[:500]
         }
 
-
     markets = response.json()
 
     btc_symbols = []
-
 
     for market in markets:
 
@@ -452,40 +451,40 @@ def get_btc_perpetual_symbols():
             if symbol:
                 btc_symbols.append(symbol)
 
-
     btc_symbols = list(
-        dict.fromkeys(btc_symbols)
+        dict.fromkeys(
+            btc_symbols
+        )
     )
 
+    btc_symbols_cache = btc_symbols
 
     return btc_symbols, None
 
 
 # ==================================================
-# GET BTC PRICE
+# GET BTC CURRENT PRICE
 # ==================================================
 
 def get_btc_price():
 
-    now = int(time.time())
+    now = int(
+        time.time()
+    )
 
     response = requests.get(
         "https://api.coinalyze.net/v1/ohlcv-history",
-
         params={
             "symbols": "BTCUSDT_PERP.A",
             "interval": "1min",
             "from": now - 300,
             "to": now
         },
-
         headers={
             "api_key": COINALYZE_API_KEY
         },
-
         timeout=10
     )
-
 
     if response.status_code != 200:
 
@@ -495,9 +494,7 @@ def get_btc_price():
             "response": response.text[:500]
         }
 
-
     data = response.json()
-
 
     if not data:
 
@@ -506,12 +503,10 @@ def get_btc_price():
             "error": "empty response"
         }
 
-
     history = data[0].get(
         "history",
         []
     )
-
 
     if not history:
 
@@ -520,39 +515,40 @@ def get_btc_price():
             "error": "no price history"
         }
 
-
     try:
-
         btc_price = float(
             history[-1]["c"]
         )
 
-    except (KeyError, TypeError, ValueError):
+    except (
+        KeyError,
+        TypeError,
+        ValueError
+    ):
 
         return None, {
             "stage": "btc-price",
             "error": "invalid BTC close"
         }
 
-
     return btc_price, None
 
 
 # ==================================================
-# CALCULATE ROLLING LAST 60 MIN BTC LIQUIDATIONS
+# FETCH ONLY NEW CLOSED 1-MIN LIQUIDATIONS
 # ==================================================
 
-def calculate_btc_liquidations():
+def get_fresh_btc_liquidations(
+    from_timestamp,
+    to_timestamp
+):
 
-    now = int(time.time())
-    one_hour_ago = now - 3600
-
-
-    btc_symbols, error = get_btc_perpetual_symbols()
+    btc_symbols, error = (
+        get_btc_perpetual_symbols()
+    )
 
     if error:
         return None, error
-
 
     long_total = 0.0
     short_total = 0.0
@@ -560,15 +556,10 @@ def calculate_btc_liquidations():
     successful_batches = 0
     failed_batches = []
 
-
     liquidation_url = (
-        "https://api.coinalyze.net/v1/liquidation-history"
+        "https://api.coinalyze.net/v1/"
+        "liquidation-history"
     )
-
-
-    # --------------------------------------------------
-    # MAX 20 SYMBOLS PER REQUEST
-    # --------------------------------------------------
 
     for i in range(
         0,
@@ -580,41 +571,39 @@ def calculate_btc_liquidations():
             i:i + 20
         ]
 
-
         response = requests.get(
             liquidation_url,
-
             params={
                 "symbols": ",".join(batch),
                 "interval": "1min",
-                "from": one_hour_ago,
-                "to": now,
+                "from": from_timestamp,
+                "to": to_timestamp,
                 "convert_to_usd": "true"
             },
-
             headers={
                 "api_key": COINALYZE_API_KEY
             },
-
             timeout=15
         )
-
 
         if response.status_code != 200:
 
             failed_batches.append({
-                "status_code": response.status_code,
-                "symbols": batch,
-                "response": response.text[:500]
+                "status_code":
+                    response.status_code,
+
+                "symbols":
+                    batch,
+
+                "response":
+                    response.text[:500]
             })
 
             continue
 
-
         successful_batches += 1
 
         data = response.json()
-
 
         for symbol_data in data:
 
@@ -623,94 +612,88 @@ def calculate_btc_liquidations():
                 []
             )
 
-
             for row in history:
 
+                try:
+                    row_time = int(
+                        row.get(
+                            "t",
+                            0
+                        )
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+                    continue
+
+                # ONLY requested new minutes
+                if (
+                    row_time
+                    < from_timestamp
+                    or row_time
+                    > to_timestamp
+                ):
+                    continue
+
                 long_total += float(
-                    row.get("l", 0) or 0
+                    row.get(
+                        "l",
+                        0
+                    ) or 0
                 )
 
                 short_total += float(
-                    row.get("s", 0) or 0
+                    row.get(
+                        "s",
+                        0
+                    ) or 0
                 )
-
-
-    # --------------------------------------------------
-    # DO NOT USE PARTIAL DATA
-    # --------------------------------------------------
 
     if failed_batches:
 
         return None, {
             "stage": "liquidation-history",
             "error": "one_or_more_batches_failed",
-            "successful_batches": successful_batches,
-            "failed_batches": failed_batches
+            "successful_batches":
+                successful_batches,
+            "failed_batches":
+                failed_batches
         }
 
+    net = (
+        short_total
+        - long_total
+    )
 
-    net = short_total - long_total
-
-
-    if net >= BTC_LIQ_THRESHOLD:
-
-        signal = "BUY"
-
-    elif net <= -BTC_LIQ_THRESHOLD:
-
-        signal = "SELL"
-
-    else:
-
-        signal = "WAIT"
-
-
-    # --------------------------------------------------
-    # GET BTC PRICE
-    # --------------------------------------------------
-
-    btc_price, price_error = get_btc_price()
-
-    if price_error:
-        return None, price_error
-
-
-    result = {
-
-        "window":
-            "rolling_last_60_minutes",
-
+    return {
         "btc_perpetual_symbols":
             len(btc_symbols),
 
         "successful_batch_count":
             successful_batches,
 
-        "long_liquidations_usd":
+        "fresh_long_usd":
             round(long_total, 2),
 
-        "short_liquidations_usd":
+        "fresh_short_usd":
             round(short_total, 2),
 
-        "net_short_minus_long_usd":
+        "fresh_net_usd":
             round(net, 2),
 
-        "threshold_usd":
-            BTC_LIQ_THRESHOLD,
+        "from_timestamp":
+            from_timestamp,
 
-        "signal":
-            signal,
-
-        "btc_price":
-            round(btc_price, 2)
-    }
-
-
-    return result, None
+        "to_timestamp":
+            to_timestamp
+    }, None
 
 
 # ==================================================
-# BTC MANUAL TEST
+# BTC STATUS / MANUAL TEST
+# DOES NOT CONSUME LIQUIDATION DATA
 # ==================================================
 
 @app.get("/test-btc-aggregate")
@@ -718,8 +701,9 @@ def test_btc_aggregate():
 
     try:
 
-        result, error = calculate_btc_liquidations()
-
+        btc_price, error = (
+            get_btc_price()
+        )
 
         if error:
 
@@ -728,12 +712,56 @@ def test_btc_aggregate():
                 "error": error
             }), 429
 
+        if btc_cumulative_net >= 0:
+            direction = "SHORT_LIQ_NET"
+        else:
+            direction = "LONG_LIQ_NET"
 
         return jsonify({
             "ok": True,
-            **result
-        })
 
+            "mode":
+                "fresh_cumulative_no_time_limit",
+
+            "threshold_usd":
+                BTC_LIQ_THRESHOLD,
+
+            "low_move_points":
+                BTC_LOW_MOVE_POINTS,
+
+            "btc_price":
+                round(
+                    btc_price,
+                    2
+                ),
+
+            "event_reference_price":
+                btc_event_ref_price,
+
+            "cumulative_long_usd":
+                round(
+                    btc_cumulative_long,
+                    2
+                ),
+
+            "cumulative_short_usd":
+                round(
+                    btc_cumulative_short,
+                    2
+                ),
+
+            "cumulative_net_usd":
+                round(
+                    btc_cumulative_net,
+                    2
+                ),
+
+            "current_direction":
+                direction,
+
+            "last_processed_liq_ts":
+                last_processed_liq_ts
+        })
 
     except Exception as e:
 
@@ -744,333 +772,496 @@ def test_btc_aggregate():
 
 
 # ==================================================
-# BTC EVERY-MINUTE ALERT
-#
-# SAME CRON:
-#
-# 1. NORMAL +/- $10M BUY / SELL
-#
-# 2. BTC 10M LOW-MOVE ALERT
-#    $10M NET LIQUIDATION CHANGE
-#    + BTC PRICE MOVE <500 POINTS
+# BTC EVERY-MINUTE CUMULATIVE ALERT
 # ==================================================
 
 @app.get("/btc-minute-alert")
 def btc_minute_alert():
 
-    global btc_liq_state
-    global special_ref_net
-    global special_ref_price
+    global btc_cumulative_net
+    global btc_cumulative_long
+    global btc_cumulative_short
 
+    global btc_event_ref_price
+    global last_processed_liq_ts
 
     try:
 
-        result, error = calculate_btc_liquidations()
+        now = int(
+            time.time()
+        )
 
+        # Last FULLY CLOSED 1-minute candle
+        current_minute = (
+            now // 60
+        ) * 60
 
-        # --------------------------------------------------
-        # API ERROR
-        # --------------------------------------------------
+        closed_minute = (
+            current_minute
+            - 60
+        )
 
-        if error:
+        # Get current BTC price
+        current_price, price_error = (
+            get_btc_price()
+        )
+
+        if price_error:
 
             return jsonify({
                 "ok": False,
                 "alert_sent": False,
-                "btc_liq_state": btc_liq_state,
-                "error": error
+                "error": price_error
             }), 429
 
-
-        current_signal = result[
-            "signal"
-        ]
-
-        long_total = result[
-            "long_liquidations_usd"
-        ]
-
-        short_total = result[
-            "short_liquidations_usd"
-        ]
-
-        current_net = result[
-            "net_short_minus_long_usd"
-        ]
-
-        current_price = result[
-            "btc_price"
-        ]
-
-
         # ==================================================
-        # MAIN +/- $10M BUY / SELL ALERT
+        # FIRST RUN AFTER DEPLOY / RESTART
+        # Initialize only.
+        # Do NOT count historical liquidations.
         # ==================================================
 
-        normal_alert_sent = False
-        new_signal = None
+        if last_processed_liq_ts is None:
 
-
-        if current_signal == "BUY":
-
-            if btc_liq_state != 1:
-
-                btc_liq_state = 1
-                new_signal = "BUY"
-
-
-        elif current_signal == "SELL":
-
-            if btc_liq_state != -1:
-
-                btc_liq_state = -1
-                new_signal = "SELL"
-
-
-        # WAIT = HOLD PREVIOUS STATE
-
-
-        if btc_liq_state == 1:
-
-            state_text = "BUY"
-
-        elif btc_liq_state == -1:
-
-            state_text = "SELL"
-
-        else:
-
-            state_text = "NONE"
-
-
-        # --------------------------------------------------
-        # NORMAL BTC PUSHOVER
-        # --------------------------------------------------
-
-        if new_signal == "BUY":
-
-            normal_alert_sent = send_pushover(
-
-                "BTC LIQUIDATION BUY",
-
-                (
-                    f"BUY | ROLLING 60 MIN | "
-                    f"SHORT ${short_total:,.0f} | "
-                    f"LONG ${long_total:,.0f} | "
-                    f"NET +${current_net:,.0f} | "
-                    f"BTC {current_price:,.0f}"
-                )
+            last_processed_liq_ts = (
+                closed_minute
             )
 
-
-        elif new_signal == "SELL":
-
-            normal_alert_sent = send_pushover(
-
-                "BTC LIQUIDATION SELL",
-
-                (
-                    f"SELL | ROLLING 60 MIN | "
-                    f"LONG ${long_total:,.0f} | "
-                    f"SHORT ${short_total:,.0f} | "
-                    f"NET -${abs(current_net):,.0f} | "
-                    f"BTC {current_price:,.0f}"
-                )
+            btc_event_ref_price = (
+                current_price
             )
 
+            return jsonify({
+                "ok": True,
+
+                "initialized": True,
+
+                "message":
+                    "BTC cumulative counter initialized",
+
+                "mode":
+                    "fresh_cumulative_no_time_limit",
+
+                "btc_price":
+                    round(
+                        current_price,
+                        2
+                    ),
+
+                "event_reference_price":
+                    round(
+                        btc_event_ref_price,
+                        2
+                    ),
+
+                "cumulative_net_usd":
+                    round(
+                        btc_cumulative_net,
+                        2
+                    ),
+
+                "last_processed_liq_ts":
+                    last_processed_liq_ts,
+
+                "alert_sent":
+                    False
+            })
 
         # ==================================================
-        # BTC 10M LOW-MOVE ALERT
-        #
-        # Reference net -> current net = +/- $10M
-        #
-        # AND
-        #
-        # Reference BTC -> current BTC <500 points
+        # NOTHING NEW YET
         # ==================================================
-
-        special_alert_sent = False
-        special_direction = None
-
-        liq_change = 0.0
-        price_move = 0.0
-
-
-        # --------------------------------------------------
-        # FIRST SUCCESSFUL RUN
-        # SAVE REFERENCE
-        # --------------------------------------------------
 
         if (
-            special_ref_net is None
-            or special_ref_price is None
+            closed_minute
+            <= last_processed_liq_ts
         ):
-
-            special_ref_net = current_net
-            special_ref_price = current_price
-
-
-        else:
-
-            liq_change = (
-                current_net
-                - special_ref_net
-            )
 
             price_move = abs(
                 current_price
-                - special_ref_price
+                - btc_event_ref_price
             )
 
+            return jsonify({
+                "ok": True,
 
-            # --------------------------------------------------
-            # +$10M NET CHANGE
-            # SHORT LIQUIDATIONS
-            # --------------------------------------------------
+                "mode":
+                    "fresh_cumulative_no_time_limit",
 
-            if (
-                liq_change
-                >= BTC_SPECIAL_LIQ_CHANGE
-            ):
+                "message":
+                    "no new closed minute yet",
 
-                special_direction = "SHORT LIQ +10M"
+                "btc_price":
+                    round(
+                        current_price,
+                        2
+                    ),
 
+                "event_reference_price":
+                    round(
+                        btc_event_ref_price,
+                        2
+                    ),
 
-                if (
-                    price_move
-                    < BTC_SPECIAL_MAX_PRICE_MOVE
-                ):
+                "price_move_points":
+                    round(
+                        price_move,
+                        2
+                    ),
 
-                    special_alert_sent = send_pushover(
+                "cumulative_long_usd":
+                    round(
+                        btc_cumulative_long,
+                        2
+                    ),
 
-                        "BTC 10M LOW-MOVE ALERT",
+                "cumulative_short_usd":
+                    round(
+                        btc_cumulative_short,
+                        2
+                    ),
 
-                        (
-                            f"SHORT LIQ CHANGE "
-                            f"+${liq_change:,.0f} | "
-                            f"BTC MOVE {price_move:,.0f} pts | "
-                            f"REF BTC {special_ref_price:,.0f} | "
-                            f"NOW BTC {current_price:,.0f}"
-                        )
-                    )
+                "cumulative_net_usd":
+                    round(
+                        btc_cumulative_net,
+                        2
+                    ),
 
+                "alert_sent":
+                    False
+            })
 
-                # New reference for next $10M block
-                special_ref_net = current_net
-                special_ref_price = current_price
+        # ==================================================
+        # FETCH ONLY NEW MINUTES
+        # ==================================================
 
+        from_timestamp = (
+            last_processed_liq_ts
+            + 60
+        )
 
-            # --------------------------------------------------
-            # -$10M NET CHANGE
-            # LONG LIQUIDATIONS
-            # --------------------------------------------------
+        fresh, error = (
+            get_fresh_btc_liquidations(
+                from_timestamp,
+                closed_minute
+            )
+        )
 
-            elif (
-                liq_change
-                <= -BTC_SPECIAL_LIQ_CHANGE
-            ):
+        if error:
 
-                special_direction = "LONG LIQ +10M"
+            # IMPORTANT:
+            # Do not advance last_processed timestamp
+            # if API failed.
+            return jsonify({
+                "ok": False,
+                "alert_sent": False,
+                "error": error
+            }), 429
 
+        # API succeeded, safe to advance
+        last_processed_liq_ts = (
+            closed_minute
+        )
 
-                if (
-                    price_move
-                    < BTC_SPECIAL_MAX_PRICE_MOVE
-                ):
+        fresh_long = (
+            fresh["fresh_long_usd"]
+        )
 
-                    special_alert_sent = send_pushover(
+        fresh_short = (
+            fresh["fresh_short_usd"]
+        )
 
-                        "BTC 10M LOW-MOVE ALERT",
+        fresh_net = (
+            fresh["fresh_net_usd"]
+        )
 
-                        (
-                            f"LONG LIQ CHANGE "
-                            f"-${abs(liq_change):,.0f} | "
-                            f"BTC MOVE {price_move:,.0f} pts | "
-                            f"REF BTC {special_ref_price:,.0f} | "
-                            f"NOW BTC {current_price:,.0f}"
-                        )
-                    )
+        # ==================================================
+        # ADD NEW LIQUIDATION FLOW TO CURRENT EVENT
+        # ==================================================
 
+        btc_cumulative_long += (
+            fresh_long
+        )
 
-                # New reference for next $10M block
-                special_ref_net = current_net
-                special_ref_price = current_price
+        btc_cumulative_short += (
+            fresh_short
+        )
 
+        btc_cumulative_net += (
+            fresh_net
+        )
+
+        # Price movement since CURRENT event started
+        price_move = abs(
+            current_price
+            - btc_event_ref_price
+        )
+
+        alert_sent = False
+        event_triggered = False
+        event_direction = None
+        low_move = False
+
+        completed_net = None
+        completed_long = None
+        completed_short = None
+        completed_ref_price = None
+        completed_price_move = None
+
+        # ==================================================
+        # +$10M NET SHORT LIQUIDATION
+        # SHORTS FORCE-CLOSED = BUY-SIDE EVENT
+        # ==================================================
+
+        if (
+            btc_cumulative_net
+            >= BTC_LIQ_THRESHOLD
+        ):
+
+            event_triggered = True
+            event_direction = "BUY"
+
+            completed_net = (
+                btc_cumulative_net
+            )
+
+            completed_long = (
+                btc_cumulative_long
+            )
+
+            completed_short = (
+                btc_cumulative_short
+            )
+
+            completed_ref_price = (
+                btc_event_ref_price
+            )
+
+            completed_price_move = (
+                price_move
+            )
+
+            low_move = (
+                price_move
+                < BTC_LOW_MOVE_POINTS
+            )
+
+            if low_move:
+
+                title = (
+                    "BTC 10M LOW-MOVE BUY"
+                )
+
+            else:
+
+                title = (
+                    "BTC 10M LIQUIDATION BUY"
+                )
+
+            alert_sent = send_pushover(
+                title,
+                (
+                    f"SHORT LIQ NET "
+                    f"+${completed_net:,.0f} | "
+                    f"SHORT ${completed_short:,.0f} | "
+                    f"LONG ${completed_long:,.0f} | "
+                    f"BTC MOVE "
+                    f"{completed_price_move:,.0f} pts | "
+                    f"REF BTC "
+                    f"{completed_ref_price:,.0f} | "
+                    f"NOW BTC "
+                    f"{current_price:,.0f} | "
+                    f"LOW MOVE "
+                    f"{'YES' if low_move else 'NO'}"
+                )
+            )
+
+            # RESET FOR NEXT FRESH $10M EVENT
+            btc_cumulative_net = 0.0
+            btc_cumulative_long = 0.0
+            btc_cumulative_short = 0.0
+
+            btc_event_ref_price = (
+                current_price
+            )
+
+        # ==================================================
+        # -$10M NET LONG LIQUIDATION
+        # LONGS FORCE-CLOSED = SELL-SIDE EVENT
+        # ==================================================
+
+        elif (
+            btc_cumulative_net
+            <= -BTC_LIQ_THRESHOLD
+        ):
+
+            event_triggered = True
+            event_direction = "SELL"
+
+            completed_net = (
+                btc_cumulative_net
+            )
+
+            completed_long = (
+                btc_cumulative_long
+            )
+
+            completed_short = (
+                btc_cumulative_short
+            )
+
+            completed_ref_price = (
+                btc_event_ref_price
+            )
+
+            completed_price_move = (
+                price_move
+            )
+
+            low_move = (
+                price_move
+                < BTC_LOW_MOVE_POINTS
+            )
+
+            if low_move:
+
+                title = (
+                    "BTC 10M LOW-MOVE SELL"
+                )
+
+            else:
+
+                title = (
+                    "BTC 10M LIQUIDATION SELL"
+                )
+
+            alert_sent = send_pushover(
+                title,
+                (
+                    f"LONG LIQ NET "
+                    f"-${abs(completed_net):,.0f} | "
+                    f"LONG ${completed_long:,.0f} | "
+                    f"SHORT ${completed_short:,.0f} | "
+                    f"BTC MOVE "
+                    f"{completed_price_move:,.0f} pts | "
+                    f"REF BTC "
+                    f"{completed_ref_price:,.0f} | "
+                    f"NOW BTC "
+                    f"{current_price:,.0f} | "
+                    f"LOW MOVE "
+                    f"{'YES' if low_move else 'NO'}"
+                )
+            )
+
+            # RESET FOR NEXT FRESH $10M EVENT
+            btc_cumulative_net = 0.0
+            btc_cumulative_long = 0.0
+            btc_cumulative_short = 0.0
+
+            btc_event_ref_price = (
+                current_price
+            )
 
         # ==================================================
         # RESPONSE
         # ==================================================
 
         return jsonify({
-
             "ok": True,
 
-            "window":
-                "rolling_last_60_minutes",
-
-            "current_1h_signal":
-                current_signal,
-
-            "held_state":
-                state_text,
-
-            "new_signal":
-                new_signal,
-
-            "normal_alert_sent":
-                normal_alert_sent,
-
-            "btc_liq_state":
-                btc_liq_state,
+            "mode":
+                "fresh_cumulative_no_time_limit",
 
             "btc_perpetual_symbols":
-                result["btc_perpetual_symbols"],
+                fresh[
+                    "btc_perpetual_symbols"
+                ],
 
-            "long_liquidations_usd":
-                long_total,
+            "fresh_long_usd":
+                fresh_long,
 
-            "short_liquidations_usd":
-                short_total,
+            "fresh_short_usd":
+                fresh_short,
 
-            "net_short_minus_long_usd":
-                current_net,
+            "fresh_net_usd":
+                fresh_net,
+
+            "btc_price":
+                round(
+                    current_price,
+                    2
+                ),
+
+            "event_reference_price":
+                round(
+                    btc_event_ref_price,
+                    2
+                ),
+
+            "current_price_move_points":
+                round(
+                    abs(
+                        current_price
+                        - btc_event_ref_price
+                    ),
+                    2
+                ),
+
+            "cumulative_long_usd":
+                round(
+                    btc_cumulative_long,
+                    2
+                ),
+
+            "cumulative_short_usd":
+                round(
+                    btc_cumulative_short,
+                    2
+                ),
+
+            "cumulative_net_usd":
+                round(
+                    btc_cumulative_net,
+                    2
+                ),
 
             "threshold_usd":
                 BTC_LIQ_THRESHOLD,
 
-            "btc_price":
-                current_price,
+            "event_triggered":
+                event_triggered,
 
-            # ------------------------------------------
-            # LOW-MOVE TRACKER
-            # ------------------------------------------
+            "event_direction":
+                event_direction,
 
-            "special_reference_net":
-                special_ref_net,
+            "low_move":
+                low_move,
 
-            "special_reference_price":
-                special_ref_price,
+            "completed_event_net":
+                completed_net,
 
-            "special_liquidation_change":
-                round(liq_change, 2),
+            "completed_event_long":
+                completed_long,
 
-            "special_price_move_points":
-                round(price_move, 2),
+            "completed_event_short":
+                completed_short,
 
-            "special_direction":
-                special_direction,
+            "completed_event_ref_price":
+                completed_ref_price,
 
-            "special_alert_sent":
-                special_alert_sent
+            "completed_event_price_move":
+                completed_price_move,
+
+            "alert_sent":
+                alert_sent,
+
+            "last_processed_liq_ts":
+                last_processed_liq_ts
         })
-
 
     except Exception as e:
 
         return jsonify({
             "ok": False,
-            "normal_alert_sent": False,
-            "special_alert_sent": False,
+            "alert_sent": False,
             "error": str(e)
         }), 500
 
