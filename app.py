@@ -52,12 +52,12 @@ entry_jpn_price = None
 # BTC LIQUIDATION SETTINGS
 # ==================================================
 
-# Main trend alert
+# Main BTC trend threshold
 BTC_LIQ_THRESHOLD = 10_000_000
 
-# Special alert:
-# liquidation net changes by $10M
-# but BTC price moves less than 500 points
+# Special LOW-MOVE alert
+# $10M liquidation-net change
+# while BTC price moves less than 500 points
 BTC_SPECIAL_LIQ_CHANGE = 10_000_000
 BTC_SPECIAL_MAX_PRICE_MOVE = 500
 
@@ -69,7 +69,7 @@ BTC_SPECIAL_MAX_PRICE_MOVE = 500
 btc_liq_state = 0
 
 
-# Special alert reference
+# Special LOW-MOVE reference
 special_ref_net = None
 special_ref_price = None
 
@@ -308,6 +308,8 @@ def webhook():
         current_nq = latest_price["NQ"]
         current_jpn = latest_price["JPN"]
 
+
+        # CLOSE PREVIOUS TRADE
 
         if (
             entry_side is not None
@@ -664,7 +666,7 @@ def calculate_btc_liquidations():
 
 
     # --------------------------------------------------
-    # GET BTC PRICE FOR SPECIAL ALERT
+    # GET BTC PRICE
     # --------------------------------------------------
 
     btc_price, price_error = get_btc_price()
@@ -744,13 +746,13 @@ def test_btc_aggregate():
 # ==================================================
 # BTC EVERY-MINUTE ALERT
 #
-# SAME CRON HANDLES:
+# SAME CRON:
 #
 # 1. NORMAL +/- $10M BUY / SELL
 #
-# 2. SPECIAL:
+# 2. BTC 10M LOW-MOVE ALERT
 #    $10M NET LIQUIDATION CHANGE
-#    + BTC PRICE MOVE < 500 POINTS
+#    + BTC PRICE MOVE <500 POINTS
 # ==================================================
 
 @app.get("/btc-minute-alert")
@@ -842,7 +844,7 @@ def btc_minute_alert():
 
 
         # --------------------------------------------------
-        # MAIN PUSHOVER
+        # NORMAL BTC PUSHOVER
         # --------------------------------------------------
 
         if new_signal == "BUY":
@@ -878,15 +880,13 @@ def btc_minute_alert():
 
 
         # ==================================================
-        # SPECIAL ALERT
+        # BTC 10M LOW-MOVE ALERT
         #
-        # LAST REFERENCE NET -> CURRENT NET
-        #
-        # +/- $10M CHANGE
+        # Reference net -> current net = +/- $10M
         #
         # AND
         #
-        # BTC PRICE MOVE < 500 POINTS
+        # Reference BTC -> current BTC <500 points
         # ==================================================
 
         special_alert_sent = False
@@ -897,8 +897,8 @@ def btc_minute_alert():
 
 
         # --------------------------------------------------
-        # FIRST RUN:
-        # SAVE STARTING REFERENCE
+        # FIRST SUCCESSFUL RUN
+        # SAVE REFERENCE
         # --------------------------------------------------
 
         if (
@@ -925,7 +925,7 @@ def btc_minute_alert():
 
             # --------------------------------------------------
             # +$10M NET CHANGE
-            # SHORT LIQUIDATIONS DOMINATING
+            # SHORT LIQUIDATIONS
             # --------------------------------------------------
 
             if (
@@ -943,26 +943,26 @@ def btc_minute_alert():
 
                     special_alert_sent = send_pushover(
 
-                        "BTC 10M LIQ / <500 MOVE",
+                        "BTC 10M LOW-MOVE ALERT",
 
                         (
                             f"SHORT LIQ CHANGE "
                             f"+${liq_change:,.0f} | "
                             f"BTC MOVE {price_move:,.0f} pts | "
-                            f"REF {special_ref_price:,.0f} | "
-                            f"NOW {current_price:,.0f}"
+                            f"REF BTC {special_ref_price:,.0f} | "
+                            f"NOW BTC {current_price:,.0f}"
                         )
                     )
 
 
-                # Start tracking next $10M block
+                # New reference for next $10M block
                 special_ref_net = current_net
                 special_ref_price = current_price
 
 
             # --------------------------------------------------
             # -$10M NET CHANGE
-            # LONG LIQUIDATIONS DOMINATING
+            # LONG LIQUIDATIONS
             # --------------------------------------------------
 
             elif (
@@ -980,19 +980,19 @@ def btc_minute_alert():
 
                     special_alert_sent = send_pushover(
 
-                        "BTC 10M LIQ / <500 MOVE",
+                        "BTC 10M LOW-MOVE ALERT",
 
                         (
                             f"LONG LIQ CHANGE "
                             f"-${abs(liq_change):,.0f} | "
                             f"BTC MOVE {price_move:,.0f} pts | "
-                            f"REF {special_ref_price:,.0f} | "
-                            f"NOW {current_price:,.0f}"
+                            f"REF BTC {special_ref_price:,.0f} | "
+                            f"NOW BTC {current_price:,.0f}"
                         )
                     )
 
 
-                # Start tracking next $10M block
+                # New reference for next $10M block
                 special_ref_net = current_net
                 special_ref_price = current_price
 
@@ -1042,7 +1042,7 @@ def btc_minute_alert():
                 current_price,
 
             # ------------------------------------------
-            # SPECIAL TRACKER
+            # LOW-MOVE TRACKER
             # ------------------------------------------
 
             "special_reference_net":
