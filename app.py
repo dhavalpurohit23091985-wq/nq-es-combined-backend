@@ -115,55 +115,56 @@ def send_pushover(title, message):
             timeout=10
         )
 
-        return response.ok
+        try:
+                long_value = float(
+                    row.get(
+                        "l",
+                        0
+                    ) or 0
+                )
 
-    except requests.RequestException:
-        return False
-def log_btc_liquidation_to_sheet(
-    row_ts,
-    symbol,
-    price,
-    value,
-    side,
-):
-    if not GOOGLE_SHEET_WEBAPP_URL:
-        return False
+                short_value = float(
+                    row.get(
+                        "s",
+                        0
+                    ) or 0
+                )
 
-    try:
-        ist = timezone(
-            timedelta(
-                hours=5,
-                minutes=30,
-            )
-        )
+                fresh_long += long_value
+                fresh_short += short_value
 
-        time_ist = datetime.fromtimestamp(
-            row_ts,
-            tz=ist,
-        ).strftime(
-            "%d-%m-%Y %H:%M"
-        )
+                symbol_name = (
+                    symbol_data.get("symbol")
+                    or asset
+                )
 
-        response = requests.post(
-            GOOGLE_SHEET_WEBAPP_URL,
-            json={
-                "time": time_ist,
-                "symbol": symbol,
-                "price": round(float(price), 2),
-                "value": round(float(value), 2),
-                "side": side,
-            },
-            timeout=10,
-        )
+                if (
+                    asset == "BTC"
+                    and long_value >= 100000
+                ):
+                    large_events.append({
+                        "t": row_ts,
+                        "symbol": symbol_name,
+                        "value": long_value,
+                        "side": "LONG",
+                    })
 
-        return response.ok
+                if (
+                    asset == "BTC"
+                    and short_value >= 100000
+                ):
+                    large_events.append({
+                        "t": row_ts,
+                        "symbol": symbol_name,
+                        "value": short_value,
+                        "side": "SHORT",
+                    })
 
-    except Exception as e:
-        print(
-            "Google Sheet logger error:",
-            str(e),
-        )
-        return False
+            except (
+                TypeError,
+                ValueError
+            ):
+                continue
 
 # ==================================================
 # GET FUTURE MARKETS
