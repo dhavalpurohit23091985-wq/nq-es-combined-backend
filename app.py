@@ -1344,11 +1344,11 @@ def process_btc(
 
 
     fresh_long = (
-        fresh[]
+        fresh["fresh_long_usd"]
     )
 
     fresh_short = (
-    fresh["fresh_short_usd"]
+        fresh["fresh_short_usd"]
 )
 
 for event in fresh.get(
