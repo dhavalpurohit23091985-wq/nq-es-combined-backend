@@ -55,22 +55,36 @@ entry_jpn_price = None
 BTC_LIQ_THRESHOLD = 5_000_000
 BTC_LOW_MOVE_POINTS = 500
 
-
-# Fresh cycle counters
 btc_long_cumulative = 0.0
 btc_short_cumulative = 0.0
 
-
-# One common cycle reference price
 btc_cycle_ref_price = None
+btc_last_processed_liq_ts = None
 
-
-# Last fully processed 1-minute liquidation timestamp
-last_processed_liq_ts = None
-
-
-# Cache BTC perpetual symbols
 btc_symbol_cache = None
+
+
+# ==================================================
+# XAU FRESH LIQUIDATION SETTINGS
+# ==================================================
+
+XAU_LIQ_THRESHOLD = 1_000_000
+
+xau_long_cumulative = 0.0
+xau_short_cumulative = 0.0
+
+xau_cycle_ref_price = None
+xau_last_processed_liq_ts = None
+
+xau_symbol_cache = None
+xau_price_symbol_cache = None
+
+
+# ==================================================
+# FUTURE MARKETS CACHE
+# ==================================================
+
+future_markets_cache = None
 
 
 # ==================================================
@@ -93,6 +107,7 @@ def send_pushover(title, message):
     }
 
     try:
+
         response = requests.post(
             PUSHOVER_URL,
             data=payload,
@@ -106,6 +121,57 @@ def send_pushover(title, message):
 
 
 # ==================================================
+# GET FUTURE MARKETS
+# ==================================================
+
+def get_future_markets():
+
+    global future_markets_cache
+
+    if future_markets_cache is not None:
+        return future_markets_cache, None
+
+    try:
+
+        response = requests.get(
+            "https://api.coinalyze.net/v1/future-markets",
+            headers={
+                "api_key": COINALYZE_API_KEY
+            },
+            timeout=10
+        )
+
+    except requests.RequestException as e:
+
+        return None, {
+            "stage": "future-markets",
+            "error": str(e)
+        }
+
+    if response.status_code != 200:
+
+        return None, {
+            "stage": "future-markets",
+            "status_code": response.status_code,
+            "response": response.text[:500]
+        }
+
+    try:
+        markets = response.json()
+
+    except ValueError:
+
+        return None, {
+            "stage": "future-markets",
+            "error": "invalid json"
+        }
+
+    future_markets_cache = markets
+
+    return markets, None
+
+
+# ==================================================
 # HOME
 # ==================================================
 
@@ -114,40 +180,87 @@ def home():
 
     return jsonify({
         "status": "ok",
-        "service": "NQ + ES + BTC Fresh Liquidation Backend",
 
-        "nq_es_threshold": THRESHOLD,
+        "service":
+            "NQ + ES + BTC + XAU Fresh Liquidation Backend",
 
-        "btc_liquidation_threshold": BTC_LIQ_THRESHOLD,
-        "btc_low_move_points": BTC_LOW_MOVE_POINTS,
+        "nq_es_threshold":
+            THRESHOLD,
 
-        "btc_long_cumulative": round(
-            btc_long_cumulative,
-            2
-        ),
+        # BTC
+        "btc_liquidation_threshold":
+            BTC_LIQ_THRESHOLD,
 
-        "btc_short_cumulative": round(
-            btc_short_cumulative,
-            2
-        ),
+        "btc_low_move_points":
+            BTC_LOW_MOVE_POINTS,
 
-        "btc_cycle_ref_price": btc_cycle_ref_price,
+        "btc_long_cumulative":
+            round(
+                btc_long_cumulative,
+                2
+            ),
 
-        "last_processed_liq_ts":
-            last_processed_liq_ts,
+        "btc_short_cumulative":
+            round(
+                btc_short_cumulative,
+                2
+            ),
 
-        "nq_delta": latest_delta["NQ"],
-        "es_delta": latest_delta["ES"],
+        "btc_cycle_ref_price":
+            btc_cycle_ref_price,
 
-        "nq_price": latest_price["NQ"],
-        "es_price": latest_price["ES"],
-        "jpn_price": latest_price["JPN"],
+        "btc_last_processed_liq_ts":
+            btc_last_processed_liq_ts,
 
-        "nq_es_state": state,
+        # XAU
+        "xau_liquidation_threshold":
+            XAU_LIQ_THRESHOLD,
 
-        "entry_side": entry_side,
-        "entry_nq_price": entry_nq_price,
-        "entry_jpn_price": entry_jpn_price
+        "xau_long_cumulative":
+            round(
+                xau_long_cumulative,
+                2
+            ),
+
+        "xau_short_cumulative":
+            round(
+                xau_short_cumulative,
+                2
+            ),
+
+        "xau_cycle_ref_price":
+            xau_cycle_ref_price,
+
+        "xau_last_processed_liq_ts":
+            xau_last_processed_liq_ts,
+
+        # NQ ES JPN
+        "nq_delta":
+            latest_delta["NQ"],
+
+        "es_delta":
+            latest_delta["ES"],
+
+        "nq_price":
+            latest_price["NQ"],
+
+        "es_price":
+            latest_price["ES"],
+
+        "jpn_price":
+            latest_price["JPN"],
+
+        "nq_es_state":
+            state,
+
+        "entry_side":
+            entry_side,
+
+        "entry_nq_price":
+            entry_nq_price,
+
+        "entry_jpn_price":
+            entry_jpn_price
     })
 
 
@@ -166,6 +279,7 @@ def webhook():
     secret = request.args.get("secret", "")
 
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+
         return jsonify({
             "ok": False,
             "error": "unauthorized"
@@ -213,6 +327,7 @@ def webhook():
     ).upper()
 
     try:
+
         price = float(
             data.get("price")
         )
@@ -246,6 +361,7 @@ def webhook():
     # ----------------------------------------------
 
     try:
+
         delta = float(
             data.get("delta")
         )
@@ -265,6 +381,7 @@ def webhook():
         instrument = "ES"
 
     else:
+
         return jsonify({
             "ok": False,
             "error": "symbol must be NQ, ES or JPN"
@@ -427,80 +544,120 @@ def webhook():
 
 
 # ==================================================
-# GET BTC PERPETUAL SYMBOLS
+# GET PERPETUAL SYMBOLS
 # ==================================================
 
-def get_btc_perpetual_symbols():
+def get_perpetual_symbols(asset):
 
     global btc_symbol_cache
+    global xau_symbol_cache
+    global xau_price_symbol_cache
 
 
-    if btc_symbol_cache:
+    asset = asset.upper()
+
+
+    if asset == "BTC" and btc_symbol_cache:
         return btc_symbol_cache, None
 
 
-    try:
-
-        response = requests.get(
-            "https://api.coinalyze.net/v1/future-markets",
-            headers={
-                "api_key": COINALYZE_API_KEY
-            },
-            timeout=10
-        )
-
-    except requests.RequestException as e:
-
-        return None, {
-            "stage": "future-markets",
-            "error": str(e)
-        }
+    if asset == "XAU" and xau_symbol_cache:
+        return xau_symbol_cache, None
 
 
-    if response.status_code != 200:
-
-        return None, {
-            "stage": "future-markets",
-            "status_code": response.status_code,
-            "response": response.text[:500]
-        }
+    markets, error = get_future_markets()
 
 
-    markets = response.json()
+    if error:
+        return None, error
 
-    btc_symbols = []
+
+    symbols = []
+    price_symbol = None
 
 
     for market in markets:
 
+        base_asset = str(
+            market.get(
+                "base_asset",
+                ""
+            )
+        ).upper()
+
+
         if (
-            market.get("base_asset") == "BTC"
+            base_asset == asset
             and market.get("is_perpetual") is True
         ):
 
             symbol = market.get("symbol")
 
             if symbol:
-                btc_symbols.append(symbol)
+                symbols.append(symbol)
 
 
-    btc_symbols = list(
+            # Pick first XAU perpetual having OHLCV data
+            if (
+                asset == "XAU"
+                and price_symbol is None
+                and market.get(
+                    "has_ohlcv_data"
+                ) is True
+                and symbol
+            ):
+                price_symbol = symbol
+
+
+    symbols = list(
         dict.fromkeys(
-            btc_symbols
+            symbols
         )
     )
 
 
-    btc_symbol_cache = btc_symbols
+    if not symbols:
 
-    return btc_symbols, None
+        return None, {
+            "stage":
+                f"{asset.lower()}-symbols",
+
+            "error":
+                f"no {asset} perpetual symbols found"
+        }
+
+
+    if asset == "BTC":
+
+        btc_symbol_cache = symbols
+
+
+    elif asset == "XAU":
+
+        xau_symbol_cache = symbols
+
+        if price_symbol:
+            xau_price_symbol_cache = (
+                price_symbol
+            )
+
+        elif symbols:
+            xau_price_symbol_cache = (
+                symbols[0]
+            )
+
+
+    return symbols, None
 
 
 # ==================================================
-# GET CURRENT BTC PRICE
+# GET CURRENT PRICE FROM COINALYZE
 # ==================================================
 
-def get_btc_price():
+def get_coinalyze_price(
+    symbol,
+    stage_name
+):
 
     now = int(time.time())
 
@@ -510,13 +667,14 @@ def get_btc_price():
         response = requests.get(
             "https://api.coinalyze.net/v1/ohlcv-history",
             params={
-                "symbols": "BTCUSDT_PERP.A",
+                "symbols": symbol,
                 "interval": "1min",
                 "from": now - 300,
                 "to": now
             },
             headers={
-                "api_key": COINALYZE_API_KEY
+                "api_key":
+                    COINALYZE_API_KEY
             },
             timeout=10
         )
@@ -524,7 +682,7 @@ def get_btc_price():
     except requests.RequestException as e:
 
         return None, {
-            "stage": "btc-price",
+            "stage": stage_name,
             "error": str(e)
         }
 
@@ -532,21 +690,32 @@ def get_btc_price():
     if response.status_code != 200:
 
         return None, {
-            "stage": "btc-price",
+            "stage":
+                stage_name,
+
             "status_code":
                 response.status_code,
+
             "response":
                 response.text[:500]
         }
 
 
-    data = response.json()
+    try:
+        data = response.json()
+
+    except ValueError:
+
+        return None, {
+            "stage": stage_name,
+            "error": "invalid json"
+        }
 
 
     if not data:
 
         return None, {
-            "stage": "btc-price",
+            "stage": stage_name,
             "error": "empty response"
         }
 
@@ -560,14 +729,14 @@ def get_btc_price():
     if not history:
 
         return None, {
-            "stage": "btc-price",
+            "stage": stage_name,
             "error": "no price history"
         }
 
 
     try:
 
-        btc_price = float(
+        price = float(
             history[-1]["c"]
         )
 
@@ -578,25 +747,78 @@ def get_btc_price():
     ):
 
         return None, {
-            "stage": "btc-price",
-            "error": "invalid BTC close"
+            "stage": stage_name,
+            "error": "invalid close"
         }
 
 
-    return btc_price, None
+    return price, None
 
 
 # ==================================================
-# GET FRESH CLOSED-MINUTE LIQUIDATIONS
+# BTC PRICE
 # ==================================================
 
-def get_fresh_btc_liquidations(
+def get_btc_price():
+
+    return get_coinalyze_price(
+        "BTCUSDT_PERP.A",
+        "btc-price"
+    )
+
+
+# ==================================================
+# XAU PRICE
+# ==================================================
+
+def get_xau_price():
+
+    global xau_price_symbol_cache
+
+
+    if not xau_price_symbol_cache:
+
+        _, error = (
+            get_perpetual_symbols(
+                "XAU"
+            )
+        )
+
+        if error:
+            return None, error
+
+
+    if not xau_price_symbol_cache:
+
+        return None, {
+            "stage":
+                "xau-price",
+
+            "error":
+                "no XAU OHLCV symbol found"
+        }
+
+
+    return get_coinalyze_price(
+        xau_price_symbol_cache,
+        "xau-price"
+    )
+
+
+# ==================================================
+# GENERIC FRESH CLOSED-MINUTE LIQUIDATIONS
+# ==================================================
+
+def get_fresh_liquidations(
+    asset,
     previous_ts,
     closed_minute_ts
 ):
 
-    btc_symbols, error = (
-        get_btc_perpetual_symbols()
+    symbols, error = (
+        get_perpetual_symbols(
+            asset
+        )
     )
 
 
@@ -622,16 +844,19 @@ def get_fresh_btc_liquidations(
         closed_minute_ts - 3600
     )
 
-    query_to = closed_minute_ts + 59
+    query_to = (
+        closed_minute_ts
+        + 59
+    )
 
 
     for i in range(
         0,
-        len(btc_symbols),
+        len(symbols),
         20
     ):
 
-        batch = btc_symbols[
+        batch = symbols[
             i:i + 20
         ]
 
@@ -666,8 +891,11 @@ def get_fresh_btc_liquidations(
         except requests.RequestException as e:
 
             failed_batches.append({
-                "symbols": batch,
-                "error": str(e)
+                "symbols":
+                    batch,
+
+                "error":
+                    str(e)
             })
 
             continue
@@ -691,7 +919,21 @@ def get_fresh_btc_liquidations(
 
         successful_batches += 1
 
-        data = response.json()
+
+        try:
+            data = response.json()
+
+        except ValueError:
+
+            failed_batches.append({
+                "symbols":
+                    batch,
+
+                "error":
+                    "invalid json"
+            })
+
+            continue
 
 
         for symbol_data in data:
@@ -705,6 +947,7 @@ def get_fresh_btc_liquidations(
             for row in history:
 
                 try:
+
                     row_ts = int(
                         row.get(
                             "t",
@@ -754,7 +997,7 @@ def get_fresh_btc_liquidations(
 
         return None, {
             "stage":
-                "liquidation-history",
+                f"{asset.lower()}-liquidation-history",
 
             "error":
                 "one_or_more_batches_failed",
@@ -768,8 +1011,11 @@ def get_fresh_btc_liquidations(
 
 
     return {
-        "btc_perpetual_symbols":
-            len(btc_symbols),
+        "asset":
+            asset,
+
+        "perpetual_symbols":
+            len(symbols),
 
         "successful_batch_count":
             successful_batches,
@@ -825,7 +1071,7 @@ def test_btc_aggregate():
             btc_cycle_ref_price,
 
         "last_processed_liq_ts":
-            last_processed_liq_ts,
+            btc_last_processed_liq_ts,
 
         "cached_btc_symbols":
             (
@@ -837,375 +1083,133 @@ def test_btc_aggregate():
 
 
 # ==================================================
-# BTC EVERY-MINUTE FRESH LIQUIDATION ALERT
+# XAU READ-ONLY STATE
 # ==================================================
 
-@app.get("/btc-minute-alert")
-def btc_minute_alert():
+@app.get("/test-xau-aggregate")
+def test_xau_aggregate():
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+
+        "xau_long_cumulative":
+            round(
+                xau_long_cumulative,
+                2
+            ),
+
+        "xau_short_cumulative":
+            round(
+                xau_short_cumulative,
+                2
+            ),
+
+        "threshold_usd":
+            XAU_LIQ_THRESHOLD,
+
+        "xau_cycle_ref_price":
+            xau_cycle_ref_price,
+
+        "last_processed_liq_ts":
+            xau_last_processed_liq_ts,
+
+        "cached_xau_symbols":
+            (
+                len(xau_symbol_cache)
+                if xau_symbol_cache
+                else 0
+            ),
+
+        "xau_price_symbol":
+            xau_price_symbol_cache
+    })
+
+
+# ==================================================
+# BTC PROCESSOR
+# ==================================================
+
+def process_btc(
+    closed_minute_ts
+):
 
     global btc_long_cumulative
     global btc_short_cumulative
 
     global btc_cycle_ref_price
 
-    global last_processed_liq_ts
+    global btc_last_processed_liq_ts
 
 
-    try:
-
-        now = int(time.time())
-
-
-        # ------------------------------------------
-        # Latest FULLY CLOSED 1-minute candle
-        # ------------------------------------------
-
-        current_minute_start = (
-            now // 60
-        ) * 60
-
-        closed_minute_ts = (
-            current_minute_start
-            - 60
-        )
+    btc_price, price_error = (
+        get_btc_price()
+    )
 
 
-        # ------------------------------------------
-        # BTC PRICE
-        # ------------------------------------------
+    if price_error:
 
-        btc_price, price_error = (
-            get_btc_price()
-        )
-
-
-        if price_error:
-
-            return jsonify({
-                "ok": False,
-                "alert_sent": False,
-                "error": price_error
-            }), 429
+        return {
+            "ok": False,
+            "asset": "BTC",
+            "alert_sent": False,
+            "error": price_error
+        }
 
 
-        # ------------------------------------------
-        # FIRST RUN AFTER DEPLOY
-        # ------------------------------------------
+    # ----------------------------------------------
+    # FIRST RUN
+    # ----------------------------------------------
 
-        if last_processed_liq_ts is None:
+    if btc_last_processed_liq_ts is None:
 
-            last_processed_liq_ts = (
-                closed_minute_ts
-            )
-
-            btc_cycle_ref_price = (
-                btc_price
-            )
-
-
-            return jsonify({
-                "ok": True,
-
-                "initialized": True,
-
-                "message":
-                    "BTC fresh liquidation cycle initialized",
-
-                "btc_price":
-                    round(
-                        btc_price,
-                        2
-                    ),
-
-                "long_cumulative_usd":
-                    0,
-
-                "short_cumulative_usd":
-                    0,
-
-                "cycle_reference_price":
-                    btc_cycle_ref_price,
-
-                "last_processed_liq_ts":
-                    last_processed_liq_ts
-            })
-
-
-        # ------------------------------------------
-        # NOTHING NEW YET
-        # ------------------------------------------
-
-        if (
-            closed_minute_ts
-            <= last_processed_liq_ts
-        ):
-
-            return jsonify({
-                "ok": True,
-
-                "new_closed_minute":
-                    False,
-
-                "btc_price":
-                    round(
-                        btc_price,
-                        2
-                    ),
-
-                "long_cumulative_usd":
-                    round(
-                        btc_long_cumulative,
-                        2
-                    ),
-
-                "short_cumulative_usd":
-                    round(
-                        btc_short_cumulative,
-                        2
-                    ),
-
-                "cycle_reference_price":
-                    btc_cycle_ref_price,
-
-                "last_processed_liq_ts":
-                    last_processed_liq_ts
-            })
-
-
-        # ------------------------------------------
-        # GET FRESH CLOSED MINUTE DATA
-        # ------------------------------------------
-
-        fresh, error = (
-            get_fresh_btc_liquidations(
-                last_processed_liq_ts,
-                closed_minute_ts
-            )
-        )
-
-
-        if error:
-
-            return jsonify({
-                "ok": False,
-
-                "alert_sent": False,
-
-                "long_cumulative_usd":
-                    round(
-                        btc_long_cumulative,
-                        2
-                    ),
-
-                "short_cumulative_usd":
-                    round(
-                        btc_short_cumulative,
-                        2
-                    ),
-
-                "last_processed_liq_ts":
-                    last_processed_liq_ts,
-
-                "error":
-                    error
-            }), 429
-
-
-        fresh_long = (
-            fresh["fresh_long_usd"]
-        )
-
-        fresh_short = (
-            fresh["fresh_short_usd"]
-        )
-
-
-        # ------------------------------------------
-        # ADD BOTH SIDES TO CURRENT CYCLE
-        # ------------------------------------------
-
-        btc_long_cumulative += (
-            fresh_long
-        )
-
-        btc_short_cumulative += (
-            fresh_short
-        )
-
-
-        last_processed_liq_ts = (
+        btc_last_processed_liq_ts = (
             closed_minute_ts
         )
 
-
-        # Save cycle values BEFORE any reset
-        cycle_long = (
-            btc_long_cumulative
+        btc_cycle_ref_price = (
+            btc_price
         )
 
-        cycle_short = (
-            btc_short_cumulative
-        )
+        btc_long_cumulative = 0.0
+        btc_short_cumulative = 0.0
 
 
-        # ------------------------------------------
-        # CHECK WHICH SIDE HIT 5M
-        # ------------------------------------------
-
-        long_hit = (
-            cycle_long
-            >= BTC_LIQ_THRESHOLD
-        )
-
-        short_hit = (
-            cycle_short
-            >= BTC_LIQ_THRESHOLD
-        )
-
-
-        alert_sent = False
-        cycle_winner = None
-
-        btc_price_move = None
-        low_move = False
-
-
-        if btc_cycle_ref_price is not None:
-
-            btc_price_move = abs(
-                btc_price
-                - btc_cycle_ref_price
-            )
-
-            low_move = (
-                btc_price_move
-                < BTC_LOW_MOVE_POINTS
-            )
-
-
-        # ------------------------------------------
-        # A CYCLE HAS COMPLETED
-        # ------------------------------------------
-
-        if long_hit or short_hit:
-
-            if long_hit and short_hit:
-
-                cycle_winner = (
-                    "BOTH HIT SAME MINUTE"
-                )
-
-                alert_title = (
-                    "BTC BOTH LIQ +5M"
-                )
-
-            elif long_hit:
-
-                cycle_winner = (
-                    "LONG"
-                )
-
-                alert_title = (
-                    "BTC LONG LIQ +5M"
-                )
-
-            else:
-
-                cycle_winner = (
-                    "SHORT"
-                )
-
-                alert_title = (
-                    "BTC SHORT LIQ +5M"
-                )
-
-
-            move_text = (
-                f"{btc_price_move:,.0f} pts"
-                if btc_price_move
-                is not None
-                else "NA"
-            )
-
-
-            low_move_text = (
-                " | LOW-MOVE YES"
-                if low_move
-                else ""
-            )
-
-
-            alert_sent = send_pushover(
-                alert_title,
-                (
-                    f"WINNER {cycle_winner} | "
-                    f"LONG ${cycle_long:,.0f} | "
-                    f"SHORT ${cycle_short:,.0f} | "
-                    f"BTC {btc_price:,.0f} | "
-                    f"BTC MOVE {move_text}"
-                    f"{low_move_text}"
-                )
-            )
-
-
-            # --------------------------------------
-            # RESET BOTH SIDES = NEW FRESH CYCLE
-            # --------------------------------------
-
-            btc_long_cumulative = 0.0
-            btc_short_cumulative = 0.0
-
-            btc_cycle_ref_price = (
-                btc_price
-            )
-
-
-        # ------------------------------------------
-        # RESPONSE
-        # ------------------------------------------
-
-        return jsonify({
+        return {
             "ok": True,
-
-            "initialized":
-                False,
-
-            "btc_perpetual_symbols":
-                fresh[
-                    "btc_perpetual_symbols"
-                ],
-
-            "successful_batch_count":
-                fresh[
-                    "successful_batch_count"
-                ],
-
+            "asset": "BTC",
+            "initialized": True,
             "btc_price":
                 round(
                     btc_price,
                     2
                 ),
+            "long_cumulative_usd": 0,
+            "short_cumulative_usd": 0,
+            "cycle_reference_price":
+                btc_cycle_ref_price,
+            "last_processed_liq_ts":
+                btc_last_processed_liq_ts
+        }
 
-            "fresh_long_usd":
-                fresh_long,
 
-            "fresh_short_usd":
-                fresh_short,
+    # ----------------------------------------------
+    # NO NEW MINUTE
+    # ----------------------------------------------
 
-            "fresh_net_short_minus_long":
-                fresh[
-                    "fresh_net_short_minus_long"
-                ],
+    if (
+        closed_minute_ts
+        <= btc_last_processed_liq_ts
+    ):
 
-            "cycle_long_before_reset":
+        return {
+            "ok": True,
+            "asset": "BTC",
+            "new_closed_minute": False,
+
+            "btc_price":
                 round(
-                    cycle_long,
-                    2
-                ),
-
-            "cycle_short_before_reset":
-                round(
-                    cycle_short,
+                    btc_price,
                     2
                 ),
 
@@ -1221,60 +1225,209 @@ def btc_minute_alert():
                     2
                 ),
 
-            "threshold_usd":
-                BTC_LIQ_THRESHOLD,
-
-            "cycle_winner":
-                cycle_winner,
-
-            "alert_sent":
-                alert_sent,
-
-            "btc_price_move_points":
-                (
-                    round(
-                        btc_price_move,
-                        2
-                    )
-                    if btc_price_move
-                    is not None
-                    else None
-                ),
-
-            "low_move":
-                low_move,
-
             "cycle_reference_price":
                 btc_cycle_ref_price,
 
             "last_processed_liq_ts":
-                last_processed_liq_ts
-        })
+                btc_last_processed_liq_ts
+        }
 
 
-    except Exception as e:
-
-        return jsonify({
-            "ok": False,
-            "alert_sent": False,
-            "error": str(e)
-        }), 500
-
-
-# ==================================================
-# START SERVER
-# ==================================================
-
-if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
+    fresh, error = (
+        get_fresh_liquidations(
+            "BTC",
+            btc_last_processed_liq_ts,
+            closed_minute_ts
         )
     )
 
-    app.run(
-        host="0.0.0.0",
-        port=port
+
+    if error:
+
+        return {
+            "ok": False,
+            "asset": "BTC",
+            "alert_sent": False,
+
+            "long_cumulative_usd":
+                round(
+                    btc_long_cumulative,
+                    2
+                ),
+
+            "short_cumulative_usd":
+                round(
+                    btc_short_cumulative,
+                    2
+                ),
+
+            "last_processed_liq_ts":
+                btc_last_processed_liq_ts,
+
+            "error":
+                error
+        }
+
+
+    fresh_long = (
+        fresh["fresh_long_usd"]
     )
+
+    fresh_short = (
+        fresh["fresh_short_usd"]
+    )
+
+
+    btc_long_cumulative += (
+        fresh_long
+    )
+
+    btc_short_cumulative += (
+        fresh_short
+    )
+
+
+    btc_last_processed_liq_ts = (
+        closed_minute_ts
+    )
+
+
+    cycle_long = (
+        btc_long_cumulative
+    )
+
+    cycle_short = (
+        btc_short_cumulative
+    )
+
+    cycle_gap = abs(
+        cycle_long
+        - cycle_short
+    )
+
+
+    long_hit = (
+        cycle_long
+        >= BTC_LIQ_THRESHOLD
+    )
+
+    short_hit = (
+        cycle_short
+        >= BTC_LIQ_THRESHOLD
+    )
+
+
+    alert_sent = False
+    cycle_winner = None
+
+    btc_price_move = None
+    low_move = False
+
+
+    if btc_cycle_ref_price is not None:
+
+        btc_price_move = abs(
+            btc_price
+            - btc_cycle_ref_price
+        )
+
+        low_move = (
+            btc_price_move
+            < BTC_LOW_MOVE_POINTS
+        )
+
+
+    if long_hit or short_hit:
+
+        if long_hit and short_hit:
+
+            cycle_winner = (
+                "BOTH HIT SAME MINUTE"
+            )
+
+            alert_title = (
+                "BTC BOTH HIT +5M"
+            )
+
+        elif long_hit:
+
+            cycle_winner = (
+                "LONG"
+            )
+
+            alert_title = (
+                "BTC LONG WINS +5M"
+            )
+
+        else:
+
+            cycle_winner = (
+                "SHORT"
+            )
+
+            alert_title = (
+                "BTC SHORT WINS +5M"
+            )
+
+
+        move_text = (
+            f"{btc_price_move:,.0f} pts"
+            if btc_price_move
+            is not None
+            else "NA"
+        )
+
+
+        low_move_text = (
+            " | LOW-MOVE YES"
+            if low_move
+            else ""
+        )
+
+
+        alert_sent = send_pushover(
+            alert_title,
+            (
+                f"WINNER {cycle_winner} | "
+                f"LONG ${cycle_long:,.0f} | "
+                f"SHORT ${cycle_short:,.0f} | "
+                f"GAP ${cycle_gap:,.0f} | "
+                f"BTC {btc_price:,.0f} | "
+                f"BTC MOVE {move_text}"
+                f"{low_move_text}"
+            )
+        )
+
+
+        # RESET BOTH
+        btc_long_cumulative = 0.0
+        btc_short_cumulative = 0.0
+
+        btc_cycle_ref_price = (
+            btc_price
+        )
+
+
+    return {
+        "ok": True,
+        "asset": "BTC",
+
+        "initialized": False,
+
+        "perpetual_symbols":
+            fresh[
+                "perpetual_symbols"
+            ],
+
+        "successful_batch_count":
+            fresh[
+                "successful_batch_count"
+            ],
+
+        "price":
+            round(
+                btc_price,
+                2
+            ),
+
+        "fresh
