@@ -56,14 +56,13 @@ BTC_LIQ_THRESHOLD = 5_000_000
 BTC_LOW_MOVE_POINTS = 500
 
 
-# Separate cumulative counters
+# Fresh cycle counters
 btc_long_cumulative = 0.0
 btc_short_cumulative = 0.0
 
 
-# Separate BTC price references
-btc_long_ref_price = None
-btc_short_ref_price = None
+# One common cycle reference price
+btc_cycle_ref_price = None
 
 
 # Last fully processed 1-minute liquidation timestamp
@@ -132,8 +131,7 @@ def home():
             2
         ),
 
-        "btc_long_ref_price": btc_long_ref_price,
-        "btc_short_ref_price": btc_short_ref_price,
+        "btc_cycle_ref_price": btc_cycle_ref_price,
 
         "last_processed_liq_ts":
             last_processed_liq_ts,
@@ -317,7 +315,6 @@ def webhook():
         current_jpn = latest_price["JPN"]
 
 
-        # Close previous trade
         if (
             entry_side is not None
             and entry_nq_price is not None
@@ -438,7 +435,6 @@ def get_btc_perpetual_symbols():
     global btc_symbol_cache
 
 
-    # Use cached list after first successful fetch
     if btc_symbol_cache:
         return btc_symbol_cache, None
 
@@ -621,8 +617,6 @@ def get_fresh_btc_liquidations(
     )
 
 
-    # Start a little before target.
-    # We filter rows ourselves by timestamp.
     query_from = max(
         previous_ts,
         closed_minute_ts - 3600
@@ -725,7 +719,6 @@ def get_fresh_btc_liquidations(
                     continue
 
 
-                # ONLY NEW, FULLY CLOSED MINUTES
                 if not (
                     previous_ts
                     < row_ts
@@ -757,9 +750,6 @@ def get_fresh_btc_liquidations(
                     continue
 
 
-    # IMPORTANT:
-    # If even one batch fails,
-    # DO NOT advance timestamp.
     if failed_batches:
 
         return None, {
@@ -831,11 +821,8 @@ def test_btc_aggregate():
         "threshold_usd":
             BTC_LIQ_THRESHOLD,
 
-        "btc_long_ref_price":
-            btc_long_ref_price,
-
-        "btc_short_ref_price":
-            btc_short_ref_price,
+        "btc_cycle_ref_price":
+            btc_cycle_ref_price,
 
         "last_processed_liq_ts":
             last_processed_liq_ts,
@@ -859,8 +846,7 @@ def btc_minute_alert():
     global btc_long_cumulative
     global btc_short_cumulative
 
-    global btc_long_ref_price
-    global btc_short_ref_price
+    global btc_cycle_ref_price
 
     global last_processed_liq_ts
 
@@ -885,7 +871,7 @@ def btc_minute_alert():
 
 
         # ------------------------------------------
-        # Get BTC price
+        # BTC PRICE
         # ------------------------------------------
 
         btc_price, price_error = (
@@ -904,7 +890,6 @@ def btc_minute_alert():
 
         # ------------------------------------------
         # FIRST RUN AFTER DEPLOY
-        # No old liquidation backfill
         # ------------------------------------------
 
         if last_processed_liq_ts is None:
@@ -913,11 +898,7 @@ def btc_minute_alert():
                 closed_minute_ts
             )
 
-            btc_long_ref_price = (
-                btc_price
-            )
-
-            btc_short_ref_price = (
+            btc_cycle_ref_price = (
                 btc_price
             )
 
@@ -928,7 +909,7 @@ def btc_minute_alert():
                 "initialized": True,
 
                 "message":
-                    "BTC fresh liquidation tracking initialized",
+                    "BTC fresh liquidation cycle initialized",
 
                 "btc_price":
                     round(
@@ -942,11 +923,8 @@ def btc_minute_alert():
                 "short_cumulative_usd":
                     0,
 
-                "long_reference_price":
-                    btc_long_ref_price,
-
-                "short_reference_price":
-                    btc_short_ref_price,
+                "cycle_reference_price":
+                    btc_cycle_ref_price,
 
                 "last_processed_liq_ts":
                     last_processed_liq_ts
@@ -954,7 +932,7 @@ def btc_minute_alert():
 
 
         # ------------------------------------------
-        # Nothing new yet
+        # NOTHING NEW YET
         # ------------------------------------------
 
         if (
@@ -986,13 +964,16 @@ def btc_minute_alert():
                         2
                     ),
 
+                "cycle_reference_price":
+                    btc_cycle_ref_price,
+
                 "last_processed_liq_ts":
                     last_processed_liq_ts
             })
 
 
         # ------------------------------------------
-        # Fetch ONLY fresh closed minute(s)
+        # GET FRESH CLOSED MINUTE DATA
         # ------------------------------------------
 
         fresh, error = (
@@ -1040,7 +1021,7 @@ def btc_minute_alert():
 
 
         # ------------------------------------------
-        # Add fresh liquidation independently
+        # ADD BOTH SIDES TO CURRENT CYCLE
         # ------------------------------------------
 
         btc_long_cumulative += (
@@ -1052,156 +1033,129 @@ def btc_minute_alert():
         )
 
 
-        # Advance ONLY after successful full fetch
         last_processed_liq_ts = (
             closed_minute_ts
         )
 
 
-        # ------------------------------------------
-        # LONG LIQUIDATION HIT
-        # ------------------------------------------
-
-        long_alert_sent = False
-        long_low_move = False
-        long_price_move = None
-
-        long_hit_amount = None
-
-
-        if (
+        # Save cycle values BEFORE any reset
+        cycle_long = (
             btc_long_cumulative
-            >= BTC_LIQ_THRESHOLD
-        ):
+        )
 
-            long_hit_amount = (
-                btc_long_cumulative
-            )
-
-
-            if (
-                btc_long_ref_price
-                is not None
-            ):
-
-                long_price_move = abs(
-                    btc_price
-                    - btc_long_ref_price
-                )
-
-                long_low_move = (
-                    long_price_move
-                    < BTC_LOW_MOVE_POINTS
-                )
-
-
-            low_move_text = (
-                " | LOW-MOVE YES"
-                if long_low_move
-                else ""
-            )
-
-
-            move_text = (
-                f"{long_price_move:,.0f} pts"
-                if long_price_move
-                is not None
-                else "NA"
-            )
-
-
-            long_alert_sent = (
-                send_pushover(
-                    "BTC LONG LIQ +5M",
-                    (
-                        f"LONG LIQ HIT | "
-                        f"${long_hit_amount:,.0f} | "
-                        f"BTC {btc_price:,.0f} | "
-                        f"BTC MOVE {move_text}"
-                        f"{low_move_text}"
-                    )
-                )
-            )
-
-
-            # RESET ONLY LONG
-            btc_long_cumulative = 0.0
-
-            btc_long_ref_price = (
-                btc_price
-            )
-
-
-        # ------------------------------------------
-        # SHORT LIQUIDATION HIT
-        # ------------------------------------------
-
-        short_alert_sent = False
-        short_low_move = False
-        short_price_move = None
-
-        short_hit_amount = None
-
-
-        if (
+        cycle_short = (
             btc_short_cumulative
+        )
+
+
+        # ------------------------------------------
+        # CHECK WHICH SIDE HIT 5M
+        # ------------------------------------------
+
+        long_hit = (
+            cycle_long
             >= BTC_LIQ_THRESHOLD
-        ):
+        )
 
-            short_hit_amount = (
-                btc_short_cumulative
+        short_hit = (
+            cycle_short
+            >= BTC_LIQ_THRESHOLD
+        )
+
+
+        alert_sent = False
+        cycle_winner = None
+
+        btc_price_move = None
+        low_move = False
+
+
+        if btc_cycle_ref_price is not None:
+
+            btc_price_move = abs(
+                btc_price
+                - btc_cycle_ref_price
+            )
+
+            low_move = (
+                btc_price_move
+                < BTC_LOW_MOVE_POINTS
             )
 
 
-            if (
-                btc_short_ref_price
-                is not None
-            ):
+        # ------------------------------------------
+        # A CYCLE HAS COMPLETED
+        # ------------------------------------------
 
-                short_price_move = abs(
-                    btc_price
-                    - btc_short_ref_price
+        if long_hit or short_hit:
+
+            if long_hit and short_hit:
+
+                cycle_winner = (
+                    "BOTH HIT SAME MINUTE"
                 )
 
-                short_low_move = (
-                    short_price_move
-                    < BTC_LOW_MOVE_POINTS
+                alert_title = (
+                    "BTC BOTH LIQ +5M"
                 )
 
+            elif long_hit:
 
-            low_move_text = (
-                " | LOW-MOVE YES"
-                if short_low_move
-                else ""
-            )
+                cycle_winner = (
+                    "LONG"
+                )
+
+                alert_title = (
+                    "BTC LONG LIQ +5M"
+                )
+
+            else:
+
+                cycle_winner = (
+                    "SHORT"
+                )
+
+                alert_title = (
+                    "BTC SHORT LIQ +5M"
+                )
 
 
             move_text = (
-                f"{short_price_move:,.0f} pts"
-                if short_price_move
+                f"{btc_price_move:,.0f} pts"
+                if btc_price_move
                 is not None
                 else "NA"
             )
 
 
-            short_alert_sent = (
-                send_pushover(
-                    "BTC SHORT LIQ +5M",
-                    (
-                        f"SHORT LIQ HIT | "
-                        f"${short_hit_amount:,.0f} | "
-                        f"BTC {btc_price:,.0f} | "
-                        f"BTC MOVE {move_text}"
-                        f"{low_move_text}"
-                    )
+            low_move_text = (
+                " | LOW-MOVE YES"
+                if low_move
+                else ""
+            )
+
+
+            alert_sent = send_pushover(
+                alert_title,
+                (
+                    f"WINNER {cycle_winner} | "
+                    f"LONG ${cycle_long:,.0f} | "
+                    f"SHORT ${cycle_short:,.0f} | "
+                    f"BTC {btc_price:,.0f} | "
+                    f"BTC MOVE {move_text}"
+                    f"{low_move_text}"
                 )
             )
 
 
-            # RESET ONLY SHORT
+            # --------------------------------------
+            # RESET BOTH SIDES = NEW FRESH CYCLE
+            # --------------------------------------
+
+            btc_long_cumulative = 0.0
             btc_short_cumulative = 0.0
 
-            btc_short_ref_price = (
+            btc_cycle_ref_price = (
                 btc_price
             )
 
@@ -1243,6 +1197,18 @@ def btc_minute_alert():
                     "fresh_net_short_minus_long"
                 ],
 
+            "cycle_long_before_reset":
+                round(
+                    cycle_long,
+                    2
+                ),
+
+            "cycle_short_before_reset":
+                round(
+                    cycle_short,
+                    2
+                ),
+
             "long_cumulative_usd":
                 round(
                     btc_long_cumulative,
@@ -1258,67 +1224,28 @@ def btc_minute_alert():
             "threshold_usd":
                 BTC_LIQ_THRESHOLD,
 
-            "long_hit_amount_usd":
+            "cycle_winner":
+                cycle_winner,
+
+            "alert_sent":
+                alert_sent,
+
+            "btc_price_move_points":
                 (
                     round(
-                        long_hit_amount,
+                        btc_price_move,
                         2
                     )
-                    if long_hit_amount
+                    if btc_price_move
                     is not None
                     else None
                 ),
 
-            "short_hit_amount_usd":
-                (
-                    round(
-                        short_hit_amount,
-                        2
-                    )
-                    if short_hit_amount
-                    is not None
-                    else None
-                ),
+            "low_move":
+                low_move,
 
-            "long_alert_sent":
-                long_alert_sent,
-
-            "short_alert_sent":
-                short_alert_sent,
-
-            "long_low_move":
-                long_low_move,
-
-            "short_low_move":
-                short_low_move,
-
-            "long_price_move_points":
-                (
-                    round(
-                        long_price_move,
-                        2
-                    )
-                    if long_price_move
-                    is not None
-                    else None
-                ),
-
-            "short_price_move_points":
-                (
-                    round(
-                        short_price_move,
-                        2
-                    )
-                    if short_price_move
-                    is not None
-                    else None
-                ),
-
-            "long_reference_price":
-                btc_long_ref_price,
-
-            "short_reference_price":
-                btc_short_ref_price,
+            "cycle_reference_price":
+                btc_cycle_ref_price,
 
             "last_processed_liq_ts":
                 last_processed_liq_ts
@@ -1329,8 +1256,7 @@ def btc_minute_alert():
 
         return jsonify({
             "ok": False,
-            "long_alert_sent": False,
-            "short_alert_sent": False,
+            "alert_sent": False,
             "error": str(e)
         }), 500
 
