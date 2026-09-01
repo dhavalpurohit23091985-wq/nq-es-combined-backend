@@ -1112,7 +1112,7 @@ def btc_minute_alert():
 
             long_alert_sent = (
                 send_pushover(
-                    "BTC LONG LIQ +10M",
+                    "BTC LONG LIQ +5M",
                     (
                         f"LONG LIQ HIT | "
                         f"${long_hit_amount:,.0f} | "
@@ -1186,7 +1186,7 @@ def btc_minute_alert():
 
             short_alert_sent = (
                 send_pushover(
-                    "BTC SHORT LIQ +10M",
+                    "BTC SHORT LIQ +5M",
                     (
                         f"SHORT LIQ HIT | "
                         f"${short_hit_amount:,.0f} | "
