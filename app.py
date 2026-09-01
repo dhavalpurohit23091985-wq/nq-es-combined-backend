@@ -52,7 +52,7 @@ entry_jpn_price = None
 # BTC FRESH LIQUIDATION SETTINGS
 # ==================================================
 
-BTC_LIQ_THRESHOLD = 10_000_000
+BTC_LIQ_THRESHOLD = 5_000_000
 BTC_LOW_MOVE_POINTS = 500
 
 
