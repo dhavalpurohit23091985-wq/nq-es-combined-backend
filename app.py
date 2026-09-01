@@ -52,12 +52,26 @@ entry_jpn_price = None
 # BTC LIQUIDATION SETTINGS
 # ==================================================
 
+# Main trend alert
 BTC_LIQ_THRESHOLD = 10_000_000
 
+# Special alert:
+# liquidation net changes by $10M
+# but BTC price moves less than 500 points
+BTC_SPECIAL_LIQ_CHANGE = 10_000_000
+BTC_SPECIAL_MAX_PRICE_MOVE = 500
+
+
+# Main BTC state
 # 0  = no valid signal yet
-# 1  = BUY state
-# -1 = SELL state
+# 1  = BUY
+# -1 = SELL
 btc_liq_state = 0
+
+
+# Special alert reference
+special_ref_net = None
+special_ref_price = None
 
 
 # ==================================================
@@ -108,6 +122,9 @@ def home():
         "nq_es_threshold": THRESHOLD,
         "btc_liquidation_threshold": BTC_LIQ_THRESHOLD,
 
+        "btc_special_liq_change": BTC_SPECIAL_LIQ_CHANGE,
+        "btc_special_max_price_move": BTC_SPECIAL_MAX_PRICE_MOVE,
+
         "nq_delta": latest_delta["NQ"],
         "es_delta": latest_delta["ES"],
 
@@ -117,6 +134,9 @@ def home():
 
         "nq_es_state": state,
         "btc_liq_state": btc_liq_state,
+
+        "special_ref_net": special_ref_net,
+        "special_ref_price": special_ref_price,
 
         "entry_side": entry_side,
         "entry_nq_price": entry_nq_price,
@@ -136,10 +156,6 @@ def webhook():
     global entry_nq_price
     global entry_jpn_price
 
-    # --------------------------------------------------
-    # SECURITY
-    # --------------------------------------------------
-
     secret = request.args.get("secret", "")
 
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
@@ -149,10 +165,6 @@ def webhook():
             "error": "unauthorized"
         }), 401
 
-
-    # --------------------------------------------------
-    # READ JSON
-    # --------------------------------------------------
 
     data = request.get_json(silent=True) or {}
 
@@ -297,8 +309,6 @@ def webhook():
         current_jpn = latest_price["JPN"]
 
 
-        # CLOSE PREVIOUS TRADE
-
         if (
             entry_side is not None
             and entry_nq_price is not None
@@ -419,7 +429,7 @@ def get_btc_perpetual_symbols():
         return None, {
             "stage": "future-markets",
             "status_code": response.status_code,
-            "response": response.text
+            "response": response.text[:500]
         }
 
 
@@ -432,8 +442,7 @@ def get_btc_perpetual_symbols():
 
         if (
             market.get("base_asset") == "BTC"
-            and
-            market.get("is_perpetual") is True
+            and market.get("is_perpetual") is True
         ):
 
             symbol = market.get("symbol")
@@ -448,6 +457,83 @@ def get_btc_perpetual_symbols():
 
 
     return btc_symbols, None
+
+
+# ==================================================
+# GET BTC PRICE
+# ==================================================
+
+def get_btc_price():
+
+    now = int(time.time())
+
+    response = requests.get(
+        "https://api.coinalyze.net/v1/ohlcv-history",
+
+        params={
+            "symbols": "BTCUSDT_PERP.A",
+            "interval": "1min",
+            "from": now - 300,
+            "to": now
+        },
+
+        headers={
+            "api_key": COINALYZE_API_KEY
+        },
+
+        timeout=10
+    )
+
+
+    if response.status_code != 200:
+
+        return None, {
+            "stage": "btc-price",
+            "status_code": response.status_code,
+            "response": response.text[:500]
+        }
+
+
+    data = response.json()
+
+
+    if not data:
+
+        return None, {
+            "stage": "btc-price",
+            "error": "empty response"
+        }
+
+
+    history = data[0].get(
+        "history",
+        []
+    )
+
+
+    if not history:
+
+        return None, {
+            "stage": "btc-price",
+            "error": "no price history"
+        }
+
+
+    try:
+
+        btc_price = float(
+            history[-1]["c"]
+        )
+
+    except (KeyError, TypeError, ValueError):
+
+        return None, {
+            "stage": "btc-price",
+            "error": "invalid BTC close"
+        }
+
+
+    return btc_price, None
 
 
 # ==================================================
@@ -512,16 +598,12 @@ def calculate_btc_liquidations():
         )
 
 
-        # ----------------------------------------------
-        # FAILED BATCH
-        # ----------------------------------------------
-
         if response.status_code != 200:
 
             failed_batches.append({
                 "status_code": response.status_code,
                 "symbols": batch,
-                "response": response.text
+                "response": response.text[:500]
             })
 
             continue
@@ -531,10 +613,6 @@ def calculate_btc_liquidations():
 
         data = response.json()
 
-
-        # ----------------------------------------------
-        # ADD LIQUIDATIONS
-        # ----------------------------------------------
 
         for symbol_data in data:
 
@@ -585,6 +663,16 @@ def calculate_btc_liquidations():
         signal = "WAIT"
 
 
+    # --------------------------------------------------
+    # GET BTC PRICE FOR SPECIAL ALERT
+    # --------------------------------------------------
+
+    btc_price, price_error = get_btc_price()
+
+    if price_error:
+        return None, price_error
+
+
     result = {
 
         "window":
@@ -609,7 +697,10 @@ def calculate_btc_liquidations():
             BTC_LIQ_THRESHOLD,
 
         "signal":
-            signal
+            signal,
+
+        "btc_price":
+            round(btc_price, 2)
     }
 
 
@@ -652,12 +743,22 @@ def test_btc_aggregate():
 
 # ==================================================
 # BTC EVERY-MINUTE ALERT
+#
+# SAME CRON HANDLES:
+#
+# 1. NORMAL +/- $10M BUY / SELL
+#
+# 2. SPECIAL:
+#    $10M NET LIQUIDATION CHANGE
+#    + BTC PRICE MOVE < 500 POINTS
 # ==================================================
 
 @app.get("/btc-minute-alert")
 def btc_minute_alert():
 
     global btc_liq_state
+    global special_ref_net
+    global special_ref_price
 
 
     try:
@@ -666,7 +767,7 @@ def btc_minute_alert():
 
 
         # --------------------------------------------------
-        # API ERROR = NO STATE CHANGE / NO ALERT
+        # API ERROR
         # --------------------------------------------------
 
         if error:
@@ -679,7 +780,9 @@ def btc_minute_alert():
             }), 429
 
 
-        current_signal = result["signal"]
+        current_signal = result[
+            "signal"
+        ]
 
         long_total = result[
             "long_liquidations_usd"
@@ -689,18 +792,22 @@ def btc_minute_alert():
             "short_liquidations_usd"
         ]
 
-        net = result[
+        current_net = result[
             "net_short_minus_long_usd"
         ]
 
+        current_price = result[
+            "btc_price"
+        ]
 
-        alert_sent = False
+
+        # ==================================================
+        # MAIN +/- $10M BUY / SELL ALERT
+        # ==================================================
+
+        normal_alert_sent = False
         new_signal = None
 
-
-        # ==================================================
-        # BUY CROSS
-        # ==================================================
 
         if current_signal == "BUY":
 
@@ -710,10 +817,6 @@ def btc_minute_alert():
                 new_signal = "BUY"
 
 
-        # ==================================================
-        # SELL CROSS
-        # ==================================================
-
         elif current_signal == "SELL":
 
             if btc_liq_state != -1:
@@ -722,12 +825,8 @@ def btc_minute_alert():
                 new_signal = "SELL"
 
 
-        # ==================================================
-        # WAIT = HOLD LAST VALID STATE
-        #
-        # IMPORTANT:
-        # DO NOT RESET btc_liq_state
-        # ==================================================
+        # WAIT = HOLD PREVIOUS STATE
+
 
         if btc_liq_state == 1:
 
@@ -742,13 +841,13 @@ def btc_minute_alert():
             state_text = "NONE"
 
 
-        # ==================================================
-        # PUSHOVER ONLY ON NEW VALID ±$10M SIGNAL
-        # ==================================================
+        # --------------------------------------------------
+        # MAIN PUSHOVER
+        # --------------------------------------------------
 
         if new_signal == "BUY":
 
-            alert_sent = send_pushover(
+            normal_alert_sent = send_pushover(
 
                 "BTC LIQUIDATION BUY",
 
@@ -756,15 +855,15 @@ def btc_minute_alert():
                     f"BUY | ROLLING 60 MIN | "
                     f"SHORT ${short_total:,.0f} | "
                     f"LONG ${long_total:,.0f} | "
-                    f"NET +${net:,.0f} | "
-                    f"{result['btc_perpetual_symbols']} BTC PERP MARKETS"
+                    f"NET +${current_net:,.0f} | "
+                    f"BTC {current_price:,.0f}"
                 )
             )
 
 
         elif new_signal == "SELL":
 
-            alert_sent = send_pushover(
+            normal_alert_sent = send_pushover(
 
                 "BTC LIQUIDATION SELL",
 
@@ -772,11 +871,135 @@ def btc_minute_alert():
                     f"SELL | ROLLING 60 MIN | "
                     f"LONG ${long_total:,.0f} | "
                     f"SHORT ${short_total:,.0f} | "
-                    f"NET -${abs(net):,.0f} | "
-                    f"{result['btc_perpetual_symbols']} BTC PERP MARKETS"
+                    f"NET -${abs(current_net):,.0f} | "
+                    f"BTC {current_price:,.0f}"
                 )
             )
 
+
+        # ==================================================
+        # SPECIAL ALERT
+        #
+        # LAST REFERENCE NET -> CURRENT NET
+        #
+        # +/- $10M CHANGE
+        #
+        # AND
+        #
+        # BTC PRICE MOVE < 500 POINTS
+        # ==================================================
+
+        special_alert_sent = False
+        special_direction = None
+
+        liq_change = 0.0
+        price_move = 0.0
+
+
+        # --------------------------------------------------
+        # FIRST RUN:
+        # SAVE STARTING REFERENCE
+        # --------------------------------------------------
+
+        if (
+            special_ref_net is None
+            or special_ref_price is None
+        ):
+
+            special_ref_net = current_net
+            special_ref_price = current_price
+
+
+        else:
+
+            liq_change = (
+                current_net
+                - special_ref_net
+            )
+
+            price_move = abs(
+                current_price
+                - special_ref_price
+            )
+
+
+            # --------------------------------------------------
+            # +$10M NET CHANGE
+            # SHORT LIQUIDATIONS DOMINATING
+            # --------------------------------------------------
+
+            if (
+                liq_change
+                >= BTC_SPECIAL_LIQ_CHANGE
+            ):
+
+                special_direction = "SHORT LIQ +10M"
+
+
+                if (
+                    price_move
+                    < BTC_SPECIAL_MAX_PRICE_MOVE
+                ):
+
+                    special_alert_sent = send_pushover(
+
+                        "BTC 10M LIQ / <500 MOVE",
+
+                        (
+                            f"SHORT LIQ CHANGE "
+                            f"+${liq_change:,.0f} | "
+                            f"BTC MOVE {price_move:,.0f} pts | "
+                            f"REF {special_ref_price:,.0f} | "
+                            f"NOW {current_price:,.0f}"
+                        )
+                    )
+
+
+                # Start tracking next $10M block
+                special_ref_net = current_net
+                special_ref_price = current_price
+
+
+            # --------------------------------------------------
+            # -$10M NET CHANGE
+            # LONG LIQUIDATIONS DOMINATING
+            # --------------------------------------------------
+
+            elif (
+                liq_change
+                <= -BTC_SPECIAL_LIQ_CHANGE
+            ):
+
+                special_direction = "LONG LIQ +10M"
+
+
+                if (
+                    price_move
+                    < BTC_SPECIAL_MAX_PRICE_MOVE
+                ):
+
+                    special_alert_sent = send_pushover(
+
+                        "BTC 10M LIQ / <500 MOVE",
+
+                        (
+                            f"LONG LIQ CHANGE "
+                            f"-${abs(liq_change):,.0f} | "
+                            f"BTC MOVE {price_move:,.0f} pts | "
+                            f"REF {special_ref_price:,.0f} | "
+                            f"NOW {current_price:,.0f}"
+                        )
+                    )
+
+
+                # Start tracking next $10M block
+                special_ref_net = current_net
+                special_ref_price = current_price
+
+
+        # ==================================================
+        # RESPONSE
+        # ==================================================
 
         return jsonify({
 
@@ -794,8 +1017,8 @@ def btc_minute_alert():
             "new_signal":
                 new_signal,
 
-            "alert_sent":
-                alert_sent,
+            "normal_alert_sent":
+                normal_alert_sent,
 
             "btc_liq_state":
                 btc_liq_state,
@@ -810,10 +1033,35 @@ def btc_minute_alert():
                 short_total,
 
             "net_short_minus_long_usd":
-                net,
+                current_net,
 
             "threshold_usd":
-                BTC_LIQ_THRESHOLD
+                BTC_LIQ_THRESHOLD,
+
+            "btc_price":
+                current_price,
+
+            # ------------------------------------------
+            # SPECIAL TRACKER
+            # ------------------------------------------
+
+            "special_reference_net":
+                special_ref_net,
+
+            "special_reference_price":
+                special_ref_price,
+
+            "special_liquidation_change":
+                round(liq_change, 2),
+
+            "special_price_move_points":
+                round(price_move, 2),
+
+            "special_direction":
+                special_direction,
+
+            "special_alert_sent":
+                special_alert_sent
         })
 
 
@@ -821,7 +1069,8 @@ def btc_minute_alert():
 
         return jsonify({
             "ok": False,
-            "alert_sent": False,
+            "normal_alert_sent": False,
+            "special_alert_sent": False,
             "error": str(e)
         }), 500
 
