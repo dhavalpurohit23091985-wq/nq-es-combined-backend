@@ -831,7 +831,7 @@ def get_fresh_liquidations(
                     )
 
                     if (
-                        asset == "BTC"
+                        asset in ("BTC", "XAU")
                         and long_value >= 100000
                     ):
                         large_events.append({
@@ -842,7 +842,7 @@ def get_fresh_liquidations(
                         })
 
                     if (
-                        asset == "BTC"
+                        asset in ("BTC", "XAU")
                         and short_value >= 100000
                     ):
                         large_events.append({
@@ -1235,6 +1235,18 @@ def process_xau(closed_minute_ts):
 
     fresh_long = fresh["fresh_long_usd"]
     fresh_short = fresh["fresh_short_usd"]
+
+    for event in fresh.get(
+        "large_events",
+        []
+    ):
+        log_btc_liquidation_to_sheet(
+            event["t"],
+            event["symbol"],
+            xau_price,
+            event["value"],
+            event["side"],
+        )
 
     xau_long_cumulative += fresh_long
     xau_short_cumulative += fresh_short
