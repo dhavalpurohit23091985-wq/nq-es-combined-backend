@@ -123,19 +123,6 @@ def send_pushover(title, message):
 # GOOGLE SHEET BTC LIQUIDATION LOGGER
 # ==================================================
 
-def format_compact_value(value):
-    value = float(value)
-
-    if abs(value) >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M"
-    elif abs(value) >= 100_000:
-        return f"{value / 100_000:.2f}L"
-    elif abs(value) >= 1_000:
-        return f"{value / 1_000:.2f}K"
-    else:
-        return f"{value:.2f}"
-
-
 def log_btc_liquidation_to_sheet(
     row_ts,
     symbol,
@@ -167,7 +154,7 @@ def log_btc_liquidation_to_sheet(
                 "time": time_ist,
                 "symbol": symbol,
                 "price": round(float(price), 2),
-                "value": format_compact_value(value),
+                "value": round(float(value), 2),
                 "side": side,
             },
             timeout=10,
@@ -831,7 +818,7 @@ def get_fresh_liquidations(
                     )
 
                     if (
-                        asset in ("BTC", "XAU")
+                        asset == "BTC"
                         and long_value >= 100000
                     ):
                         large_events.append({
@@ -842,7 +829,7 @@ def get_fresh_liquidations(
                         })
 
                     if (
-                        asset in ("BTC", "XAU")
+                        asset == "BTC"
                         and short_value >= 100000
                     ):
                         large_events.append({
@@ -1106,12 +1093,16 @@ def process_btc(
             else ""
         )
 
+        cycle_total = cycle_long + cycle_short
+        long_pct = (cycle_long / cycle_total * 100) if cycle_total > 0 else 0
+        short_pct = (cycle_short / cycle_total * 100) if cycle_total > 0 else 0
+
         alert_sent = send_pushover(
             alert_title,
             (
                 f"WINNER {cycle_winner} | "
-                f"LONG ${cycle_long:,.0f} | "
-                f"SHORT ${cycle_short:,.0f} | "
+                f"LONG ${cycle_long:,.0f} ({long_pct:.2f}%) | "
+                f"SHORT ${cycle_short:,.0f} ({short_pct:.2f}%) | "
                 f"GAP ${cycle_gap:,.0f} | "
                 f"BTC {btc_price:,.0f} | "
                 f"BTC MOVE {move_text}"
@@ -1236,18 +1227,6 @@ def process_xau(closed_minute_ts):
     fresh_long = fresh["fresh_long_usd"]
     fresh_short = fresh["fresh_short_usd"]
 
-    for event in fresh.get(
-        "large_events",
-        []
-    ):
-        log_btc_liquidation_to_sheet(
-            event["t"],
-            event["symbol"],
-            xau_price,
-            event["value"],
-            event["side"],
-        )
-
     xau_long_cumulative += fresh_long
     xau_short_cumulative += fresh_short
     xau_last_processed_liq_ts = closed_minute_ts
@@ -1296,12 +1275,16 @@ def process_xau(closed_minute_ts):
             else "NA"
         )
 
+        cycle_total = cycle_long + cycle_short
+        long_pct = (cycle_long / cycle_total * 100) if cycle_total > 0 else 0
+        short_pct = (cycle_short / cycle_total * 100) if cycle_total > 0 else 0
+
         alert_sent = send_pushover(
             alert_title,
             (
                 f"WINNER {cycle_winner} | "
-                f"LONG ${cycle_long:,.0f} | "
-                f"SHORT ${cycle_short:,.0f} | "
+                f"LONG ${cycle_long:,.0f} ({long_pct:.2f}%) | "
+                f"SHORT ${cycle_short:,.0f} ({short_pct:.2f}%) | "
                 f"GAP ${cycle_gap:,.0f} | "
                 f"XAU {xau_price:,.2f} | "
                 f"XAU MOVE {move_text}"
