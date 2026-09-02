@@ -123,6 +123,19 @@ def send_pushover(title, message):
 # GOOGLE SHEET BTC LIQUIDATION LOGGER
 # ==================================================
 
+def format_compact_value(value):
+    value = float(value)
+
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    elif abs(value) >= 100_000:
+        return f"{value / 100_000:.2f}L"
+    elif abs(value) >= 1_000:
+        return f"{value / 1_000:.2f}K"
+    else:
+        return f"{value:.2f}"
+
+
 def log_btc_liquidation_to_sheet(
     row_ts,
     symbol,
@@ -154,7 +167,7 @@ def log_btc_liquidation_to_sheet(
                 "time": time_ist,
                 "symbol": symbol,
                 "price": round(float(price), 2),
-                "value": round(float(value), 2),
+                "value": format_compact_value(value),
                 "side": side,
             },
             timeout=10,
