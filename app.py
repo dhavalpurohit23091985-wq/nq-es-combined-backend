@@ -1,4 +1,3 @@
-from datetime import datetime, timezone, timedelta
 import os
 import time
 
@@ -18,6 +17,15 @@ PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY")
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+
+
+# ==================================================
+# COINALYZE RETRY / SPACING SETTINGS
+# ==================================================
+
+COINALYZE_MAX_RETRIES = 3
+COINALYZE_RETRY_DELAYS = (2, 4, 8)
+BTC_XAU_SPACING_SECONDS = 1.0
 
 
 # ==================================================
@@ -119,6 +127,83 @@ def send_pushover(title, message):
 
 
 # ==================================================
+# COINALYZE GET WITH RETRY / BACKOFF
+# ==================================================
+
+def coinalyze_get(
+    url,
+    *,
+    params=None,
+    timeout=15,
+    stage="coinalyze"
+):
+
+    last_error = None
+
+    for attempt in range(COINALYZE_MAX_RETRIES + 1):
+
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers={
+                    "api_key": COINALYZE_API_KEY
+                },
+                timeout=timeout
+            )
+
+        except requests.RequestException as e:
+
+            last_error = {
+                "stage": stage,
+                "error": str(e),
+                "attempt": attempt + 1
+            }
+
+            retryable = True
+
+        else:
+
+            if response.status_code == 200:
+                return response, None
+
+            last_error = {
+                "stage": stage,
+                "status_code": response.status_code,
+                "response": response.text[:500],
+                "attempt": attempt + 1
+            }
+
+            retryable = (
+                response.status_code == 429
+                or 500 <= response.status_code <= 599
+            )
+
+            if not retryable:
+                return None, last_error
+
+        if attempt >= COINALYZE_MAX_RETRIES:
+            break
+
+        if retryable:
+            delay = COINALYZE_RETRY_DELAYS[
+                min(
+                    attempt,
+                    len(COINALYZE_RETRY_DELAYS) - 1
+                )
+            ]
+
+            print(
+                f"{stage}: retrying in {delay}s "
+                f"(attempt {attempt + 2})"
+            )
+
+            time.sleep(delay)
+
+    return None, last_error
+
+
+# ==================================================
 # GET FUTURE MARKETS
 # ==================================================
 
@@ -129,27 +214,14 @@ def get_future_markets():
     if future_markets_cache is not None:
         return future_markets_cache, None
 
-    try:
-        response = requests.get(
-            "https://api.coinalyze.net/v1/future-markets",
-            headers={
-                "api_key": COINALYZE_API_KEY
-            },
-            timeout=10
-        )
+    response, error = coinalyze_get(
+        "https://api.coinalyze.net/v1/future-markets",
+        timeout=10,
+        stage="future-markets"
+    )
 
-    except requests.RequestException as e:
-        return None, {
-            "stage": "future-markets",
-            "error": str(e)
-        }
-
-    if response.status_code != 200:
-        return None, {
-            "stage": "future-markets",
-            "status_code": response.status_code,
-            "response": response.text[:500]
-        }
+    if error:
+        return None, error
 
     try:
         markets = response.json()
@@ -497,33 +569,20 @@ def get_coinalyze_price(
 
     now = int(time.time())
 
-    try:
-        response = requests.get(
-            "https://api.coinalyze.net/v1/ohlcv-history",
-            params={
-                "symbols": symbol,
-                "interval": "1min",
-                "from": now - 300,
-                "to": now
-            },
-            headers={
-                "api_key": COINALYZE_API_KEY
-            },
-            timeout=10
-        )
+    response, error = coinalyze_get(
+        "https://api.coinalyze.net/v1/ohlcv-history",
+        params={
+            "symbols": symbol,
+            "interval": "1min",
+            "from": now - 300,
+            "to": now
+        },
+        timeout=10,
+        stage=stage_name
+    )
 
-    except requests.RequestException as e:
-        return None, {
-            "stage": stage_name,
-            "error": str(e)
-        }
-
-    if response.status_code != 200:
-        return None, {
-            "stage": stage_name,
-            "status_code": response.status_code,
-            "response": response.text[:500]
-        }
+    if error:
+        return None, error
 
     try:
         data = response.json()
@@ -662,37 +721,24 @@ def get_fresh_liquidations(
             i:i + 20
         ]
 
-        try:
-            response = requests.get(
-                liquidation_url,
-                params={
-                    "symbols": ",".join(batch),
-                    "interval": "1min",
-                    "from": query_from,
-                    "to": query_to,
-                    "convert_to_usd": "true"
-                },
-                headers={
-                    "api_key": COINALYZE_API_KEY
-                },
-                timeout=15
-            )
+        response, batch_error = coinalyze_get(
+            liquidation_url,
+            params={
+                "symbols": ",".join(batch),
+                "interval": "1min",
+                "from": query_from,
+                "to": query_to,
+                "convert_to_usd": "true"
+            },
+            timeout=15,
+            stage=f"{asset.lower()}-liquidation-batch"
+        )
 
-        except requests.RequestException as e:
+        if batch_error:
 
             failed_batches.append({
                 "symbols": batch,
-                "error": str(e)
-            })
-
-            continue
-
-        if response.status_code != 200:
-
-            failed_batches.append({
-                "status_code": response.status_code,
-                "symbols": batch,
-                "response": response.text[:500]
+                **batch_error
             })
 
             continue
@@ -1253,6 +1299,9 @@ def btc_minute_alert():
             closed_minute_ts
         )
 
+        # Small spacing to reduce API burst pressure
+        time.sleep(BTC_XAU_SPACING_SECONDS)
+
         xau_result = process_xau(
             closed_minute_ts
         )
@@ -1271,19 +1320,25 @@ def btc_minute_alert():
 
         return jsonify({
             "ok": overall_ok,
+            "retry_needed": not overall_ok,
             "closed_minute_ts": closed_minute_ts,
             "btc": btc_result,
             "xau": xau_result
-        }), 200 if overall_ok else 429
+        }), 200
 
     except Exception as e:
-        print("BTC-MINUTE-ALERT ERROR:", str(e))
+
+        print(
+            "BTC-MINUTE-ALERT ERROR:",
+            str(e)
+        )
 
         return jsonify({
             "ok": False,
+            "retry_needed": True,
             "alert_sent": False,
             "error": str(e)
-        }), 500
+        }), 200
 
 
 # ==================================================
