@@ -20,12 +20,11 @@ PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
 # ==================================================
-# COINALYZE RETRY / SPACING SETTINGS
+# COINALYZE RETRY SETTINGS
 # ==================================================
 
 COINALYZE_MAX_RETRIES = 3
 COINALYZE_RETRY_DELAYS = (2, 4, 8)
-BTC_XAU_SPACING_SECONDS = 1.0
 
 
 # ==================================================
@@ -246,7 +245,7 @@ def home():
 
     return jsonify({
         "status": "ok",
-        "service": "NQ + ES + BTC + XAU Fresh Liquidation Backend",
+        "service": "NQ + ES + BTC + XAU Split Liquidation Backend",
         "nq_es_threshold": THRESHOLD,
 
         "btc_liquidation_threshold": BTC_LIQ_THRESHOLD,
@@ -1277,59 +1276,100 @@ def process_xau(closed_minute_ts):
 
 
 # ==================================================
-# BTC + XAU EVERY-MINUTE ALERT
-# SAME OLD URL - CRON DOES NOT CHANGE
+# HELPER: LAST CLOSED MINUTE
+# ==================================================
+
+def get_closed_minute_ts():
+
+    now = int(time.time())
+
+    current_minute_start = (
+        now // 60
+    ) * 60
+
+    return (
+        current_minute_start - 60
+    )
+
+
+# ==================================================
+# BTC ONLY EVERY-MINUTE ENDPOINT
 # ==================================================
 
 @app.get("/btc-minute-alert")
 def btc_minute_alert():
 
     try:
-        now = int(time.time())
-
-        current_minute_start = (
-            now // 60
-        ) * 60
-
         closed_minute_ts = (
-            current_minute_start - 60
+            get_closed_minute_ts()
         )
 
         btc_result = process_btc(
             closed_minute_ts
         )
 
-        # Small spacing to reduce API burst pressure
-        time.sleep(BTC_XAU_SPACING_SECONDS)
-
-        xau_result = process_xau(
-            closed_minute_ts
-        )
-
-        overall_ok = (
-            btc_result.get("ok", False)
-            and
-            xau_result.get("ok", False)
-        )
-
         if not btc_result.get("ok", False):
-            print("BTC PROCESS ERROR:", btc_result)
-
-        if not xau_result.get("ok", False):
-            print("XAU PROCESS ERROR:", xau_result)
+            print(
+                "BTC PROCESS ERROR:",
+                btc_result
+            )
 
         return jsonify({
-            "ok": overall_ok,
-            "retry_needed": not overall_ok,
+            "ok": btc_result.get("ok", False),
+            "retry_needed": not btc_result.get("ok", False),
             "closed_minute_ts": closed_minute_ts,
-            "btc": btc_result,
-            "xau": xau_result
+            "btc": btc_result
         }), 200
 
     except Exception as e:
 
         print(
             "BTC-MINUTE-ALERT ERROR:",
+            str(e)
+        )
+
+        return jsonify({
+            "ok": False,
+            "retry_needed": True,
+            "alert_sent": False,
+            "error": str(e)
+        }), 200
+
+
+# ==================================================
+# XAU ONLY EVERY-MINUTE ENDPOINT
+# RUN THIS CRON OFFSET FROM BTC
+# ==================================================
+
+@app.get("/xau-minute-alert")
+def xau_minute_alert():
+
+    try:
+        closed_minute_ts = (
+            get_closed_minute_ts()
+        )
+
+        xau_result = process_xau(
+            closed_minute_ts
+        )
+
+        if not xau_result.get("ok", False):
+            print(
+                "XAU PROCESS ERROR:",
+                xau_result
+            )
+
+        return jsonify({
+            "ok": xau_result.get("ok", False),
+            "retry_needed": not xau_result.get("ok", False),
+            "closed_minute_ts": closed_minute_ts,
+            "xau": xau_result
+        }), 200
+
+    except Exception as e:
+
+        print(
+            "XAU-MINUTE-ALERT ERROR:",
             str(e)
         )
 
