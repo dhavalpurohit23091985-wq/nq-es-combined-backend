@@ -17,7 +17,6 @@ PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY")
-GOOGLE_SHEET_WEBAPP_URL = os.environ.get("GOOGLE_SHEET_WEBAPP_URL")
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
@@ -116,57 +115,6 @@ def send_pushover(title, message):
         return response.ok
 
     except requests.RequestException:
-        return False
-
-
-# ==================================================
-# GOOGLE SHEET BTC LIQUIDATION LOGGER
-# ==================================================
-
-def log_btc_liquidation_to_sheet(
-    row_ts,
-    symbol,
-    price,
-    value,
-    side,
-):
-    if not GOOGLE_SHEET_WEBAPP_URL:
-        return False
-
-    try:
-        ist = timezone(
-            timedelta(
-                hours=5,
-                minutes=30,
-            )
-        )
-
-        time_ist = datetime.fromtimestamp(
-            row_ts,
-            tz=ist,
-        ).strftime(
-            "%d-%m-%Y %H:%M"
-        )
-
-        response = requests.post(
-            GOOGLE_SHEET_WEBAPP_URL,
-            json={
-                "time": time_ist,
-                "symbol": symbol,
-                "price": round(float(price), 2),
-                "value": round(float(value), 2),
-                "side": side,
-            },
-            timeout=10,
-        )
-
-        return response.ok
-
-    except Exception as e:
-        print(
-            "Google Sheet logger error:",
-            str(e),
-        )
         return False
 
 
@@ -685,7 +633,6 @@ def get_fresh_liquidations(
 
     fresh_long = 0.0
     fresh_short = 0.0
-    large_events = []
 
     successful_batches = 0
     failed_batches = []
@@ -812,33 +759,6 @@ def get_fresh_liquidations(
                     fresh_long += long_value
                     fresh_short += short_value
 
-                    symbol_name = (
-                        symbol_data.get("symbol")
-                        or asset
-                    )
-
-                    if (
-                        asset == "BTC"
-                        and long_value >= 100000
-                    ):
-                        large_events.append({
-                            "t": row_ts,
-                            "symbol": symbol_name,
-                            "value": long_value,
-                            "side": "LONG",
-                        })
-
-                    if (
-                        asset == "BTC"
-                        and short_value >= 100000
-                    ):
-                        large_events.append({
-                            "t": row_ts,
-                            "symbol": symbol_name,
-                            "value": short_value,
-                            "side": "SHORT",
-                        })
-
                 except (
                     TypeError,
                     ValueError
@@ -867,7 +787,6 @@ def get_fresh_liquidations(
         "successful_batch_count": successful_batches,
         "fresh_long_usd": round(fresh_long, 2),
         "fresh_short_usd": round(fresh_short, 2),
-        "large_events": large_events,
         "fresh_net_short_minus_long": round(
             fresh_short - fresh_long,
             2
@@ -1014,18 +933,6 @@ def process_btc(
 
     fresh_long = fresh["fresh_long_usd"]
     fresh_short = fresh["fresh_short_usd"]
-
-    for event in fresh.get(
-        "large_events",
-        []
-    ):
-        log_btc_liquidation_to_sheet(
-            event["t"],
-            event["symbol"],
-            btc_price,
-            event["value"],
-            event["side"],
-        )
 
     btc_long_cumulative += fresh_long
     btc_short_cumulative += fresh_short
