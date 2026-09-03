@@ -1263,6 +1263,12 @@ def btc_minute_alert():
             xau_result.get("ok", False)
         )
 
+        if not btc_result.get("ok", False):
+            print("BTC PROCESS ERROR:", btc_result)
+
+        if not xau_result.get("ok", False):
+            print("XAU PROCESS ERROR:", xau_result)
+
         return jsonify({
             "ok": overall_ok,
             "closed_minute_ts": closed_minute_ts,
@@ -1271,6 +1277,8 @@ def btc_minute_alert():
         }), 200 if overall_ok else 429
 
     except Exception as e:
+        print("BTC-MINUTE-ALERT ERROR:", str(e))
+
         return jsonify({
             "ok": False,
             "alert_sent": False,
