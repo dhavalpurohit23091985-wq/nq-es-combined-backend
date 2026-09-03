@@ -17,6 +17,7 @@ PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY")
+CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
@@ -2149,11 +2150,37 @@ def get_closed_minute_ts():
 
 
 # ==================================================
+# CRON AUTHORIZATION
+# ==================================================
+
+def cron_authorized():
+
+    supplied = (
+        request.headers.get(
+            "X-Cron-Secret",
+            ""
+        )
+    )
+
+    return (
+        bool(CRON_SECRET)
+        and supplied == CRON_SECRET
+    )
+
+
+# ==================================================
 # BTC ONLY ENDPOINT
 # ==================================================
 
 @app.get("/btc-minute-alert")
 def btc_minute_alert():
+
+    if not cron_authorized():
+
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized"
+        }), 403
 
     try:
 
