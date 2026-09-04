@@ -128,6 +128,24 @@ marginpad_seen_set = set()
 
 
 # ==================================================
+# XAU FRESH LIQUIDATION SETTINGS - MARGINPAD
+# ==================================================
+# Completely separate from both BTC MarginPad and XAU Coinalyze.
+
+MARGINPAD_XAU_LIQ_THRESHOLD = 1_000_000
+
+marginpad_xau_long_cumulative = 0.0
+marginpad_xau_short_cumulative = 0.0
+
+marginpad_xau_cycle_ref_price = None
+marginpad_xau_processed_through_ms = None
+
+# Separate de-duplication cache for XAU MarginPad events.
+marginpad_xau_seen_queue = deque()
+marginpad_xau_seen_set = set()
+
+
+# ==================================================
 # XAU FRESH LIQUIDATION SETTINGS
 # ==================================================
 
@@ -783,6 +801,233 @@ def get_marginpad_fresh_btc_liquidations(
 
 
 # ==================================================
+# MARGINPAD XAU HELPERS
+# ==================================================
+
+def remember_marginpad_xau_event(fingerprint):
+
+    if fingerprint in marginpad_xau_seen_set:
+        return
+
+    marginpad_xau_seen_set.add(fingerprint)
+    marginpad_xau_seen_queue.append(fingerprint)
+
+    while len(marginpad_xau_seen_queue) > MARGINPAD_SEEN_MAX:
+        old = marginpad_xau_seen_queue.popleft()
+        marginpad_xau_seen_set.discard(old)
+
+
+def get_marginpad_xau_price():
+
+    payload, error = marginpad_get(
+        "/api/v1/price",
+        params={
+            "symbol": "XAU"
+        },
+        timeout=10,
+        stage="marginpad-xau-price"
+    )
+
+    if error:
+        return None, error
+
+    try:
+        data = payload.get("data", {})
+
+        if isinstance(data, dict) and "price" in data:
+            price = float(data["price"])
+        else:
+            # Defensive fallback for a flat response such as
+            # {"symbol":"XAU","price":4437.8}.
+            price = float(payload["price"])
+
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError
+    ):
+        return None, {
+            "stage": "marginpad-xau-price",
+            "error": "price missing or invalid",
+            "response": str(payload)[:500]
+        }
+
+    return price, None
+
+
+def get_marginpad_fresh_xau_liquidations(
+    previous_through_ms,
+    closed_minute_ts
+):
+
+    payload, error = marginpad_get(
+        "/api/v1/liquidations/live",
+        params={
+            "symbol": "XAU",
+            "limit": MARGINPAD_LIVE_LIMIT
+        },
+        timeout=12,
+        stage="marginpad-xau-liquidations"
+    )
+
+    if error:
+        return None, error
+
+    events = extract_marginpad_events(
+        payload
+    )
+
+    # The live XAU response can also be flat:
+    # {"symbol":"XAU","events":[...]}.
+    if not events and isinstance(payload, dict):
+        value = payload.get("events")
+        if isinstance(value, list):
+            events = value
+
+    if not isinstance(events, list):
+        return None, {
+            "stage": "marginpad-xau-liquidations",
+            "error": "events payload is not a list"
+        }
+
+    closed_end_ms = (
+        closed_minute_ts
+        + 59
+    ) * 1000 + 999
+
+    if previous_through_ms is None:
+        lower_bound_ms = (
+            closed_end_ms
+            - MARGINPAD_OVERLAP_MS
+        )
+    else:
+        lower_bound_ms = max(
+            0,
+            previous_through_ms
+            - MARGINPAD_OVERLAP_MS
+        )
+
+    fresh_long = 0.0
+    fresh_short = 0.0
+    accepted_events = 0
+    newest_event_ms = None
+    exchanges = set()
+    normalized_events = []
+
+    for event in events:
+
+        if not isinstance(event, dict):
+            continue
+
+        # Extra guard so a malformed mixed payload can never leak BTC
+        # events into the XAU accumulator.
+        event_symbol = str(
+            event.get("symbol", "")
+        ).strip().upper()
+
+        if event_symbol and event_symbol != "XAU":
+            continue
+
+        event_ts_ms = normalize_marginpad_ts_ms(
+            event.get("ts")
+        )
+
+        if event_ts_ms is None:
+            continue
+
+        normalized_events.append(
+            (event_ts_ms, event)
+        )
+
+    normalized_events.sort(
+        key=lambda item: item[0]
+    )
+
+    for event_ts_ms, event in normalized_events:
+
+        if event_ts_ms > closed_end_ms:
+            continue
+
+        if event_ts_ms <= lower_bound_ms:
+            continue
+
+        fingerprint = marginpad_event_fingerprint(
+            event
+        )
+
+        if fingerprint in marginpad_xau_seen_set:
+            continue
+
+        try:
+            notional = float(
+                event.get("notional", 0)
+                or 0
+            )
+        except (
+            TypeError,
+            ValueError
+        ):
+            continue
+
+        if notional < 0:
+            notional = abs(notional)
+
+        side = str(
+            event.get("side", "")
+        ).strip().lower()
+
+        if side == "long_liquidated":
+            fresh_long += notional
+
+        elif side == "short_liquidated":
+            fresh_short += notional
+
+        else:
+            continue
+
+        exchange = str(
+            event.get("exchange", "")
+        ).strip()
+
+        if exchange:
+            exchanges.add(exchange)
+
+        remember_marginpad_xau_event(
+            fingerprint
+        )
+
+        accepted_events += 1
+
+        if (
+            newest_event_ms is None
+            or event_ts_ms > newest_event_ms
+        ):
+            newest_event_ms = event_ts_ms
+
+    print(
+        "MARGINPAD XAU | "
+        f"events_returned={len(events)} | "
+        f"events_accepted={accepted_events} | "
+        f"exchanges={len(exchanges)}"
+    )
+
+    return {
+        "events_returned": len(events),
+        "events_accepted": accepted_events,
+        "fresh_long_usd": round(fresh_long, 2),
+        "fresh_short_usd": round(fresh_short, 2),
+        "fresh_net_short_minus_long": round(
+            fresh_short - fresh_long,
+            2
+        ),
+        "exchanges_seen": sorted(exchanges),
+        "newest_event_ts_ms": newest_event_ms,
+        "closed_end_ms": closed_end_ms
+    }, None
+
+
+# ==================================================
 # HOME
 # ==================================================
 
@@ -792,7 +1037,7 @@ def home():
     return jsonify({
         "status": "ok",
         "service":
-            "NQ + ES + BTC + XAU + MarginPad BTC Liquidation Backend",
+            "NQ + ES + BTC + XAU + MarginPad BTC + XAU Liquidation Backend",
 
         "coinalyze_min_request_gap_seconds":
             COINALYZE_MIN_REQUEST_GAP_SECONDS,
@@ -854,6 +1099,32 @@ def home():
         "marginpad_seen_event_cache":
             len(
                 marginpad_seen_set
+            ),
+
+        "marginpad_xau_liquidation_threshold":
+            MARGINPAD_XAU_LIQ_THRESHOLD,
+
+        "marginpad_xau_long_cumulative":
+            round(
+                marginpad_xau_long_cumulative,
+                2
+            ),
+
+        "marginpad_xau_short_cumulative":
+            round(
+                marginpad_xau_short_cumulative,
+                2
+            ),
+
+        "marginpad_xau_cycle_ref_price":
+            marginpad_xau_cycle_ref_price,
+
+        "marginpad_xau_processed_through_ms":
+            marginpad_xau_processed_through_ms,
+
+        "marginpad_xau_seen_event_cache":
+            len(
+                marginpad_xau_seen_set
             ),
 
         "xau_liquidation_threshold":
@@ -1818,6 +2089,35 @@ def test_marginpad_btc_aggregate():
 
 
 # ==================================================
+# XAU READ-ONLY STATE - MARGINPAD
+# ==================================================
+
+@app.get("/test-marginpad-xau-aggregate")
+def test_marginpad_xau_aggregate():
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "source": "MarginPad",
+        "asset": "XAU",
+        "long_cumulative_usd": round(
+            marginpad_xau_long_cumulative,
+            2
+        ),
+        "short_cumulative_usd": round(
+            marginpad_xau_short_cumulative,
+            2
+        ),
+        "threshold_usd": MARGINPAD_XAU_LIQ_THRESHOLD,
+        "cycle_reference_price": marginpad_xau_cycle_ref_price,
+        "processed_through_ms": marginpad_xau_processed_through_ms,
+        "seen_event_cache": len(
+            marginpad_xau_seen_set
+        )
+    })
+
+
+# ==================================================
 # XAU READ-ONLY STATE
 # ==================================================
 
@@ -2678,6 +2978,232 @@ def process_marginpad_btc(
 
 
 # ==================================================
+# XAU PROCESSOR - MARGINPAD
+# ==================================================
+
+def process_marginpad_xau(
+    closed_minute_ts
+):
+
+    global marginpad_xau_long_cumulative
+    global marginpad_xau_short_cumulative
+    global marginpad_xau_cycle_ref_price
+    global marginpad_xau_processed_through_ms
+
+    xau_price, price_error = (
+        get_marginpad_xau_price()
+    )
+
+    if price_error:
+
+        return {
+            "ok": False,
+            "asset": "XAU",
+            "source": "MarginPad",
+            "alert_sent": False,
+            "error": price_error
+        }
+
+    closed_end_ms = (
+        closed_minute_ts
+        + 59
+    ) * 1000 + 999
+
+    if marginpad_xau_processed_through_ms is None:
+
+        # Start clean at the current closed minute so a deploy/restart
+        # cannot replay old XAU liquidation events into the new cycle.
+        marginpad_xau_processed_through_ms = (
+            closed_end_ms
+        )
+
+        marginpad_xau_cycle_ref_price = (
+            xau_price
+        )
+
+        marginpad_xau_long_cumulative = 0.0
+        marginpad_xau_short_cumulative = 0.0
+
+        return {
+            "ok": True,
+            "asset": "XAU",
+            "source": "MarginPad",
+            "initialized": True,
+            "xau_price": round(xau_price, 2),
+            "long_cumulative_usd": 0,
+            "short_cumulative_usd": 0,
+            "cycle_reference_price": marginpad_xau_cycle_ref_price,
+            "processed_through_ms": marginpad_xau_processed_through_ms
+        }
+
+    if closed_end_ms <= marginpad_xau_processed_through_ms:
+
+        return {
+            "ok": True,
+            "asset": "XAU",
+            "source": "MarginPad",
+            "new_closed_minute": False,
+            "xau_price": round(xau_price, 2),
+            "long_cumulative_usd": round(
+                marginpad_xau_long_cumulative,
+                2
+            ),
+            "short_cumulative_usd": round(
+                marginpad_xau_short_cumulative,
+                2
+            ),
+            "cycle_reference_price": marginpad_xau_cycle_ref_price,
+            "processed_through_ms": marginpad_xau_processed_through_ms
+        }
+
+    fresh, error = (
+        get_marginpad_fresh_xau_liquidations(
+            marginpad_xau_processed_through_ms,
+            closed_minute_ts
+        )
+    )
+
+    if error:
+
+        return {
+            "ok": False,
+            "asset": "XAU",
+            "source": "MarginPad",
+            "alert_sent": False,
+            "long_cumulative_usd": round(
+                marginpad_xau_long_cumulative,
+                2
+            ),
+            "short_cumulative_usd": round(
+                marginpad_xau_short_cumulative,
+                2
+            ),
+            "processed_through_ms": marginpad_xau_processed_through_ms,
+            "error": error
+        }
+
+    fresh_long = fresh["fresh_long_usd"]
+    fresh_short = fresh["fresh_short_usd"]
+
+    marginpad_xau_long_cumulative += fresh_long
+    marginpad_xau_short_cumulative += fresh_short
+
+    # Advance only after a successful MarginPad fetch/parse.
+    marginpad_xau_processed_through_ms = (
+        closed_end_ms
+    )
+
+    cycle_long = marginpad_xau_long_cumulative
+    cycle_short = marginpad_xau_short_cumulative
+    cycle_gap = abs(cycle_long - cycle_short)
+
+    long_hit = (
+        cycle_long >= MARGINPAD_XAU_LIQ_THRESHOLD
+    )
+
+    short_hit = (
+        cycle_short >= MARGINPAD_XAU_LIQ_THRESHOLD
+    )
+
+    alert_sent = False
+    cycle_winner = None
+
+    xau_price_move = None
+
+    if marginpad_xau_cycle_ref_price is not None:
+        xau_price_move = abs(
+            xau_price
+            - marginpad_xau_cycle_ref_price
+        )
+
+    if long_hit or short_hit:
+
+        if long_hit and short_hit:
+            cycle_winner = "BOTH HIT SAME MINUTE"
+            alert_title = "XAU MARGINPAD BOTH HIT +1M"
+
+        elif long_hit:
+            cycle_winner = "LONG"
+            alert_title = "XAU MARGINPAD LONG WINS +1M"
+
+        else:
+            cycle_winner = "SHORT"
+            alert_title = "XAU MARGINPAD SHORT WINS +1M"
+
+        move_text = (
+            f"{xau_price_move:,.2f} pts"
+            if xau_price_move is not None
+            else "NA"
+        )
+
+        cycle_total = cycle_long + cycle_short
+
+        long_pct = (
+            cycle_long / cycle_total * 100
+        ) if cycle_total > 0 else 0
+
+        short_pct = (
+            cycle_short / cycle_total * 100
+        ) if cycle_total > 0 else 0
+
+        alert_sent = send_pushover(
+            alert_title,
+            (
+                f"SOURCE MARGINPAD | "
+                f"WINNER {cycle_winner} | "
+                f"LONG ${cycle_long:,.0f} "
+                f"({long_pct:.2f}%) | "
+                f"SHORT ${cycle_short:,.0f} "
+                f"({short_pct:.2f}%) | "
+                f"GAP ${cycle_gap:,.0f} | "
+                f"XAU {xau_price:,.2f} | "
+                f"XAU MOVE {move_text}"
+            )
+        )
+
+        marginpad_xau_long_cumulative = 0.0
+        marginpad_xau_short_cumulative = 0.0
+        marginpad_xau_cycle_ref_price = xau_price
+
+    return {
+        "ok": True,
+        "asset": "XAU",
+        "source": "MarginPad",
+        "initialized": False,
+        "price": round(xau_price, 2),
+        "events_returned": fresh["events_returned"],
+        "events_accepted": fresh["events_accepted"],
+        "exchanges_seen": fresh["exchanges_seen"],
+        "fresh_long_usd": fresh_long,
+        "fresh_short_usd": fresh_short,
+        "cycle_long_before_reset": round(cycle_long, 2),
+        "cycle_short_before_reset": round(cycle_short, 2),
+        "cycle_gap_usd": round(cycle_gap, 2),
+        "long_cumulative_usd": round(
+            marginpad_xau_long_cumulative,
+            2
+        ),
+        "short_cumulative_usd": round(
+            marginpad_xau_short_cumulative,
+            2
+        ),
+        "threshold_usd": MARGINPAD_XAU_LIQ_THRESHOLD,
+        "cycle_winner": cycle_winner,
+        "alert_sent": alert_sent,
+        "price_move_points": (
+            round(xau_price_move, 2)
+            if xau_price_move is not None
+            else None
+        ),
+        "cycle_reference_price": marginpad_xau_cycle_ref_price,
+        "processed_through_ms": marginpad_xau_processed_through_ms,
+        "seen_event_cache": len(
+            marginpad_xau_seen_set
+        )
+    }
+
+
+# ==================================================
 # XAU PROCESSOR
 # ==================================================
 
@@ -3229,6 +3755,70 @@ def marginpad_btc_minute_alert():
 
         print(
             "MARGINPAD-BTC-MINUTE-ALERT ERROR:",
+            str(e)
+        )
+
+        return jsonify({
+            "ok": False,
+            "retry_needed": True,
+            "alert_sent": False,
+            "error": str(e)
+        }), 200
+
+
+# ==================================================
+# XAU ONLY ENDPOINT - MARGINPAD
+# ==================================================
+
+@app.get("/marginpad-xau-minute-alert")
+def marginpad_xau_minute_alert():
+
+    if not cron_authorized():
+
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized"
+        }), 403
+
+    try:
+
+        closed_minute_ts = (
+            get_closed_minute_ts()
+        )
+
+        xau_result = (
+            process_marginpad_xau(
+                closed_minute_ts
+            )
+        )
+
+        if not xau_result.get(
+            "ok",
+            False
+        ):
+
+            print(
+                "MARGINPAD XAU PROCESS ERROR:",
+                xau_result
+            )
+
+        return jsonify({
+            "ok": xau_result.get(
+                "ok",
+                False
+            ),
+            "retry_needed": not xau_result.get(
+                "ok",
+                False
+            ),
+            "closed_minute_ts": closed_minute_ts,
+            "marginpad_xau": xau_result
+        }), 200
+
+    except Exception as e:
+
+        print(
+            "MARGINPAD-XAU-MINUTE-ALERT ERROR:",
             str(e)
         )
 
