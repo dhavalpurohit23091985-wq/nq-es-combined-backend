@@ -14,6 +14,8 @@ THRESHOLD_USD = float(os.getenv("DIRECT_BTC_THRESHOLD_USD", "5000000"))
 BITGET_WS = "wss://ws.bitget.com/v3/ws/public"
 ASTER_WS = "wss://fstream.asterdex.com/ws/btcusdt@forceOrder"
 COINEX_URL = "https://api.coinex.com/v2/futures/liquidation-history"
+LIGHTER_WS = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
+LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
 
 COINEX_POLL_SECONDS = 5
 COINEX_LOOKBACK_MS = 60_000
@@ -24,6 +26,7 @@ by_exchange = {
     "bitget": {"long": 0.0, "short": 0.0},
     "aster": {"long": 0.0, "short": 0.0},
     "coinex": {"long": 0.0, "short": 0.0},
+    "lighter": {"long": 0.0, "short": 0.0},
 }
 
 lock = asyncio.Lock()
@@ -108,7 +111,8 @@ async def add_liquidation(exchange, side, notional_usd, event_key):
             f"GAP: {usd(gap)}\n\n"
             f"Bitget  L {usd(by_exchange['bitget']['long'])} | S {usd(by_exchange['bitget']['short'])}\n"
             f"Aster   L {usd(by_exchange['aster']['long'])} | S {usd(by_exchange['aster']['short'])}\n"
-            f"CoinEx  L {usd(by_exchange['coinex']['long'])} | S {usd(by_exchange['coinex']['short'])}"
+            f"CoinEx  L {usd(by_exchange['coinex']['long'])} | S {usd(by_exchange['coinex']['short'])}\n"
+            f"Lighter L {usd(by_exchange['lighter']['long'])} | S {usd(by_exchange['lighter']['short'])}"
         )
         await asyncio.to_thread(send_pushover, title, message)
 
@@ -257,6 +261,145 @@ async def coinex_loop():
         await asyncio.sleep(COINEX_POLL_SECONDS)
 
 
+def _lighter_find_btc_market_id(payload):
+    """Return BTC perpetual market_id from Lighter orderBooks metadata."""
+    books = payload.get("order_books") or payload.get("orderBooks") or payload.get("data") or []
+    if isinstance(books, dict):
+        books = books.get("order_books") or books.get("orderBooks") or books.get("data") or []
+
+    for item in books:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = str(item.get("symbol") or "").upper().strip()
+        market_type = str(item.get("market_type") or "").lower().strip()
+
+        # Lighter perpetual metadata uses raw symbol such as BTC.
+        # Accept common symbol variants but avoid spot-style BTC/...
+        is_btc = symbol in {"BTC", "BTC-USD", "BTCUSD", "BTC-PERP"} or (
+            symbol.startswith("BTC") and "/" not in symbol
+        )
+        if not is_btc:
+            continue
+
+        # Prefer perpetual market when market_type is present.
+        if market_type and "spot" in market_type:
+            continue
+
+        market_id = item.get("market_id")
+        if market_id is None:
+            market_id = item.get("market_index")
+        if market_id is not None:
+            return int(market_id)
+
+    raise RuntimeError("Could not discover Lighter BTC perpetual market_id")
+
+
+async def lighter_get_btc_market_id():
+    def fetch():
+        r = requests.get(LIGHTER_ORDERBOOKS_URL, timeout=20)
+        r.raise_for_status()
+        return _lighter_find_btc_market_id(r.json())
+
+    return await asyncio.to_thread(fetch)
+
+
+async def lighter_heartbeat(ws):
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await ws.send(json.dumps({"type": "ping"}))
+        except Exception:
+            return
+
+
+async def lighter_loop():
+    while True:
+        try:
+            market_id = await lighter_get_btc_market_id()
+            print(f"[LIGHTER] BTC market_id={market_id}", flush=True)
+            print("[LIGHTER] connecting...", flush=True)
+
+            async with websockets.connect(
+                LIGHTER_WS,
+                open_timeout=20,
+                close_timeout=10,
+                ping_interval=None,
+                max_size=4_000_000,
+            ) as ws:
+                await ws.send(json.dumps({
+                    "type": "subscribe",
+                    "channel": f"trade/{market_id}",
+                }))
+                print(f"[LIGHTER] subscribed trade/{market_id}", flush=True)
+
+                hb = asyncio.create_task(lighter_heartbeat(ws))
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        if msg.get("type") == "pong":
+                            continue
+
+                        for trade in msg.get("liquidation_trades") or []:
+                            if not isinstance(trade, dict):
+                                continue
+
+                            if int(trade.get("market_id", market_id)) != market_id:
+                                continue
+
+                            # Official Trade payload provides usd_amount directly.
+                            notional = float(trade.get("usd_amount") or 0)
+                            if notional <= 0:
+                                continue
+
+                            # For liquidation trades, use the taker's pre-trade
+                            # position sign when present:
+                            #   positive -> long position being liquidated
+                            #   negative -> short position being liquidated
+                            #
+                            # If Lighter omits this field, skip rather than guess
+                            # the side from is_maker_ask. The raw event is logged
+                            # so we can inspect the live payload and safely add a
+                            # fallback later if needed.
+                            before_raw = trade.get("taker_position_size_before")
+                            try:
+                                before = float(before_raw)
+                            except (TypeError, ValueError):
+                                before = 0.0
+
+                            if before > 0:
+                                side = "long"
+                            elif before < 0:
+                                side = "short"
+                            else:
+                                print(
+                                    "[LIGHTER SIDE UNRESOLVED] "
+                                    f"trade_id={trade.get('trade_id_str') or trade.get('trade_id')} "
+                                    f"usd={usd(notional)} "
+                                    f"is_maker_ask={trade.get('is_maker_ask')} "
+                                    f"taker_position_size_before={before_raw}",
+                                    flush=True,
+                                )
+                                continue
+
+                            trade_id = str(trade.get("trade_id_str") or trade.get("trade_id") or "")
+                            ts = str(trade.get("timestamp") or "")
+                            tx_hash = str(trade.get("tx_hash") or "")
+                            key = f"lighter|{market_id}|{trade_id}|{ts}|{tx_hash}"
+
+                            await add_liquidation("lighter", side, notional, key)
+                finally:
+                    hb.cancel()
+
+        except Exception as e:
+            print(f"[LIGHTER ERROR] {type(e).__name__}: {e}", flush=True)
+            await asyncio.sleep(5)
+
+
 async def status_loop():
     while True:
         await asyncio.sleep(60)
@@ -267,7 +410,8 @@ async def status_loop():
                 f"LONG={usd(totals['long'])} SHORT={usd(totals['short'])} | "
                 f"Bitget(L={usd(by_exchange['bitget']['long'])},S={usd(by_exchange['bitget']['short'])}) "
                 f"Aster(L={usd(by_exchange['aster']['long'])},S={usd(by_exchange['aster']['short'])}) "
-                f"CoinEx(L={usd(by_exchange['coinex']['long'])},S={usd(by_exchange['coinex']['short'])})",
+                f"CoinEx(L={usd(by_exchange['coinex']['long'])},S={usd(by_exchange['coinex']['short'])}) "
+                f"Lighter(L={usd(by_exchange['lighter']['long'])},S={usd(by_exchange['lighter']['short'])})",
                 flush=True,
             )
 
@@ -275,11 +419,12 @@ async def status_loop():
 async def main():
     print("DIRECT BTC LIQUIDATION WORKER STARTING", flush=True)
     print(f"Threshold: {usd(THRESHOLD_USD)}", flush=True)
-    print("Sources: Bitget + Aster + CoinEx", flush=True)
+    print("Sources: Bitget + Aster + CoinEx + Lighter", flush=True)
     await asyncio.gather(
         bitget_loop(),
         aster_loop(),
         coinex_loop(),
+        lighter_loop(),
         status_loop(),
     )
 
