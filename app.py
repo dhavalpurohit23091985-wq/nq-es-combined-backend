@@ -2384,21 +2384,21 @@ def process_btc(
             )
 
             alert_title = (
-                "BTC BOTH HIT +5M"
+                "BTC COINALYZE BOTH HIT +5M"
             )
 
         elif long_hit:
 
             cycle_winner = "LONG"
             alert_title = (
-                "BTC LONG WINS +5M"
+                "BTC COINALYZE LONG WINS +5M"
             )
 
         else:
 
             cycle_winner = "SHORT"
             alert_title = (
-                "BTC SHORT WINS +5M"
+                "BTC COINALYZE SHORT WINS +5M"
             )
 
         move_text = (
@@ -3417,7 +3417,7 @@ def process_xau(
             )
 
             alert_title = (
-                "XAU BOTH HIT +1M"
+                "XAU COINALYZE BOTH HIT +1M"
             )
 
         elif long_hit:
@@ -3425,7 +3425,7 @@ def process_xau(
             cycle_winner = "LONG"
 
             alert_title = (
-                "XAU LONG WINS +1M"
+                "XAU COINALYZE LONG WINS +1M"
             )
 
         else:
@@ -3433,7 +3433,7 @@ def process_xau(
             cycle_winner = "SHORT"
 
             alert_title = (
-                "XAU SHORT WINS +1M"
+                "XAU COINALYZE SHORT WINS +1M"
             )
 
         move_text = (
