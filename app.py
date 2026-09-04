@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+from collections import deque
 
 from flask import Flask, request, jsonify
 import requests
@@ -24,21 +25,40 @@ PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 # ==================================================
 # COINALYZE RATE-LIMIT / RETRY SETTINGS
 # ==================================================
-# IMPORTANT:
-# - ALL BTC perpetual contracts are retained.
-# - ALL XAU perpetual contracts are retained.
-# - No symbol/contract is intentionally removed.
-# - Requests are serialized and spaced to reduce 429 errors.
 
 COINALYZE_MAX_RETRIES = 3
 COINALYZE_FALLBACK_RETRY_DELAYS = (3, 6, 12)
-
-# Minimum gap between ANY two Coinalyze requests from this service.
-# This applies to price, future-markets, and liquidation batches.
 COINALYZE_MIN_REQUEST_GAP_SECONDS = 3.0
 
 _coinalyze_request_lock = threading.Lock()
 _coinalyze_last_request_monotonic = 0.0
+
+
+# ==================================================
+# MARGINPAD SETTINGS
+# ==================================================
+# Free/keyless liquidation feed.
+# Kept COMPLETELY SEPARATE from Coinalyze totals/alerts.
+#
+# Official endpoints used:
+#   GET /api/v1/price?symbol=BTC
+#   GET /api/v1/liquidations/live?symbol=BTC&limit=400
+#
+# MarginPad documents side as:
+#   long_liquidated
+#   short_liquidated
+
+MARGINPAD_BASE_URL = "https://marginpad.io"
+MARGINPAD_MAX_RETRIES = 3
+MARGINPAD_RETRY_DELAYS = (2, 4, 8)
+MARGINPAD_LIVE_LIMIT = 400
+
+# Small overlap protects against events that arrive a little late.
+# Fingerprint de-duplication prevents the overlap from double-counting.
+MARGINPAD_OVERLAP_MS = 5 * 60 * 1000
+MARGINPAD_SEEN_MAX = 10000
+
+_marginpad_request_lock = threading.Lock()
 
 
 # ==================================================
@@ -70,7 +90,7 @@ entry_jpn_price = None
 
 
 # ==================================================
-# BTC FRESH LIQUIDATION SETTINGS
+# BTC FRESH LIQUIDATION SETTINGS - COINALYZE
 # ==================================================
 
 BTC_LIQ_THRESHOLD = 5_000_000
@@ -83,6 +103,28 @@ btc_cycle_ref_price = None
 btc_last_processed_liq_ts = None
 
 btc_symbol_cache = None
+
+
+# ==================================================
+# BTC FRESH LIQUIDATION SETTINGS - MARGINPAD
+# ==================================================
+# Same threshold logic as the existing BTC Coinalyze feed,
+# but state and alerts are independent.
+
+MARGINPAD_BTC_LIQ_THRESHOLD = 5_000_000
+MARGINPAD_BTC_LOW_MOVE_POINTS = 500
+
+marginpad_btc_long_cumulative = 0.0
+marginpad_btc_short_cumulative = 0.0
+
+marginpad_btc_cycle_ref_price = None
+
+# We process events only through the last fully closed minute.
+marginpad_btc_processed_through_ms = None
+
+# In-memory event de-duplication.
+marginpad_seen_queue = deque()
+marginpad_seen_set = set()
 
 
 # ==================================================
@@ -184,7 +226,6 @@ def get_retry_after_seconds(response):
         if value < 0:
             return None
 
-        # Avoid pathological waits in a web request.
         return min(value, 20.0)
 
     except (
@@ -208,8 +249,6 @@ def coinalyze_get(
 
     last_error = None
 
-    # One lock ensures BTC/XAU endpoints cannot burst
-    # Coinalyze simultaneously inside this process.
     with _coinalyze_request_lock:
 
         for attempt in range(
@@ -301,6 +340,121 @@ def coinalyze_get(
 
 
 # ==================================================
+# MARGINPAD GET WITH RETRY
+# ==================================================
+
+def marginpad_get(
+    path,
+    *,
+    params=None,
+    timeout=10,
+    stage="marginpad"
+):
+
+    last_error = None
+
+    with _marginpad_request_lock:
+
+        for attempt in range(
+            MARGINPAD_MAX_RETRIES + 1
+        ):
+
+            try:
+                response = requests.get(
+                    f"{MARGINPAD_BASE_URL}{path}",
+                    params=params,
+                    timeout=timeout
+                )
+
+            except requests.RequestException as e:
+
+                last_error = {
+                    "stage": stage,
+                    "error": str(e),
+                    "attempt": attempt + 1
+                }
+
+                retryable = True
+                retry_after = None
+
+            else:
+
+                if response.status_code == 200:
+
+                    try:
+                        payload = response.json()
+
+                    except ValueError:
+                        return None, {
+                            "stage": stage,
+                            "error": "invalid json"
+                        }
+
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("ok") is False
+                    ):
+                        return None, {
+                            "stage": stage,
+                            "error": payload.get(
+                                "error",
+                                "marginpad returned ok=false"
+                            )
+                        }
+
+                    return payload, None
+
+                retry_after = (
+                    get_retry_after_seconds(
+                        response
+                    )
+                )
+
+                last_error = {
+                    "stage": stage,
+                    "status_code":
+                        response.status_code,
+                    "response":
+                        response.text[:500],
+                    "attempt": attempt + 1,
+                    "retry_after":
+                        retry_after
+                }
+
+                retryable = (
+                    response.status_code == 429
+                    or
+                    500 <= response.status_code <= 599
+                )
+
+                if not retryable:
+                    return None, last_error
+
+            if attempt >= MARGINPAD_MAX_RETRIES:
+                break
+
+            if retry_after is not None:
+                delay = retry_after
+            else:
+                delay = MARGINPAD_RETRY_DELAYS[
+                    min(
+                        attempt,
+                        len(MARGINPAD_RETRY_DELAYS) - 1
+                    )
+                ]
+
+            print(
+                f"{stage}: retrying in "
+                f"{delay:.1f}s "
+                f"(attempt {attempt + 2})"
+            )
+
+            time.sleep(delay)
+
+    return None, last_error
+
+
+# ==================================================
 # GET FUTURE MARKETS
 # ==================================================
 
@@ -335,6 +489,300 @@ def get_future_markets():
 
 
 # ==================================================
+# MARGINPAD HELPERS
+# ==================================================
+
+def normalize_marginpad_ts_ms(raw_ts):
+
+    try:
+        value = float(raw_ts)
+    except (TypeError, ValueError):
+        return None
+
+    # MarginPad documents server/event timestamps in Unix milliseconds.
+    # This fallback also tolerates seconds if an event ever arrives that way.
+    if value < 10_000_000_000:
+        value *= 1000.0
+
+    return int(value)
+
+
+def marginpad_event_fingerprint(event):
+
+    return "|".join([
+        str(event.get("ts", "")),
+        str(event.get("exchange", "")),
+        str(event.get("symbol", "")),
+        str(event.get("side", "")),
+        str(event.get("price", "")),
+        str(event.get("qty", "")),
+        str(event.get("notional", ""))
+    ])
+
+
+def remember_marginpad_event(fingerprint):
+
+    if fingerprint in marginpad_seen_set:
+        return
+
+    marginpad_seen_set.add(fingerprint)
+    marginpad_seen_queue.append(fingerprint)
+
+    while len(marginpad_seen_queue) > MARGINPAD_SEEN_MAX:
+        old = marginpad_seen_queue.popleft()
+        marginpad_seen_set.discard(old)
+
+
+def get_marginpad_btc_price():
+
+    payload, error = marginpad_get(
+        "/api/v1/price",
+        params={
+            "symbol": "BTC"
+        },
+        timeout=10,
+        stage="marginpad-btc-price"
+    )
+
+    if error:
+        return None, error
+
+    try:
+        data = payload.get("data", {})
+        price = float(data["price"])
+
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError
+    ):
+        return None, {
+            "stage": "marginpad-btc-price",
+            "error": "price missing or invalid",
+            "response": str(payload)[:500]
+        }
+
+    return price, None
+
+
+def extract_marginpad_events(payload):
+
+    if not isinstance(payload, dict):
+        return []
+
+    data = payload.get("data")
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in (
+            "events",
+            "rows",
+            "liquidations",
+            "items"
+        ):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+    # Defensive fallback in case the endpoint returns
+    # {events:[...]} outside the standard data envelope.
+    value = payload.get("events")
+    if isinstance(value, list):
+        return value
+
+    return []
+
+
+def get_marginpad_fresh_btc_liquidations(
+    previous_through_ms,
+    closed_minute_ts
+):
+
+    payload, error = marginpad_get(
+        "/api/v1/liquidations/live",
+        params={
+            "symbol": "BTC",
+            "limit": MARGINPAD_LIVE_LIMIT
+        },
+        timeout=12,
+        stage="marginpad-btc-liquidations"
+    )
+
+    if error:
+        return None, error
+
+    events = extract_marginpad_events(
+        payload
+    )
+
+    if not isinstance(events, list):
+        return None, {
+            "stage": "marginpad-btc-liquidations",
+            "error": "events payload is not a list"
+        }
+
+    closed_end_ms = (
+        closed_minute_ts
+        + 59
+    ) * 1000 + 999
+
+    if previous_through_ms is None:
+        lower_bound_ms = (
+            closed_end_ms
+            - MARGINPAD_OVERLAP_MS
+        )
+    else:
+        lower_bound_ms = max(
+            0,
+            previous_through_ms
+            - MARGINPAD_OVERLAP_MS
+        )
+
+    fresh_long = 0.0
+    fresh_short = 0.0
+    accepted_events = 0
+    newest_event_ms = None
+    exchanges = set()
+
+    # Oldest first makes logging/debugging easier.
+    normalized_events = []
+
+    for event in events:
+
+        if not isinstance(event, dict):
+            continue
+
+        event_ts_ms = normalize_marginpad_ts_ms(
+            event.get("ts")
+        )
+
+        if event_ts_ms is None:
+            continue
+
+        normalized_events.append(
+            (event_ts_ms, event)
+        )
+
+    normalized_events.sort(
+        key=lambda item: item[0]
+    )
+
+    for event_ts_ms, event in normalized_events:
+
+        if event_ts_ms > closed_end_ms:
+            continue
+
+        if event_ts_ms <= lower_bound_ms:
+            continue
+
+        fingerprint = (
+            marginpad_event_fingerprint(
+                event
+            )
+        )
+
+        if fingerprint in marginpad_seen_set:
+            continue
+
+        try:
+            notional = float(
+                event.get("notional", 0)
+                or 0
+            )
+        except (
+            TypeError,
+            ValueError
+        ):
+            continue
+
+        if notional < 0:
+            notional = abs(notional)
+
+        side = str(
+            event.get("side", "")
+        ).strip().lower()
+
+        if side == "long_liquidated":
+            fresh_long += notional
+
+        elif side == "short_liquidated":
+            fresh_short += notional
+
+        else:
+            continue
+
+        exchange = str(
+            event.get("exchange", "")
+        ).strip()
+
+        if exchange:
+            exchanges.add(exchange)
+
+        remember_marginpad_event(
+            fingerprint
+        )
+
+        accepted_events += 1
+
+        if (
+            newest_event_ms is None
+            or event_ts_ms > newest_event_ms
+        ):
+            newest_event_ms = (
+                event_ts_ms
+            )
+
+    print(
+        "MARGINPAD BTC | "
+        f"events_returned={len(events)} | "
+        f"events_accepted={accepted_events} | "
+        f"exchanges={len(exchanges)}"
+    )
+
+    return {
+        "events_returned":
+            len(events),
+
+        "events_accepted":
+            accepted_events,
+
+        "fresh_long_usd":
+            round(
+                fresh_long,
+                2
+            ),
+
+        "fresh_short_usd":
+            round(
+                fresh_short,
+                2
+            ),
+
+        "fresh_net_short_minus_long":
+            round(
+                fresh_short
+                -
+                fresh_long,
+                2
+            ),
+
+        "exchanges_seen":
+            sorted(
+                exchanges
+            ),
+
+        "newest_event_ts_ms":
+            newest_event_ms,
+
+        "closed_end_ms":
+            closed_end_ms
+    }, None
+
+
+# ==================================================
 # HOME
 # ==================================================
 
@@ -344,7 +792,7 @@ def home():
     return jsonify({
         "status": "ok",
         "service":
-            "NQ + ES + BTC + XAU Full Contract Liquidation Backend",
+            "NQ + ES + BTC + XAU + MarginPad BTC Liquidation Backend",
 
         "coinalyze_min_request_gap_seconds":
             COINALYZE_MIN_REQUEST_GAP_SECONDS,
@@ -380,6 +828,32 @@ def home():
                 len(btc_symbol_cache)
                 if btc_symbol_cache
                 else 0
+            ),
+
+        "marginpad_btc_liquidation_threshold":
+            MARGINPAD_BTC_LIQ_THRESHOLD,
+
+        "marginpad_btc_long_cumulative":
+            round(
+                marginpad_btc_long_cumulative,
+                2
+            ),
+
+        "marginpad_btc_short_cumulative":
+            round(
+                marginpad_btc_short_cumulative,
+                2
+            ),
+
+        "marginpad_btc_cycle_ref_price":
+            marginpad_btc_cycle_ref_price,
+
+        "marginpad_btc_processed_through_ms":
+            marginpad_btc_processed_through_ms,
+
+        "marginpad_seen_event_cache":
+            len(
+                marginpad_seen_set
             ),
 
         "xau_liquidation_threshold":
@@ -835,8 +1309,6 @@ def get_perpetual_symbols(asset):
             ):
                 price_symbol = symbol
 
-    # Remove only duplicate symbol names.
-    # No valid unique contract is intentionally dropped.
     symbols = list(
         dict.fromkeys(
             symbols
@@ -1062,9 +1534,6 @@ def get_fresh_liquidations(
         + 59
     )
 
-    # Keep Coinalyze's 20-symbol batch size.
-    # ALL contracts are processed across as many
-    # sequential batches as required.
     for batch_index, i in enumerate(
         range(
             0,
@@ -1209,9 +1678,6 @@ def get_fresh_liquidations(
                 ):
                     continue
 
-    # Critical data-integrity rule:
-    # If even ONE batch failed, do NOT accept a partial total.
-    # Timestamp will therefore NOT advance in process_btc/process_xau.
     if failed_batches:
 
         return None, {
@@ -1270,7 +1736,7 @@ def get_fresh_liquidations(
 
 
 # ==================================================
-# BTC READ-ONLY STATE
+# BTC READ-ONLY STATE - COINALYZE
 # ==================================================
 
 @app.get("/test-btc-aggregate")
@@ -1306,6 +1772,47 @@ def test_btc_aggregate():
                 len(btc_symbol_cache)
                 if btc_symbol_cache
                 else 0
+            )
+    })
+
+
+# ==================================================
+# BTC READ-ONLY STATE - MARGINPAD
+# ==================================================
+
+@app.get("/test-marginpad-btc-aggregate")
+def test_marginpad_btc_aggregate():
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+
+        "source": "MarginPad",
+
+        "long_cumulative_usd":
+            round(
+                marginpad_btc_long_cumulative,
+                2
+            ),
+
+        "short_cumulative_usd":
+            round(
+                marginpad_btc_short_cumulative,
+                2
+            ),
+
+        "threshold_usd":
+            MARGINPAD_BTC_LIQ_THRESHOLD,
+
+        "cycle_reference_price":
+            marginpad_btc_cycle_ref_price,
+
+        "processed_through_ms":
+            marginpad_btc_processed_through_ms,
+
+        "seen_event_cache":
+            len(
+                marginpad_seen_set
             )
     })
 
@@ -1355,7 +1862,7 @@ def test_xau_aggregate():
 
 
 # ==================================================
-# BTC PROCESSOR
+# BTC PROCESSOR - COINALYZE
 # ==================================================
 
 def process_btc(
@@ -1376,6 +1883,7 @@ def process_btc(
         return {
             "ok": False,
             "asset": "BTC",
+            "source": "Coinalyze",
             "alert_sent": False,
             "error": price_error
         }
@@ -1396,6 +1904,7 @@ def process_btc(
         return {
             "ok": True,
             "asset": "BTC",
+            "source": "Coinalyze",
             "initialized": True,
 
             "btc_price":
@@ -1426,6 +1935,7 @@ def process_btc(
         return {
             "ok": True,
             "asset": "BTC",
+            "source": "Coinalyze",
             "new_closed_minute": False,
 
             "btc_price":
@@ -1466,6 +1976,7 @@ def process_btc(
         return {
             "ok": False,
             "asset": "BTC",
+            "source": "Coinalyze",
             "alert_sent": False,
 
             "long_cumulative_usd":
@@ -1503,7 +2014,6 @@ def process_btc(
         fresh_short
     )
 
-    # Advance ONLY after every contract batch succeeded.
     btc_last_processed_liq_ts = (
         closed_minute_ts
     )
@@ -1659,6 +2169,7 @@ def process_btc(
     return {
         "ok": True,
         "asset": "BTC",
+        "source": "Coinalyze",
         "initialized": False,
 
         "perpetual_symbols":
@@ -1743,6 +2254,426 @@ def process_btc(
 
         "last_processed_liq_ts":
             btc_last_processed_liq_ts
+    }
+
+
+# ==================================================
+# BTC PROCESSOR - MARGINPAD
+# ==================================================
+
+def process_marginpad_btc(
+    closed_minute_ts
+):
+
+    global marginpad_btc_long_cumulative
+    global marginpad_btc_short_cumulative
+    global marginpad_btc_cycle_ref_price
+    global marginpad_btc_processed_through_ms
+
+    btc_price, price_error = (
+        get_marginpad_btc_price()
+    )
+
+    if price_error:
+
+        return {
+            "ok": False,
+            "asset": "BTC",
+            "source": "MarginPad",
+            "alert_sent": False,
+            "error": price_error
+        }
+
+    closed_end_ms = (
+        closed_minute_ts
+        + 59
+    ) * 1000 + 999
+
+    if (
+        marginpad_btc_processed_through_ms
+        is None
+    ):
+
+        # Initialize at the current closed minute so old
+        # events are not counted on first deployment/restart.
+        marginpad_btc_processed_through_ms = (
+            closed_end_ms
+        )
+
+        marginpad_btc_cycle_ref_price = (
+            btc_price
+        )
+
+        marginpad_btc_long_cumulative = 0.0
+        marginpad_btc_short_cumulative = 0.0
+
+        return {
+            "ok": True,
+            "asset": "BTC",
+            "source": "MarginPad",
+            "initialized": True,
+
+            "btc_price":
+                round(
+                    btc_price,
+                    2
+                ),
+
+            "long_cumulative_usd":
+                0,
+
+            "short_cumulative_usd":
+                0,
+
+            "cycle_reference_price":
+                marginpad_btc_cycle_ref_price,
+
+            "processed_through_ms":
+                marginpad_btc_processed_through_ms
+        }
+
+    if (
+        closed_end_ms
+        <=
+        marginpad_btc_processed_through_ms
+    ):
+
+        return {
+            "ok": True,
+            "asset": "BTC",
+            "source": "MarginPad",
+            "new_closed_minute": False,
+
+            "btc_price":
+                round(
+                    btc_price,
+                    2
+                ),
+
+            "long_cumulative_usd":
+                round(
+                    marginpad_btc_long_cumulative,
+                    2
+                ),
+
+            "short_cumulative_usd":
+                round(
+                    marginpad_btc_short_cumulative,
+                    2
+                ),
+
+            "cycle_reference_price":
+                marginpad_btc_cycle_ref_price,
+
+            "processed_through_ms":
+                marginpad_btc_processed_through_ms
+        }
+
+    fresh, error = (
+        get_marginpad_fresh_btc_liquidations(
+            marginpad_btc_processed_through_ms,
+            closed_minute_ts
+        )
+    )
+
+    if error:
+
+        return {
+            "ok": False,
+            "asset": "BTC",
+            "source": "MarginPad",
+            "alert_sent": False,
+
+            "long_cumulative_usd":
+                round(
+                    marginpad_btc_long_cumulative,
+                    2
+                ),
+
+            "short_cumulative_usd":
+                round(
+                    marginpad_btc_short_cumulative,
+                    2
+                ),
+
+            "processed_through_ms":
+                marginpad_btc_processed_through_ms,
+
+            "error":
+                error
+        }
+
+    fresh_long = (
+        fresh["fresh_long_usd"]
+    )
+
+    fresh_short = (
+        fresh["fresh_short_usd"]
+    )
+
+    marginpad_btc_long_cumulative += (
+        fresh_long
+    )
+
+    marginpad_btc_short_cumulative += (
+        fresh_short
+    )
+
+    # Advance only after a successful MarginPad fetch/parse.
+    marginpad_btc_processed_through_ms = (
+        closed_end_ms
+    )
+
+    cycle_long = (
+        marginpad_btc_long_cumulative
+    )
+
+    cycle_short = (
+        marginpad_btc_short_cumulative
+    )
+
+    cycle_gap = abs(
+        cycle_long
+        -
+        cycle_short
+    )
+
+    long_hit = (
+        cycle_long
+        >=
+        MARGINPAD_BTC_LIQ_THRESHOLD
+    )
+
+    short_hit = (
+        cycle_short
+        >=
+        MARGINPAD_BTC_LIQ_THRESHOLD
+    )
+
+    alert_sent = False
+    cycle_winner = None
+
+    btc_price_move = None
+    low_move = False
+
+    if (
+        marginpad_btc_cycle_ref_price
+        is not None
+    ):
+
+        btc_price_move = abs(
+            btc_price
+            -
+            marginpad_btc_cycle_ref_price
+        )
+
+        low_move = (
+            btc_price_move
+            <
+            MARGINPAD_BTC_LOW_MOVE_POINTS
+        )
+
+    if (
+        long_hit
+        or
+        short_hit
+    ):
+
+        if (
+            long_hit
+            and
+            short_hit
+        ):
+
+            cycle_winner = (
+                "BOTH HIT SAME MINUTE"
+            )
+
+            alert_title = (
+                "BTC MARGINPAD BOTH HIT +5M"
+            )
+
+        elif long_hit:
+
+            cycle_winner = "LONG"
+
+            alert_title = (
+                "BTC MARGINPAD LONG WINS +5M"
+            )
+
+        else:
+
+            cycle_winner = "SHORT"
+
+            alert_title = (
+                "BTC MARGINPAD SHORT WINS +5M"
+            )
+
+        move_text = (
+            f"{btc_price_move:,.0f} pts"
+            if
+            btc_price_move
+            is not None
+            else
+            "NA"
+        )
+
+        low_move_text = (
+            " | LOW-MOVE YES"
+            if low_move
+            else
+            ""
+        )
+
+        cycle_total = (
+            cycle_long
+            +
+            cycle_short
+        )
+
+        long_pct = (
+            cycle_long
+            /
+            cycle_total
+            *
+            100
+        ) if cycle_total > 0 else 0
+
+        short_pct = (
+            cycle_short
+            /
+            cycle_total
+            *
+            100
+        ) if cycle_total > 0 else 0
+
+        alert_sent = send_pushover(
+            alert_title,
+            (
+                f"SOURCE MARGINPAD | "
+                f"WINNER "
+                f"{cycle_winner} | "
+                f"LONG "
+                f"${cycle_long:,.0f} "
+                f"({long_pct:.2f}%) | "
+                f"SHORT "
+                f"${cycle_short:,.0f} "
+                f"({short_pct:.2f}%) | "
+                f"GAP "
+                f"${cycle_gap:,.0f} | "
+                f"BTC "
+                f"{btc_price:,.0f} | "
+                f"BTC MOVE "
+                f"{move_text}"
+                f"{low_move_text}"
+            )
+        )
+
+        marginpad_btc_long_cumulative = 0.0
+        marginpad_btc_short_cumulative = 0.0
+
+        marginpad_btc_cycle_ref_price = (
+            btc_price
+        )
+
+    return {
+        "ok": True,
+        "asset": "BTC",
+        "source": "MarginPad",
+        "initialized": False,
+
+        "price":
+            round(
+                btc_price,
+                2
+            ),
+
+        "events_returned":
+            fresh[
+                "events_returned"
+            ],
+
+        "events_accepted":
+            fresh[
+                "events_accepted"
+            ],
+
+        "exchanges_seen":
+            fresh[
+                "exchanges_seen"
+            ],
+
+        "fresh_long_usd":
+            fresh_long,
+
+        "fresh_short_usd":
+            fresh_short,
+
+        "cycle_long_before_reset":
+            round(
+                cycle_long,
+                2
+            ),
+
+        "cycle_short_before_reset":
+            round(
+                cycle_short,
+                2
+            ),
+
+        "cycle_gap_usd":
+            round(
+                cycle_gap,
+                2
+            ),
+
+        "long_cumulative_usd":
+            round(
+                marginpad_btc_long_cumulative,
+                2
+            ),
+
+        "short_cumulative_usd":
+            round(
+                marginpad_btc_short_cumulative,
+                2
+            ),
+
+        "threshold_usd":
+            MARGINPAD_BTC_LIQ_THRESHOLD,
+
+        "cycle_winner":
+            cycle_winner,
+
+        "alert_sent":
+            alert_sent,
+
+        "price_move_points":
+            (
+                round(
+                    btc_price_move,
+                    2
+                )
+                if
+                btc_price_move
+                is not None
+                else
+                None
+            ),
+
+        "low_move":
+            low_move,
+
+        "cycle_reference_price":
+            marginpad_btc_cycle_ref_price,
+
+        "processed_through_ms":
+            marginpad_btc_processed_through_ms,
+
+        "seen_event_cache":
+            len(
+                marginpad_seen_set
+            )
     }
 
 
@@ -1898,7 +2829,6 @@ def process_xau(
         fresh_short
     )
 
-    # Advance ONLY after every contract batch succeeded.
     xau_last_processed_liq_ts = (
         closed_minute_ts
     )
@@ -2169,7 +3099,7 @@ def cron_authorized():
 
 
 # ==================================================
-# BTC ONLY ENDPOINT
+# BTC ONLY ENDPOINT - COINALYZE
 # ==================================================
 
 @app.get("/btc-minute-alert")
@@ -2228,6 +3158,77 @@ def btc_minute_alert():
 
         print(
             "BTC-MINUTE-ALERT ERROR:",
+            str(e)
+        )
+
+        return jsonify({
+            "ok": False,
+            "retry_needed": True,
+            "alert_sent": False,
+            "error": str(e)
+        }), 200
+
+
+# ==================================================
+# BTC ONLY ENDPOINT - MARGINPAD
+# ==================================================
+
+@app.get("/marginpad-btc-minute-alert")
+def marginpad_btc_minute_alert():
+
+    if not cron_authorized():
+
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized"
+        }), 403
+
+    try:
+
+        closed_minute_ts = (
+            get_closed_minute_ts()
+        )
+
+        btc_result = (
+            process_marginpad_btc(
+                closed_minute_ts
+            )
+        )
+
+        if not btc_result.get(
+            "ok",
+            False
+        ):
+
+            print(
+                "MARGINPAD BTC PROCESS ERROR:",
+                btc_result
+            )
+
+        return jsonify({
+            "ok":
+                btc_result.get(
+                    "ok",
+                    False
+                ),
+
+            "retry_needed":
+                not btc_result.get(
+                    "ok",
+                    False
+                ),
+
+            "closed_minute_ts":
+                closed_minute_ts,
+
+            "marginpad_btc":
+                btc_result
+        }), 200
+
+    except Exception as e:
+
+        print(
+            "MARGINPAD-BTC-MINUTE-ALERT ERROR:",
             str(e)
         )
 
