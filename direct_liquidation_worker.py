@@ -107,6 +107,19 @@ TRANSPORT_STALE_SECONDS = float(
     os.getenv("DIRECT_TRANSPORT_STALE_SECONDS", "180")
 )
 
+LIGHTER_MAX_EVENT_AGE_SECONDS = float(
+    os.getenv("DIRECT_LIGHTER_MAX_EVENT_AGE_SECONDS", "120")
+)
+
+ALERT_COOLDOWN_SECONDS = float(
+    os.getenv("DIRECT_ALERT_COOLDOWN_SECONDS", "180")
+)
+
+last_alert_wall = {
+    "BTC": None,
+    "XAU": None,
+}
+
 RAW_EVENT_LOGS = os.getenv("DIRECT_RAW_EVENT_LOGS", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -158,6 +171,19 @@ def transport_state(asset, exchange):
         return "STALE"
 
     return "ALIVE"
+
+
+def event_timestamp_age_seconds(event_ts):
+    try:
+        ts = float(event_ts)
+    except (TypeError, ValueError):
+        return None
+
+    # Most exchange timestamps here are milliseconds.
+    if ts > 10_000_000_000:
+        ts /= 1000.0
+
+    return time.time() - ts
 
 
 # ============================================================
@@ -275,6 +301,23 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_
         if not (long_hit or short_hit):
             return
 
+        now = time.time()
+        last_alert = last_alert_wall[asset]
+
+        if last_alert is not None:
+            elapsed = now - last_alert
+            if elapsed < ALERT_COOLDOWN_SECONDS:
+                remaining = ALERT_COOLDOWN_SECONDS - elapsed
+                print(
+                    f"[ALERT COOLDOWN] {asset} threshold reached but "
+                    f"next alert allowed in {remaining:.0f}s | "
+                    f"TOTAL L={usd(totals[asset]['long'])} "
+                    f"S={usd(totals[asset]['short'])}",
+                    flush=True,
+                )
+                # Keep accumulating during cooldown. Do NOT reset totals.
+                return
+
         long_total = totals[asset]["long"]
         short_total = totals[asset]["short"]
         gap = abs(long_total - short_total)
@@ -311,6 +354,7 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_
             "\n".join(lines),
         )
 
+        last_alert_wall[asset] = time.time()
         reset_asset_cycle(asset)
 
         print(
@@ -490,8 +534,8 @@ async def aster_loop():
                 ASTER_WS,
                 open_timeout=20,
                 close_timeout=10,
-                ping_interval=180,
-                ping_timeout=30,
+                ping_interval=60,
+                ping_timeout=20,
                 max_size=4_000_000,
             ) as ws:
                 print(
@@ -500,10 +544,25 @@ async def aster_loop():
                     flush=True,
                 )
                 print("[ASTER WS] connected", flush=True)
+
                 for _asset in ASSETS:
                     transport_connected[_asset]["aster"] = True
+                    mark_transport(_asset, "aster")
 
-                async for raw in ws:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=TRANSPORT_STALE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            f"[ASTER WATCHDOG] no WS message for "
+                            f"{TRANSPORT_STALE_SECONDS:.0f}s; forcing reconnect",
+                            flush=True,
+                        )
+                        raise RuntimeError("Aster transport stale")
+
                     for _asset in ASSETS:
                         mark_transport(_asset, "aster")
 
@@ -575,11 +634,11 @@ async def aster_loop():
                         )
 
         except Exception as e:
+            mark_transport_disconnected("aster")
             print(
                 f"[ASTER ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
-            mark_transport_disconnected("aster")
             print("[ASTER WS] disconnected; reconnecting in 5s", flush=True)
             await asyncio.sleep(5)
 
@@ -990,6 +1049,21 @@ async def lighter_asset_loop(asset):
                                 or ""
                             )
 
+                            event_age = event_timestamp_age_seconds(ts)
+                            if (
+                                event_age is not None
+                                and event_age > LIGHTER_MAX_EVENT_AGE_SECONDS
+                            ):
+                                print(
+                                    f"[LIGHTER OLD EVENT SKIPPED] "
+                                    f"{asset} market_id={market_id} "
+                                    f"age={event_age:.1f}s "
+                                    f"usd={usd(notional)} "
+                                    f"event_ts={ts}",
+                                    flush=True,
+                                )
+                                continue
+
                             tx_hash = str(
                                 trade.get("tx_hash")
                                 or ""
@@ -1096,10 +1170,6 @@ async def status_loop():
                         flush=True,
                     )
 
-                print(
-                    f"[FEED HEALTH] {asset} | " + " | ".join(health_parts),
-                    flush=True,
-                )
 
 
 
@@ -1136,6 +1206,8 @@ async def main():
 
     print(
         f"Transport stale threshold: {TRANSPORT_STALE_SECONDS:.0f}s | "
+        f"Lighter max event age: {LIGHTER_MAX_EVENT_AGE_SECONDS:.0f}s | "
+        f"Alert cooldown: {ALERT_COOLDOWN_SECONDS:.0f}s | "
         f"RAW liquidation logs: {'ON' if RAW_EVENT_LOGS else 'OFF'}",
         flush=True,
     )
