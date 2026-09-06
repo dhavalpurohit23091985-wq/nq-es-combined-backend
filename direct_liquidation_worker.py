@@ -525,8 +525,51 @@ def iter_aster_force_orders(msg):
         yield msg
 
 
+async def aster_heartbeat(ws):
+    """
+    Aster's forceOrder stream can stay quiet when there are no liquidations.
+    So transport health is verified with an explicit WebSocket ping/pong,
+    instead of treating a quiet application stream as stale.
+    """
+    while True:
+        await asyncio.sleep(60)
+
+        try:
+            pong_waiter = await ws.ping()
+
+            await asyncio.wait_for(
+                pong_waiter,
+                timeout=20,
+            )
+
+            for _asset in ASSETS:
+                transport_connected[_asset]["aster"] = True
+                mark_transport(_asset, "aster")
+
+            print("[ASTER HEARTBEAT] pong OK", flush=True)
+
+        except Exception as e:
+            print(
+                f"[ASTER HEARTBEAT ERROR] "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+            try:
+                await ws.close(
+                    code=1011,
+                    reason="Aster heartbeat failed",
+                )
+            except Exception:
+                pass
+
+            raise
+
+
 async def aster_loop():
     while True:
+        heartbeat_task = None
+
         try:
             print("[ASTER] connecting all-market forceOrder...", flush=True)
 
@@ -534,8 +577,9 @@ async def aster_loop():
                 ASTER_WS,
                 open_timeout=20,
                 close_timeout=10,
-                ping_interval=60,
-                ping_timeout=20,
+                # Disable library auto-ping because we maintain
+                # an explicit heartbeat and record successful pong health.
+                ping_interval=None,
                 max_size=4_000_000,
             ) as ws:
                 print(
@@ -549,20 +593,15 @@ async def aster_loop():
                     transport_connected[_asset]["aster"] = True
                     mark_transport(_asset, "aster")
 
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(
-                            ws.recv(),
-                            timeout=TRANSPORT_STALE_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        print(
-                            f"[ASTER WATCHDOG] no WS message for "
-                            f"{TRANSPORT_STALE_SECONDS:.0f}s; forcing reconnect",
-                            flush=True,
-                        )
-                        raise RuntimeError("Aster transport stale")
+                heartbeat_task = asyncio.create_task(
+                    aster_heartbeat(ws)
+                )
 
+                while True:
+                    raw = await ws.recv()
+
+                    # Any received application frame also proves the
+                    # connection is active.
                     for _asset in ASSETS:
                         mark_transport(_asset, "aster")
 
@@ -639,8 +678,23 @@ async def aster_loop():
                 f"[ASTER ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
-            print("[ASTER WS] disconnected; reconnecting in 5s", flush=True)
-            await asyncio.sleep(5)
+            print(
+                "[ASTER WS] disconnected; reconnecting in 5s",
+                flush=True,
+            )
+
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+        await asyncio.sleep(5)
 
 
 # ============================================================
@@ -1208,6 +1262,7 @@ async def main():
         f"Transport stale threshold: {TRANSPORT_STALE_SECONDS:.0f}s | "
         f"Lighter max event age: {LIGHTER_MAX_EVENT_AGE_SECONDS:.0f}s | "
         f"Alert cooldown: {ALERT_COOLDOWN_SECONDS:.0f}s | "
+        f"Aster heartbeat: 60s ping / 20s pong timeout | "
         f"RAW liquidation logs: {'ON' if RAW_EVENT_LOGS else 'OFF'}",
         flush=True,
     )
