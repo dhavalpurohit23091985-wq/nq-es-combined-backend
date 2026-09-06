@@ -73,6 +73,57 @@ coinex_markets = {
 
 
 # ============================================================
+# FEED HEALTH / DEBUG
+# ============================================================
+
+# Last accepted liquidation event per asset/exchange.
+# Used only for diagnostics; it does not change alert logic.
+last_event_ts = {
+    asset: {ex: None for ex in EXCHANGES}
+    for asset in ASSETS
+}
+
+last_event_wall = {
+    asset: {ex: None for ex in EXCHANGES}
+    for asset in ASSETS
+}
+
+FEED_STALE_SECONDS = float(os.getenv("DIRECT_FEED_STALE_SECONDS", "300"))
+RAW_EVENT_LOGS = os.getenv("DIRECT_RAW_EVENT_LOGS", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+
+
+def mark_feed_event(asset, exchange, event_ts=None):
+    last_event_wall[asset][exchange] = time.time()
+    if event_ts not in (None, ""):
+        last_event_ts[asset][exchange] = str(event_ts)
+
+
+def feed_age_seconds(asset, exchange):
+    t = last_event_wall[asset][exchange]
+    if t is None:
+        return None
+    return max(0.0, time.time() - t)
+
+
+def format_feed_age(asset, exchange):
+    age = feed_age_seconds(asset, exchange)
+    if age is None:
+        return "NEVER"
+    return f"{age:.0f}s"
+
+
+def feed_state(asset, exchange):
+    age = feed_age_seconds(asset, exchange)
+    if age is None:
+        return "NO-EVENT-YET"
+    if age >= FEED_STALE_SECONDS:
+        return "STALE"
+    return "OK"
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -136,7 +187,7 @@ def reset_asset_cycle(asset):
         by_exchange[asset][ex]["short"] = 0.0
 
 
-async def add_liquidation(asset, exchange, side, notional_usd, event_key):
+async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_ts=None, symbol=None):
     if asset not in ASSETS:
         return
 
@@ -156,6 +207,17 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key):
 
     if not remember_event(event_key):
         return
+
+    mark_feed_event(asset, exchange, event_ts)
+
+    if RAW_EVENT_LOGS:
+        print(
+            f"[RAW EVENT] asset={asset} exchange={exchange.upper()} "
+            f"symbol={symbol or '-'} side={side.upper()} "
+            f"usd={usd(notional_usd)} event_ts={event_ts or '-'} "
+            f"recv_unix={time.time():.3f}",
+            flush=True,
+        )
 
     async with lock:
         totals[asset][side] += notional_usd
@@ -281,6 +343,7 @@ async def bitget_loop():
                     "(BTC + XAU filter)",
                     flush=True,
                 )
+                print("[BITGET WS] connected", flush=True)
 
                 hb = asyncio.create_task(bitget_heartbeat(ws))
 
@@ -336,6 +399,8 @@ async def bitget_loop():
                                 side,
                                 amount,
                                 key,
+                                event_ts=ts,
+                                symbol=symbol,
                             )
                 finally:
                     hb.cancel()
@@ -345,6 +410,7 @@ async def bitget_loop():
                 f"[BITGET ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
+            print("[BITGET WS] disconnected; reconnecting in 5s", flush=True)
             await asyncio.sleep(5)
 
 
@@ -388,6 +454,7 @@ async def aster_loop():
                     "(BTC + XAU/GOLD filter)",
                     flush=True,
                 )
+                print("[ASTER WS] connected", flush=True)
 
                 async for raw in ws:
                     try:
@@ -453,6 +520,8 @@ async def aster_loop():
                             side,
                             notional,
                             key,
+                            event_ts=ts,
+                            symbol=symbol,
                         )
 
         except Exception as e:
@@ -460,6 +529,7 @@ async def aster_loop():
                 f"[ASTER ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
+            print("[ASTER WS] disconnected; reconnecting in 5s", flush=True)
             await asyncio.sleep(5)
 
 
@@ -581,6 +651,8 @@ async def coinex_poll_market(session, asset, market):
             side,
             notional,
             key,
+            event_ts=ts,
+            symbol=market,
         )
 
 
@@ -775,6 +847,7 @@ async def lighter_asset_loop(asset):
                     f"trade/{market_id}",
                     flush=True,
                 )
+                print(f"[LIGHTER {asset} WS] connected", flush=True)
 
                 hb = asyncio.create_task(
                     lighter_heartbeat(ws)
@@ -870,6 +943,8 @@ async def lighter_asset_loop(asset):
                                 side,
                                 notional,
                                 key,
+                                event_ts=ts,
+                                symbol=f"market_id:{market_id}",
                             )
                 finally:
                     hb.cancel()
@@ -878,6 +953,10 @@ async def lighter_asset_loop(asset):
             print(
                 f"[LIGHTER {asset} ERROR] "
                 f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            print(
+                f"[LIGHTER {asset} WS] disconnected; reconnecting in 5s",
                 flush=True,
             )
             await asyncio.sleep(5)
@@ -913,6 +992,31 @@ async def status_loop():
                     flush=True,
                 )
 
+                health_parts = []
+                for ex in EXCHANGES:
+                    health_parts.append(
+                        f"{ex.title()}={feed_state(asset, ex)}"
+                        f"(age={format_feed_age(asset, ex)},"
+                        f"event_ts={last_event_ts[asset][ex] or '-'})"
+                    )
+
+                print(
+                    f"[FEED HEALTH] {asset} | " + " | ".join(health_parts),
+                    flush=True,
+                )
+
+                stale = [
+                    ex for ex in EXCHANGES
+                    if feed_state(asset, ex) == "STALE"
+                ]
+                if stale:
+                    print(
+                        f"[STALE WARNING] {asset} no accepted liquidation "
+                        f"event for >= {FEED_STALE_SECONDS:.0f}s on: "
+                        + ", ".join(ex.title() for ex in stale),
+                        flush=True,
+                    )
+
 
 # ============================================================
 # MAIN
@@ -942,6 +1046,12 @@ async def main():
     print(
         "XAU Sources: exchange-by-exchange auto-detect; "
         "unsupported markets skipped",
+        flush=True,
+    )
+
+    print(
+        f"Feed health stale threshold: {FEED_STALE_SECONDS:.0f}s | "
+        f"RAW event logs: {'ON' if RAW_EVENT_LOGS else 'OFF'}",
         flush=True,
     )
 
