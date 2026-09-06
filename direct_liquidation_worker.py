@@ -73,54 +73,91 @@ coinex_markets = {
 
 
 # ============================================================
-# FEED HEALTH / DEBUG
+# FEED / TRANSPORT HEALTH DEBUG
 # ============================================================
 
-# Last accepted liquidation event per asset/exchange.
-# Used only for diagnostics; it does not change alert logic.
-last_event_ts = {
+# These diagnostics intentionally separate:
+#   1) transport/message health (WebSocket messages or successful HTTP poll)
+#   2) last accepted liquidation event
+#
+# A quiet market can have no liquidations for many minutes while the feed
+# itself is perfectly healthy. Alert/threshold logic is unchanged.
+
+last_liq_wall = {
     asset: {ex: None for ex in EXCHANGES}
     for asset in ASSETS
 }
 
-last_event_wall = {
+last_liq_event_ts = {
     asset: {ex: None for ex in EXCHANGES}
     for asset in ASSETS
 }
 
-FEED_STALE_SECONDS = float(os.getenv("DIRECT_FEED_STALE_SECONDS", "300"))
+last_transport_wall = {
+    asset: {ex: None for ex in EXCHANGES}
+    for asset in ASSETS
+}
+
+transport_connected = {
+    asset: {ex: False for ex in EXCHANGES}
+    for asset in ASSETS
+}
+
+TRANSPORT_STALE_SECONDS = float(
+    os.getenv("DIRECT_TRANSPORT_STALE_SECONDS", "180")
+)
+
 RAW_EVENT_LOGS = os.getenv("DIRECT_RAW_EVENT_LOGS", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
 
 
-def mark_feed_event(asset, exchange, event_ts=None):
-    last_event_wall[asset][exchange] = time.time()
+def mark_transport(asset, exchange):
+    last_transport_wall[asset][exchange] = time.time()
+    transport_connected[asset][exchange] = True
+
+
+def mark_transport_disconnected(exchange, asset=None):
+    if asset is not None:
+        transport_connected[asset][exchange] = False
+        return
+
+    for a in ASSETS:
+        transport_connected[a][exchange] = False
+
+
+def mark_liquidation(asset, exchange, event_ts=None):
+    last_liq_wall[asset][exchange] = time.time()
     if event_ts not in (None, ""):
-        last_event_ts[asset][exchange] = str(event_ts)
+        last_liq_event_ts[asset][exchange] = str(event_ts)
 
 
-def feed_age_seconds(asset, exchange):
-    t = last_event_wall[asset][exchange]
-    if t is None:
+def age_seconds(ts):
+    if ts is None:
         return None
-    return max(0.0, time.time() - t)
+    return max(0.0, time.time() - ts)
 
 
-def format_feed_age(asset, exchange):
-    age = feed_age_seconds(asset, exchange)
+def fmt_age(ts):
+    age = age_seconds(ts)
     if age is None:
         return "NEVER"
     return f"{age:.0f}s"
 
 
-def feed_state(asset, exchange):
-    age = feed_age_seconds(asset, exchange)
+def transport_state(asset, exchange):
+    age = age_seconds(last_transport_wall[asset][exchange])
+
+    if not transport_connected[asset][exchange]:
+        return "DISCONNECTED"
+
     if age is None:
-        return "NO-EVENT-YET"
-    if age >= FEED_STALE_SECONDS:
+        return "CONNECTED/WAITING"
+
+    if age >= TRANSPORT_STALE_SECONDS:
         return "STALE"
-    return "OK"
+
+    return "ALIVE"
 
 
 # ============================================================
@@ -208,7 +245,7 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_
     if not remember_event(event_key):
         return
 
-    mark_feed_event(asset, exchange, event_ts)
+    mark_liquidation(asset, exchange, event_ts)
 
     if RAW_EVENT_LOGS:
         print(
@@ -344,13 +381,20 @@ async def bitget_loop():
                     flush=True,
                 )
                 print("[BITGET WS] connected", flush=True)
+                for _asset in ASSETS:
+                    transport_connected[_asset]["bitget"] = True
 
                 hb = asyncio.create_task(bitget_heartbeat(ws))
 
                 try:
                     async for raw in ws:
                         if raw == "pong":
+                            for _asset in ASSETS:
+                                mark_transport(_asset, "bitget")
                             continue
+
+                        for _asset in ASSETS:
+                            mark_transport(_asset, "bitget")
 
                         try:
                             msg = json.loads(raw)
@@ -410,6 +454,7 @@ async def bitget_loop():
                 f"[BITGET ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
+            mark_transport_disconnected("bitget")
             print("[BITGET WS] disconnected; reconnecting in 5s", flush=True)
             await asyncio.sleep(5)
 
@@ -455,8 +500,13 @@ async def aster_loop():
                     flush=True,
                 )
                 print("[ASTER WS] connected", flush=True)
+                for _asset in ASSETS:
+                    transport_connected[_asset]["aster"] = True
 
                 async for raw in ws:
+                    for _asset in ASSETS:
+                        mark_transport(_asset, "aster")
+
                     try:
                         msg = json.loads(raw)
                     except Exception:
@@ -529,6 +579,7 @@ async def aster_loop():
                 f"[ASTER ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
+            mark_transport_disconnected("aster")
             print("[ASTER WS] disconnected; reconnecting in 5s", flush=True)
             await asyncio.sleep(5)
 
@@ -583,6 +634,12 @@ def discover_coinex_markets():
         coinex_markets["BTC"] = btc_market or "BTCUSDT"
         coinex_markets["XAU"] = xau_market
 
+        transport_connected["BTC"]["coinex"] = True
+        if coinex_markets["XAU"]:
+            transport_connected["XAU"]["coinex"] = True
+        else:
+            transport_connected["XAU"]["coinex"] = False
+
         print(
             f"[COINEX] BTC market={coinex_markets['BTC']} | "
             f"XAU market={coinex_markets['XAU'] or 'NOT FOUND / SKIPPED'}",
@@ -621,6 +678,8 @@ async def coinex_poll_market(session, asset, market):
         raise RuntimeError(
             f"CoinEx {asset} response: {payload}"
         )
+
+    mark_transport(asset, "coinex")
 
     for event in payload.get("data") or []:
         if str(event.get("market") or "").upper() != market:
@@ -818,6 +877,7 @@ async def lighter_asset_loop(asset):
                     f"skipping and rechecking later",
                     flush=True,
                 )
+                transport_connected[asset]["lighter"] = False
                 await asyncio.sleep(300)
                 continue
 
@@ -848,6 +908,7 @@ async def lighter_asset_loop(asset):
                     flush=True,
                 )
                 print(f"[LIGHTER {asset} WS] connected", flush=True)
+                transport_connected[asset]["lighter"] = True
 
                 hb = asyncio.create_task(
                     lighter_heartbeat(ws)
@@ -855,6 +916,8 @@ async def lighter_asset_loop(asset):
 
                 try:
                     async for raw in ws:
+                        mark_transport(asset, "lighter")
+
                         try:
                             msg = json.loads(raw)
                         except Exception:
@@ -955,6 +1018,7 @@ async def lighter_asset_loop(asset):
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
+            mark_transport_disconnected("lighter", asset)
             print(
                 f"[LIGHTER {asset} WS] disconnected; reconnecting in 5s",
                 flush=True,
@@ -995,9 +1059,11 @@ async def status_loop():
                 health_parts = []
                 for ex in EXCHANGES:
                     health_parts.append(
-                        f"{ex.title()}={feed_state(asset, ex)}"
-                        f"(age={format_feed_age(asset, ex)},"
-                        f"event_ts={last_event_ts[asset][ex] or '-'})"
+                        f"{ex.title()}="
+                        f"{transport_state(asset, ex)}"
+                        f"(msg_age={fmt_age(last_transport_wall[asset][ex])},"
+                        f"liq_age={fmt_age(last_liq_wall[asset][ex])},"
+                        f"liq_ts={last_liq_event_ts[asset][ex] or '-'})"
                     )
 
                 print(
@@ -1005,17 +1071,36 @@ async def status_loop():
                     flush=True,
                 )
 
-                stale = [
+                stale_transports = [
                     ex for ex in EXCHANGES
-                    if feed_state(asset, ex) == "STALE"
+                    if transport_state(asset, ex) == "STALE"
                 ]
-                if stale:
+
+                disconnected = [
+                    ex for ex in EXCHANGES
+                    if transport_state(asset, ex) == "DISCONNECTED"
+                ]
+
+                if stale_transports:
                     print(
-                        f"[STALE WARNING] {asset} no accepted liquidation "
-                        f"event for >= {FEED_STALE_SECONDS:.0f}s on: "
-                        + ", ".join(ex.title() for ex in stale),
+                        f"[TRANSPORT WARNING] {asset} no feed message/poll "
+                        f"for >= {TRANSPORT_STALE_SECONDS:.0f}s on: "
+                        + ", ".join(ex.title() for ex in stale_transports),
                         flush=True,
                     )
+
+                if disconnected:
+                    print(
+                        f"[TRANSPORT INFO] {asset} disconnected/unsupported: "
+                        + ", ".join(ex.title() for ex in disconnected),
+                        flush=True,
+                    )
+
+                print(
+                    f"[FEED HEALTH] {asset} | " + " | ".join(health_parts),
+                    flush=True,
+                )
+
 
 
 # ============================================================
@@ -1050,8 +1135,8 @@ async def main():
     )
 
     print(
-        f"Feed health stale threshold: {FEED_STALE_SECONDS:.0f}s | "
-        f"RAW event logs: {'ON' if RAW_EVENT_LOGS else 'OFF'}",
+        f"Transport stale threshold: {TRANSPORT_STALE_SECONDS:.0f}s | "
+        f"RAW liquidation logs: {'ON' if RAW_EVENT_LOGS else 'OFF'}",
         flush=True,
     )
 
