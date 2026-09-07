@@ -2202,45 +2202,26 @@ def test_xau_aggregate():
 # BTC PROCESSOR - COINALYZE
 # ==================================================
 
-CROSS_REFERENCE_RECENT_SECONDS = 10 * 60
-
-
 def _btc_reference_text(reference_source, closed_minute_ts):
-    """Return a compact latest-available comparison snapshot for BTC alerts.
+    """Return the other provider's CURRENT accumulating BTC cycle.
 
-    If the other provider fired recently, use its pre-reset alert snapshot.
-    Otherwise use its current accumulating cycle. This avoids showing zero
-    immediately after the other provider has just alerted and reset.
+    This intentionally does NOT use the other provider's previous alert
+    snapshot. The goal is same-moment comparison: when MarginPad alerts,
+    show Coinalyze's current cycle; when Coinalyze alerts, show MarginPad's
+    current cycle.
     """
 
     if reference_source == "MARGINPAD":
-        snapshot = marginpad_btc_last_alert_snapshot
-        current_long = marginpad_btc_long_cumulative
-        current_short = marginpad_btc_short_cumulative
+        ref_long = marginpad_btc_long_cumulative
+        ref_short = marginpad_btc_short_cumulative
         initialized = marginpad_btc_processed_through_ms is not None
     else:
-        snapshot = btc_last_alert_snapshot
-        current_long = btc_long_cumulative
-        current_short = btc_short_cumulative
+        ref_long = btc_long_cumulative
+        ref_short = btc_short_cumulative
         initialized = btc_last_processed_liq_ts is not None
 
-    if snapshot is not None:
-        age_seconds = max(0, closed_minute_ts - snapshot["ts"])
-        if age_seconds <= CROSS_REFERENCE_RECENT_SECONDS:
-            ref_long = snapshot["long"]
-            ref_short = snapshot["short"]
-            age_minutes = age_seconds // 60
-            ref_label = f"LAST ALERT {age_minutes}m AGO"
-        else:
-            ref_long = current_long
-            ref_short = current_short
-            ref_label = "CURRENT CYCLE"
-    else:
-        if not initialized:
-            return f"REF {reference_source} | NOT INITIALIZED"
-        ref_long = current_long
-        ref_short = current_short
-        ref_label = "CURRENT CYCLE"
+    if not initialized:
+        return f"REF {reference_source} CURRENT CYCLE | NOT INITIALIZED"
 
     ref_total = ref_long + ref_short
     ref_gap = abs(ref_long - ref_short)
@@ -2248,7 +2229,7 @@ def _btc_reference_text(reference_source, closed_minute_ts):
     ref_short_pct = (ref_short / ref_total * 100) if ref_total > 0 else 0
 
     return (
-        f"REF {reference_source} {ref_label} | "
+        f"REF {reference_source} CURRENT CYCLE | "
         f"LONG ${ref_long:,.0f} ({ref_long_pct:.2f}%) | "
         f"SHORT ${ref_short:,.0f} ({ref_short_pct:.2f}%) | "
         f"GAP ${ref_gap:,.0f}"
