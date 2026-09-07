@@ -673,6 +673,23 @@ def get_marginpad_fresh_btc_liquidations(
         if not isinstance(event, dict):
             continue
 
+        # Defensive BTC symbol guard. The API is requested with symbol=BTC,
+        # but we still verify each returned event before it can reach totals.
+        event_symbol = str(
+            event.get("symbol", "")
+        ).strip().upper()
+
+        if event_symbol and event_symbol != "BTC":
+            print(
+                "[MARGINPAD BTC SYMBOL REJECT] "
+                f"symbol={event_symbol} | "
+                f"exchange={event.get('exchange', '')} | "
+                f"ts={event.get('ts', '')} | "
+                f"side={event.get('side', '')} | "
+                f"notional={event.get('notional', '')}"
+            )
+            continue
+
         event_ts_ms = normalize_marginpad_ts_ms(
             event.get("ts")
         )
@@ -738,6 +755,19 @@ def get_marginpad_fresh_btc_liquidations(
 
         if exchange:
             exchanges.add(exchange)
+
+        # Audit every event that is actually accepted into BTC totals.
+        # This does not change the calculation; it only makes anomalies traceable.
+        print(
+            "[MARGINPAD BTC ACCEPTED] "
+            f"ts_ms={event_ts_ms} | "
+            f"exchange={exchange or '-'} | "
+            f"symbol={event_symbol or 'BTC'} | "
+            f"side={side} | "
+            f"price={event.get('price', '')} | "
+            f"qty={event.get('qty', '')} | "
+            f"notional=${notional:,.2f}"
+        )
 
         remember_marginpad_event(
             fingerprint
