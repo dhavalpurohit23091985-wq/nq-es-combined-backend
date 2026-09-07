@@ -1621,8 +1621,41 @@ def debug_coinalyze_nvda_state():
 # ==========================================================
 ZERODHA_API_KEY = os.getenv("ZERODHA_API_KEY", "").strip()
 ZERODHA_API_SECRET = os.getenv("ZERODHA_API_SECRET", "").strip()
+ZERODHA_STATE_DIR = os.getenv("ZERODHA_STATE_DIR", "/var/data").strip() or "/var/data"
+ZERODHA_TOKEN_FILE = os.getenv(
+    "ZERODHA_TOKEN_FILE",
+    os.path.join(ZERODHA_STATE_DIR, "zerodha_token.json"),
+)
+
 zerodha_access_token = None
 zerodha_access_token_created_at = None
+
+
+def _zerodha_atomic_json_write(path, payload):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def _zerodha_restore_token_from_disk():
+    global zerodha_access_token, zerodha_access_token_created_at
+    try:
+        with open(ZERODHA_TOKEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        token = (data.get("access_token") or "").strip()
+        if token:
+            zerodha_access_token = token
+            zerodha_access_token_created_at = data.get("token_created_at_utc")
+            print("[ZERODHA TOKEN] restored from persistent disk", flush=True)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[ZERODHA TOKEN RESTORE ERROR] {exc}", flush=True)
+
+
+_zerodha_restore_token_from_disk()
 
 
 @app.get("/zerodha-login")
@@ -1708,9 +1741,24 @@ def zerodha_callback():
     zerodha_access_token_created_at = datetime.now(timezone.utc).isoformat()
 
     user_id = (data.get("data") or {}).get("user_id")
+    try:
+        _zerodha_atomic_json_write(
+            ZERODHA_TOKEN_FILE,
+            {
+                "access_token": zerodha_access_token,
+                "token_created_at_utc": zerodha_access_token_created_at,
+                "user_id": user_id,
+            },
+        )
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"Zerodha login succeeded but token could not be persisted: {exc}"
+        }), 500
+
     return jsonify({
         "ok": True,
-        "message": "Zerodha login successful. Access token stored in this web-service process.",
+        "message": "Zerodha login successful. Access token stored on persistent disk and loaded in this web-service process.",
         "user_id": user_id,
         "token_created_at_utc": zerodha_access_token_created_at,
         "next": "Use /zerodha-auth-status to verify token state. Token value is intentionally not returned."
@@ -1726,6 +1774,8 @@ def zerodha_auth_status():
         "api_secret_configured": bool(ZERODHA_API_SECRET),
         "access_token_present": bool(zerodha_access_token),
         "token_created_at_utc": zerodha_access_token_created_at,
+        "persistent_token_file": ZERODHA_TOKEN_FILE,
+        "persistent_token_file_exists": os.path.exists(ZERODHA_TOKEN_FILE),
     })
 
 
@@ -1911,7 +1961,7 @@ def zerodha_nifty_oi_test():
 ZERODHA_NIFTY_COI_THRESHOLD = int(os.getenv("ZERODHA_NIFTY_COI_THRESHOLD", "100000"))
 ZERODHA_NIFTY_STATE_FILE = os.getenv(
     "ZERODHA_NIFTY_STATE_FILE",
-    "/tmp/zerodha_nifty_coi_state.json",
+    os.path.join(ZERODHA_STATE_DIR, "nifty_coi_state.json"),
 )
 
 
@@ -1926,10 +1976,7 @@ def _zerodha_read_nifty_state():
 
 def _zerodha_write_nifty_state(state):
     try:
-        tmp = ZERODHA_NIFTY_STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, separators=(",", ":"))
-        os.replace(tmp, ZERODHA_NIFTY_STATE_FILE)
+        _zerodha_atomic_json_write(ZERODHA_NIFTY_STATE_FILE, state)
     except Exception as exc:
         print(f"[ZERODHA NIFTY STATE WRITE ERROR] {exc}", flush=True)
 
@@ -2073,15 +2120,81 @@ def _zerodha_nifty_snapshot():
     if now_ist < session_start:
         raise RuntimeError("NIFTY 09:15 session has not started yet")
 
-    nifty_open = _zerodha_nifty_0915_open(session_date)
-    nearest_expiry, atm_strike, selected_strikes, selected_rows = (
-        _zerodha_build_nifty_fixed_basket(session_date, nifty_open)
+    # Reuse the exact 09:15 basket/baseline from persistent disk when present.
+    # On the first call of a new trading day, build it once and persist it.
+    state = _zerodha_read_nifty_state()
+    baseline_state = state.get("baseline") if isinstance(state, dict) else None
+    use_saved = (
+        isinstance(baseline_state, dict)
+        and baseline_state.get("session_date") == session_date.isoformat()
+        and isinstance(baseline_state.get("contracts"), list)
+        and len(baseline_state.get("contracts")) == 10
     )
 
-    baseline = {}
-    for row in selected_rows:
-        key = f"{row['exchange']}:{row['tradingsymbol']}"
-        baseline[key] = _zerodha_option_0915_oi(row, session_date)
+    if use_saved:
+        nifty_open = float(baseline_state["nifty_open"])
+        nearest_expiry = datetime.strptime(
+            baseline_state["nearest_expiry"], "%Y-%m-%d"
+        ).date()
+        atm_strike = float(baseline_state["atm_strike"])
+        selected_strikes = [float(x) for x in baseline_state["selected_strikes"]]
+        selected_rows = []
+        baseline = {}
+        for saved in baseline_state["contracts"]:
+            row = {
+                "tradingsymbol": saved["tradingsymbol"],
+                "exchange": saved.get("exchange") or "NFO",
+                "instrument_token": int(saved["instrument_token"]),
+                "expiry": datetime.strptime(saved["expiry"], "%Y-%m-%d").date(),
+                "strike": float(saved["strike"]),
+                "instrument_type": saved["instrument_type"],
+                "lot_size": int(saved["lot_size"]),
+            }
+            selected_rows.append(row)
+            key = f"{row['exchange']}:{row['tradingsymbol']}"
+            baseline[key] = int(saved["baseline_oi_raw"])
+    else:
+        nifty_open = _zerodha_nifty_0915_open(session_date)
+        nearest_expiry, atm_strike, selected_strikes, selected_rows = (
+            _zerodha_build_nifty_fixed_basket(session_date, nifty_open)
+        )
+
+        baseline = {}
+        persisted_contracts = []
+        for row in selected_rows:
+            key = f"{row['exchange']}:{row['tradingsymbol']}"
+            base_oi = _zerodha_option_0915_oi(row, session_date)
+            baseline[key] = base_oi
+            persisted_contracts.append({
+                "tradingsymbol": row["tradingsymbol"],
+                "exchange": row["exchange"],
+                "instrument_token": row["instrument_token"],
+                "expiry": row["expiry"].isoformat(),
+                "strike": row["strike"],
+                "instrument_type": row["instrument_type"],
+                "lot_size": row["lot_size"],
+                "baseline_oi_raw": base_oi,
+            })
+
+        # Preserve crossing/alert state while adding the persistent daily baseline.
+        state = state if isinstance(state, dict) else {}
+        if state.get("session_date") != session_date.isoformat():
+            state = {
+                "session_date": session_date.isoformat(),
+                "initialized": False,
+                "ce_above": False,
+                "pe_above": False,
+            }
+        state["baseline"] = {
+            "session_date": session_date.isoformat(),
+            "nifty_open": nifty_open,
+            "nearest_expiry": nearest_expiry.isoformat(),
+            "atm_strike": atm_strike,
+            "selected_strikes": selected_strikes,
+            "contracts": persisted_contracts,
+            "saved_at_ist": now_ist.isoformat(),
+        }
+        _zerodha_write_nifty_state(state)
 
     quote_keys = [f"{x['exchange']}:{x['tradingsymbol']}" for x in selected_rows]
     quote_data = _zerodha_json_get(
@@ -2177,12 +2290,15 @@ def zerodha_nifty_coi_monitor():
 
         # New trading date => start fresh crossing state.
         if state.get("session_date") != snap["session_date"]:
+            prior_baseline = state.get("baseline") if isinstance(state, dict) else None
             state = {
                 "session_date": snap["session_date"],
                 "initialized": False,
                 "ce_above": False,
                 "pe_above": False,
             }
+            if isinstance(prior_baseline, dict) and prior_baseline.get("session_date") == snap["session_date"]:
+                state["baseline"] = prior_baseline
 
         current_ce_above = snap["ce_coi_raw"] >= threshold
         current_pe_above = snap["pe_coi_raw"] >= threshold
@@ -2277,6 +2393,8 @@ def zerodha_nifty_coi_state():
     return jsonify({
         "ok": True,
         "threshold_raw": ZERODHA_NIFTY_COI_THRESHOLD,
+        "persistent_state_file": ZERODHA_NIFTY_STATE_FILE,
+        "persistent_state_file_exists": os.path.exists(ZERODHA_NIFTY_STATE_FILE),
         "state": _zerodha_read_nifty_state(),
     })
 
