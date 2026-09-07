@@ -1123,6 +1123,94 @@ def debug_coinalyze_nvda():
 
 
 # ==================================================
+# DEBUG: COINALYZE NVDA 5-MIN OHLC TEST
+# ==================================================
+
+@app.get("/debug/coinalyze-nvda-5m")
+def debug_coinalyze_nvda_5m():
+
+    # Candidate confirmed from /v1/future-markets.
+    symbol = request.args.get(
+        "symbol",
+        "NVDAUSDT_PERP.A"
+    ).strip()
+
+    now = int(time.time())
+
+    response, error = coinalyze_get(
+        "https://api.coinalyze.net/v1/ohlcv-history",
+        params={
+            "symbols": symbol,
+            "interval": "5min",
+            "from": now - (6 * 60 * 60),
+            "to": now
+        },
+        timeout=15,
+        stage="nvda-5m-debug"
+    )
+
+    if error:
+        return jsonify({
+            "ok": False,
+            "symbol": symbol,
+            "error": error
+        }), 500
+
+    try:
+        payload = response.json()
+
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "symbol": symbol,
+            "error": "invalid json",
+            "response": response.text[:1000]
+        }), 500
+
+    history = []
+
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+
+        if isinstance(first, dict):
+            history = first.get(
+                "history",
+                []
+            )
+
+    # Keep only the latest 12 x 5-minute candles in browser output.
+    latest = history[-12:] if history else []
+
+    print(
+        f"[COINALYZE NVDA 5M DEBUG] "
+        f"symbol={symbol} | "
+        f"candles={len(history)} | "
+        f"latest={latest[-1] if latest else None}",
+        flush=True
+    )
+
+    return jsonify({
+        "ok": True,
+        "symbol": symbol,
+        "candles_returned": len(history),
+        "latest_12": latest,
+        "raw_series_meta": (
+            {
+                k: v
+                for k, v in payload[0].items()
+                if k != "history"
+            }
+            if (
+                isinstance(payload, list)
+                and payload
+                and isinstance(payload[0], dict)
+            )
+            else {}
+        )
+    })
+
+
+# ==================================================
 # HOME
 # ==================================================
 
