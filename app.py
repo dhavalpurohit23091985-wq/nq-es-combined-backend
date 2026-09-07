@@ -102,6 +102,10 @@ btc_short_cumulative = 0.0
 btc_cycle_ref_price = None
 btc_last_processed_liq_ts = None
 
+# Keep the most recent completed BTC alert snapshot so the other
+# provider can show it as a same-message comparison even after reset.
+btc_last_alert_snapshot = None
+
 btc_symbol_cache = None
 
 
@@ -118,6 +122,9 @@ marginpad_btc_long_cumulative = 0.0
 marginpad_btc_short_cumulative = 0.0
 
 marginpad_btc_cycle_ref_price = None
+
+# Most recent completed MarginPad BTC alert snapshot for cross-reference.
+marginpad_btc_last_alert_snapshot = None
 
 # We process events only through the last fully closed minute.
 marginpad_btc_processed_through_ms = None
@@ -2195,6 +2202,59 @@ def test_xau_aggregate():
 # BTC PROCESSOR - COINALYZE
 # ==================================================
 
+CROSS_REFERENCE_RECENT_SECONDS = 10 * 60
+
+
+def _btc_reference_text(reference_source, closed_minute_ts):
+    """Return a compact latest-available comparison snapshot for BTC alerts.
+
+    If the other provider fired recently, use its pre-reset alert snapshot.
+    Otherwise use its current accumulating cycle. This avoids showing zero
+    immediately after the other provider has just alerted and reset.
+    """
+
+    if reference_source == "MARGINPAD":
+        snapshot = marginpad_btc_last_alert_snapshot
+        current_long = marginpad_btc_long_cumulative
+        current_short = marginpad_btc_short_cumulative
+        initialized = marginpad_btc_processed_through_ms is not None
+    else:
+        snapshot = btc_last_alert_snapshot
+        current_long = btc_long_cumulative
+        current_short = btc_short_cumulative
+        initialized = btc_last_processed_liq_ts is not None
+
+    if snapshot is not None:
+        age_seconds = max(0, closed_minute_ts - snapshot["ts"])
+        if age_seconds <= CROSS_REFERENCE_RECENT_SECONDS:
+            ref_long = snapshot["long"]
+            ref_short = snapshot["short"]
+            age_minutes = age_seconds // 60
+            ref_label = f"LAST ALERT {age_minutes}m AGO"
+        else:
+            ref_long = current_long
+            ref_short = current_short
+            ref_label = "CURRENT CYCLE"
+    else:
+        if not initialized:
+            return f"REF {reference_source} | NOT INITIALIZED"
+        ref_long = current_long
+        ref_short = current_short
+        ref_label = "CURRENT CYCLE"
+
+    ref_total = ref_long + ref_short
+    ref_gap = abs(ref_long - ref_short)
+    ref_long_pct = (ref_long / ref_total * 100) if ref_total > 0 else 0
+    ref_short_pct = (ref_short / ref_total * 100) if ref_total > 0 else 0
+
+    return (
+        f"REF {reference_source} {ref_label} | "
+        f"LONG ${ref_long:,.0f} ({ref_long_pct:.2f}%) | "
+        f"SHORT ${ref_short:,.0f} ({ref_short_pct:.2f}%) | "
+        f"GAP ${ref_gap:,.0f}"
+    )
+
+
 def process_btc(
     closed_minute_ts
 ):
@@ -2203,6 +2263,7 @@ def process_btc(
     global btc_short_cumulative
     global btc_cycle_ref_price
     global btc_last_processed_liq_ts
+    global btc_last_alert_snapshot
 
     btc_price, price_error = (
         get_btc_price()
@@ -2468,9 +2529,24 @@ def process_btc(
             100
         ) if cycle_total > 0 else 0
 
+        # Save this cycle before reset so a MarginPad alert arriving a few
+        # seconds/minutes later can still reference the completed Coinalyze cycle.
+        btc_last_alert_snapshot = {
+            "ts": closed_minute_ts,
+            "long": cycle_long,
+            "short": cycle_short,
+            "winner": cycle_winner,
+        }
+
+        reference_text = _btc_reference_text(
+            "MARGINPAD",
+            closed_minute_ts
+        )
+
         alert_sent = send_pushover(
             alert_title,
             (
+                f"SOURCE COINALYZE | "
                 f"WINNER "
                 f"{cycle_winner} | "
                 f"LONG "
@@ -2486,6 +2562,7 @@ def process_btc(
                 f"BTC MOVE "
                 f"{move_text}"
                 f"{low_move_text}"
+                f"\n{reference_text}"
             )
         )
 
@@ -2599,6 +2676,7 @@ def process_marginpad_btc(
     global marginpad_btc_short_cumulative
     global marginpad_btc_cycle_ref_price
     global marginpad_btc_processed_through_ms
+    global marginpad_btc_last_alert_snapshot
 
     btc_price, price_error = (
         get_marginpad_btc_price()
@@ -2877,6 +2955,20 @@ def process_marginpad_btc(
             100
         ) if cycle_total > 0 else 0
 
+        # Save this cycle before reset so a Coinalyze alert arriving shortly
+        # afterwards can reference the completed MarginPad cycle.
+        marginpad_btc_last_alert_snapshot = {
+            "ts": closed_minute_ts,
+            "long": cycle_long,
+            "short": cycle_short,
+            "winner": cycle_winner,
+        }
+
+        reference_text = _btc_reference_text(
+            "COINALYZE",
+            closed_minute_ts
+        )
+
         alert_sent = send_pushover(
             alert_title,
             (
@@ -2896,6 +2988,7 @@ def process_marginpad_btc(
                 f"BTC MOVE "
                 f"{move_text}"
                 f"{low_move_text}"
+                f"\n{reference_text}"
             )
         )
 
