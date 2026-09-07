@@ -1239,6 +1239,210 @@ nvda_state = 0
 nvda_last_processed_candle_ts = None
 
 
+# ==================================================
+# PERSISTENT RUNTIME STATE - BTC/XAU/NVDA
+# ==================================================
+# Core strategy logic is unchanged. This only preserves in-memory runtime
+# state across Render deploys/restarts using the existing /var/data disk.
+
+RUNTIME_STATE_FILE = os.path.join('/var/data', 'backend_runtime_state.json')
+_runtime_state_lock = threading.Lock()
+
+
+def _runtime_state_payload():
+    return {
+        'version': 1,
+        'saved_at_utc': datetime.now(timezone.utc).isoformat(),
+
+        'coinalyze_btc': {
+            'long_cumulative': btc_long_cumulative,
+            'short_cumulative': btc_short_cumulative,
+            'cycle_ref_price': btc_cycle_ref_price,
+            'last_processed_liq_ts': btc_last_processed_liq_ts,
+            'last_alert_snapshot': btc_last_alert_snapshot,
+        },
+
+        'marginpad_btc': {
+            'long_cumulative': marginpad_btc_long_cumulative,
+            'short_cumulative': marginpad_btc_short_cumulative,
+            'cycle_ref_price': marginpad_btc_cycle_ref_price,
+            'processed_through_ms': marginpad_btc_processed_through_ms,
+            'last_alert_snapshot': marginpad_btc_last_alert_snapshot,
+            'seen_queue': list(marginpad_seen_queue),
+        },
+
+        'coinalyze_xau': {
+            'long_cumulative': xau_long_cumulative,
+            'short_cumulative': xau_short_cumulative,
+            'cycle_ref_price': xau_cycle_ref_price,
+            'last_processed_liq_ts': xau_last_processed_liq_ts,
+        },
+
+        'marginpad_xau': {
+            'long_cumulative': marginpad_xau_long_cumulative,
+            'short_cumulative': marginpad_xau_short_cumulative,
+            'cycle_ref_price': marginpad_xau_cycle_ref_price,
+            'processed_through_ms': marginpad_xau_processed_through_ms,
+            'seen_queue': list(marginpad_xau_seen_queue),
+        },
+
+        'nvda': {
+            'session_date_ist': nvda_session_date_ist,
+            'session_open': nvda_session_open,
+            'state': nvda_state,
+            'last_processed_candle_ts': nvda_last_processed_candle_ts,
+        },
+    }
+
+
+def _save_runtime_state():
+    try:
+        os.makedirs(os.path.dirname(RUNTIME_STATE_FILE), exist_ok=True)
+        payload = _runtime_state_payload()
+        tmp_path = RUNTIME_STATE_FILE + '.tmp'
+        with _runtime_state_lock:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, separators=(',', ':'), sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, RUNTIME_STATE_FILE)
+        return True
+    except Exception as exc:
+        print(f'[RUNTIME STATE SAVE ERROR] {exc}', flush=True)
+        return False
+
+
+def _load_runtime_state():
+    global btc_long_cumulative, btc_short_cumulative
+    global btc_cycle_ref_price, btc_last_processed_liq_ts
+    global btc_last_alert_snapshot
+    global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
+    global marginpad_btc_cycle_ref_price, marginpad_btc_processed_through_ms
+    global marginpad_btc_last_alert_snapshot
+    global marginpad_seen_queue, marginpad_seen_set
+    global xau_long_cumulative, xau_short_cumulative
+    global xau_cycle_ref_price, xau_last_processed_liq_ts
+    global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
+    global marginpad_xau_cycle_ref_price, marginpad_xau_processed_through_ms
+    global marginpad_xau_seen_queue, marginpad_xau_seen_set
+    global nvda_session_date_ist, nvda_session_open
+    global nvda_state, nvda_last_processed_candle_ts
+
+    if not os.path.exists(RUNTIME_STATE_FILE):
+        print('[RUNTIME STATE] no saved state yet', flush=True)
+        return False
+
+    try:
+        with _runtime_state_lock:
+            with open(RUNTIME_STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+        cbtc = data.get('coinalyze_btc') or {}
+        btc_long_cumulative = float(cbtc.get('long_cumulative', 0.0) or 0.0)
+        btc_short_cumulative = float(cbtc.get('short_cumulative', 0.0) or 0.0)
+        btc_cycle_ref_price = cbtc.get('cycle_ref_price')
+        btc_last_processed_liq_ts = cbtc.get('last_processed_liq_ts')
+        btc_last_alert_snapshot = cbtc.get('last_alert_snapshot')
+
+        mbtc = data.get('marginpad_btc') or {}
+        marginpad_btc_long_cumulative = float(mbtc.get('long_cumulative', 0.0) or 0.0)
+        marginpad_btc_short_cumulative = float(mbtc.get('short_cumulative', 0.0) or 0.0)
+        marginpad_btc_cycle_ref_price = mbtc.get('cycle_ref_price')
+        marginpad_btc_processed_through_ms = mbtc.get('processed_through_ms')
+        marginpad_btc_last_alert_snapshot = mbtc.get('last_alert_snapshot')
+        mbtc_seen = list(mbtc.get('seen_queue') or [])[-MARGINPAD_SEEN_MAX:]
+        marginpad_seen_queue = deque(mbtc_seen)
+        marginpad_seen_set = set(mbtc_seen)
+
+        cxau = data.get('coinalyze_xau') or {}
+        xau_long_cumulative = float(cxau.get('long_cumulative', 0.0) or 0.0)
+        xau_short_cumulative = float(cxau.get('short_cumulative', 0.0) or 0.0)
+        xau_cycle_ref_price = cxau.get('cycle_ref_price')
+        xau_last_processed_liq_ts = cxau.get('last_processed_liq_ts')
+
+        mxau = data.get('marginpad_xau') or {}
+        marginpad_xau_long_cumulative = float(mxau.get('long_cumulative', 0.0) or 0.0)
+        marginpad_xau_short_cumulative = float(mxau.get('short_cumulative', 0.0) or 0.0)
+        marginpad_xau_cycle_ref_price = mxau.get('cycle_ref_price')
+        marginpad_xau_processed_through_ms = mxau.get('processed_through_ms')
+        mxau_seen = list(mxau.get('seen_queue') or [])[-MARGINPAD_SEEN_MAX:]
+        marginpad_xau_seen_queue = deque(mxau_seen)
+        marginpad_xau_seen_set = set(mxau_seen)
+
+        nvd = data.get('nvda') or {}
+        nvda_session_date_ist = nvd.get('session_date_ist')
+        nvda_session_open = nvd.get('session_open')
+        nvda_state = int(nvd.get('state', 0) or 0)
+        nvda_last_processed_candle_ts = nvd.get('last_processed_candle_ts')
+
+        print(
+            '[RUNTIME STATE RESTORED] '
+            f'BTC C={btc_long_cumulative:.0f}/{btc_short_cumulative:.0f} | '
+            f'BTC M={marginpad_btc_long_cumulative:.0f}/{marginpad_btc_short_cumulative:.0f} | '
+            f'XAU C={xau_long_cumulative:.0f}/{xau_short_cumulative:.0f} | '
+            f'XAU M={marginpad_xau_long_cumulative:.0f}/{marginpad_xau_short_cumulative:.0f} | '
+            f'NVDA state={nvda_state}',
+            flush=True
+        )
+        return True
+    except Exception as exc:
+        print(f'[RUNTIME STATE LOAD ERROR] {exc}', flush=True)
+        return False
+
+
+_runtime_state_restored = _load_runtime_state()
+
+
+@app.after_request
+def _persist_runtime_state_after_request(response):
+    # One worker is used on Render. Persist after every completed request so
+    # cron-triggered state changes survive the next deploy/restart.
+    _save_runtime_state()
+    return response
+
+
+@app.get('/debug/runtime-state')
+def debug_runtime_state():
+    return jsonify({
+        'ok': True,
+        'state_file': RUNTIME_STATE_FILE,
+        'state_file_exists': os.path.exists(RUNTIME_STATE_FILE),
+        'restored_on_startup': _runtime_state_restored,
+        'coinalyze_btc': {
+            'long': btc_long_cumulative,
+            'short': btc_short_cumulative,
+            'ref_price': btc_cycle_ref_price,
+            'last_processed': btc_last_processed_liq_ts,
+        },
+        'marginpad_btc': {
+            'long': marginpad_btc_long_cumulative,
+            'short': marginpad_btc_short_cumulative,
+            'ref_price': marginpad_btc_cycle_ref_price,
+            'processed_through_ms': marginpad_btc_processed_through_ms,
+            'seen_count': len(marginpad_seen_set),
+        },
+        'coinalyze_xau': {
+            'long': xau_long_cumulative,
+            'short': xau_short_cumulative,
+            'ref_price': xau_cycle_ref_price,
+            'last_processed': xau_last_processed_liq_ts,
+        },
+        'marginpad_xau': {
+            'long': marginpad_xau_long_cumulative,
+            'short': marginpad_xau_short_cumulative,
+            'ref_price': marginpad_xau_cycle_ref_price,
+            'processed_through_ms': marginpad_xau_processed_through_ms,
+            'seen_count': len(marginpad_xau_seen_set),
+        },
+        'nvda': {
+            'session_date_ist': nvda_session_date_ist,
+            'session_open': nvda_session_open,
+            'state': nvda_state,
+            'last_processed_candle_ts': nvda_last_processed_candle_ts,
+        },
+    })
+
+
 def _nvda_active_anchor_ist(now_ist):
 
     anchor = now_ist.replace(
