@@ -125,6 +125,22 @@ RAW_EVENT_LOGS = os.getenv("DIRECT_RAW_EVENT_LOGS", "1").strip().lower() not in 
 }
 
 
+# ============================================================
+# PERSISTENT RUNTIME STATE
+# ============================================================
+STATE_FILE = os.getenv(
+    "DIRECT_STATE_FILE",
+    "/var/data/direct_liquidation_state.json",
+).strip()
+
+STATE_SAVE_SECONDS = float(
+    os.getenv("DIRECT_STATE_SAVE_SECONDS", "2")
+)
+
+STATE_VERSION = 1
+state_restored_on_startup = False
+
+
 def mark_transport(asset, exchange):
     last_transport_wall[asset][exchange] = time.time()
     transport_connected[asset][exchange] = True
@@ -184,6 +200,173 @@ def event_timestamp_age_seconds(event_ts):
         ts /= 1000.0
 
     return time.time() - ts
+
+
+
+# ============================================================
+# PERSISTENCE HELPERS
+# ============================================================
+
+def _copy_asset_exchange_map(source):
+    return {
+        asset: {
+            ex: source[asset][ex]
+            for ex in EXCHANGES
+        }
+        for asset in ASSETS
+    }
+
+
+def build_persistent_state():
+    return {
+        "version": STATE_VERSION,
+        "saved_at_unix": time.time(),
+        "totals": {
+            asset: {
+                "long": float(totals[asset]["long"]),
+                "short": float(totals[asset]["short"]),
+            }
+            for asset in ASSETS
+        },
+        "by_exchange": {
+            asset: {
+                ex: {
+                    "long": float(by_exchange[asset][ex]["long"]),
+                    "short": float(by_exchange[asset][ex]["short"]),
+                }
+                for ex in EXCHANGES
+            }
+            for asset in ASSETS
+        },
+        "last_alert_wall": {
+            asset: last_alert_wall[asset]
+            for asset in ASSETS
+        },
+        "last_liq_wall": _copy_asset_exchange_map(last_liq_wall),
+        "last_liq_event_ts": _copy_asset_exchange_map(last_liq_event_ts),
+        "seen_events": list(seen_queue),
+    }
+
+
+def save_persistent_state():
+    if not STATE_FILE:
+        return False
+
+    try:
+        parent = os.path.dirname(STATE_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        tmp = STATE_FILE + ".tmp"
+        payload = build_persistent_state()
+
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp, STATE_FILE)
+        return True
+    except Exception as e:
+        print(
+            f"[PERSIST ERROR] save failed: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return False
+
+
+def load_persistent_state():
+    global state_restored_on_startup
+
+    state_restored_on_startup = False
+
+    if not STATE_FILE or not os.path.exists(STATE_FILE):
+        print(
+            f"[PERSIST] no existing state file at {STATE_FILE}; "
+            "starting with current in-memory defaults",
+            flush=True,
+        )
+        return False
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        saved_totals = data.get("totals") or {}
+        saved_by_exchange = data.get("by_exchange") or {}
+        saved_last_alert = data.get("last_alert_wall") or {}
+        saved_last_liq_wall = data.get("last_liq_wall") or {}
+        saved_last_liq_event_ts = data.get("last_liq_event_ts") or {}
+        saved_seen = data.get("seen_events") or []
+
+        for asset in ASSETS:
+            asset_totals = saved_totals.get(asset) or {}
+            totals[asset]["long"] = float(asset_totals.get("long", 0.0) or 0.0)
+            totals[asset]["short"] = float(asset_totals.get("short", 0.0) or 0.0)
+
+            asset_by_exchange = saved_by_exchange.get(asset) or {}
+            for ex in EXCHANGES:
+                ex_state = asset_by_exchange.get(ex) or {}
+                by_exchange[asset][ex]["long"] = float(
+                    ex_state.get("long", 0.0) or 0.0
+                )
+                by_exchange[asset][ex]["short"] = float(
+                    ex_state.get("short", 0.0) or 0.0
+                )
+
+                wall_state = (saved_last_liq_wall.get(asset) or {}).get(ex)
+                if wall_state is not None:
+                    try:
+                        last_liq_wall[asset][ex] = float(wall_state)
+                    except (TypeError, ValueError):
+                        pass
+
+                event_ts = (saved_last_liq_event_ts.get(asset) or {}).get(ex)
+                if event_ts not in (None, ""):
+                    last_liq_event_ts[asset][ex] = str(event_ts)
+
+            alert_wall = saved_last_alert.get(asset)
+            if alert_wall is not None:
+                try:
+                    last_alert_wall[asset] = float(alert_wall)
+                except (TypeError, ValueError):
+                    last_alert_wall[asset] = None
+
+        seen_queue.clear()
+        seen_set.clear()
+        for key in saved_seen[-SEEN_LIMIT:]:
+            try:
+                hash(key)
+            except Exception:
+                continue
+            seen_queue.append(key)
+            seen_set.add(key)
+
+        state_restored_on_startup = True
+
+        print(
+            f"[PERSIST] restored state from {STATE_FILE} | "
+            f"BTC L={usd(totals['BTC']['long'])} "
+            f"S={usd(totals['BTC']['short'])} | "
+            f"XAU L={usd(totals['XAU']['long'])} "
+            f"S={usd(totals['XAU']['short'])} | "
+            f"seen={len(seen_queue)}",
+            flush=True,
+        )
+        return True
+
+    except Exception as e:
+        print(
+            f"[PERSIST ERROR] load failed: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return False
+
+
+async def persistence_loop():
+    while True:
+        await asyncio.sleep(max(1.0, STATE_SAVE_SECONDS))
+        save_persistent_state()
 
 
 # ============================================================
@@ -356,6 +539,9 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_
 
         last_alert_wall[asset] = time.time()
         reset_asset_cycle(asset)
+
+        # Persist reset + cooldown timestamp immediately.
+        save_persistent_state()
 
         print(
             f"[CYCLE RESET] {asset} cumulative totals reset after alert",
@@ -1232,6 +1418,8 @@ async def status_loop():
 # ============================================================
 
 async def main():
+    load_persistent_state()
+
     print(
         "DIRECT BTC + XAU LIQUIDATION WORKER STARTING",
         flush=True,
@@ -1267,7 +1455,17 @@ async def main():
         flush=True,
     )
 
+    print(
+        f"Persistence: file={STATE_FILE} | "
+        f"save_every={STATE_SAVE_SECONDS:.0f}s | "
+        f"restored_on_startup={state_restored_on_startup}",
+        flush=True,
+    )
+
+    save_persistent_state()
+
     await asyncio.gather(
+        persistence_loop(),
         bitget_loop(),
         aster_loop(),
         coinex_loop(),
