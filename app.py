@@ -1065,6 +1065,63 @@ def get_marginpad_fresh_xau_liquidations(
 
 
 # ==================================================
+# DEBUG: COINALYZE NVDA MARKET IDS
+# ==================================================
+
+@app.get("/debug/coinalyze-nvda")
+def debug_coinalyze_nvda():
+
+    markets, error = get_future_markets()
+
+    if error:
+        return jsonify({
+            "ok": False,
+            "error": error
+        }), 500
+
+    matches = []
+
+    for market in (markets or []):
+        if not isinstance(market, dict):
+            continue
+
+        # Coinalyze market payloads can evolve, so search both the
+        # common fields and the full row text for NVDA / NVIDIA.
+        searchable = " ".join([
+            str(market.get("symbol", "")),
+            str(market.get("base_asset", "")),
+            str(market.get("quote_asset", "")),
+            str(market.get("exchange", "")),
+            str(market.get("name", "")),
+            str(market.get("instrument", "")),
+            str(market)
+        ]).upper()
+
+        if "NVDA" in searchable or "NVIDIA" in searchable:
+            matches.append(market)
+            print(
+                "[COINALYZE NVDA MARKET] "
+                + json.dumps(
+                    market,
+                    sort_keys=True,
+                    default=str
+                ),
+                flush=True
+            )
+
+    print(
+        f"[COINALYZE NVDA DEBUG] matches={len(matches)}",
+        flush=True
+    )
+
+    return jsonify({
+        "ok": True,
+        "matches": len(matches),
+        "markets": matches
+    })
+
+
+# ==================================================
 # HOME
 # ==================================================
 
