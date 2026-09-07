@@ -1904,6 +1904,382 @@ def zerodha_nifty_oi_test():
         }), 500
 
 
+
+# ==========================================================
+# ZERODHA NIFTY FIXED 09:15 COI MONITOR
+# ==========================================================
+ZERODHA_NIFTY_COI_THRESHOLD = int(os.getenv("ZERODHA_NIFTY_COI_THRESHOLD", "100000"))
+ZERODHA_NIFTY_STATE_FILE = os.getenv(
+    "ZERODHA_NIFTY_STATE_FILE",
+    "/tmp/zerodha_nifty_coi_state.json",
+)
+
+
+def _zerodha_read_nifty_state():
+    try:
+        with open(ZERODHA_NIFTY_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _zerodha_write_nifty_state(state):
+    try:
+        tmp = ZERODHA_NIFTY_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, separators=(",", ":"))
+        os.replace(tmp, ZERODHA_NIFTY_STATE_FILE)
+    except Exception as exc:
+        print(f"[ZERODHA NIFTY STATE WRITE ERROR] {exc}", flush=True)
+
+
+def _zerodha_get_csv_rows(url, timeout=35):
+    resp = requests.get(url, headers=_zerodha_headers(), timeout=timeout)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Kite instrument dump failed: HTTP {resp.status_code}")
+    return list(csv.DictReader(io.StringIO(resp.text)))
+
+
+def _zerodha_historical_candles(instrument_token, start_dt, end_dt, *, oi=False):
+    url = f"https://api.kite.trade/instruments/historical/{int(instrument_token)}/minute"
+    params = {
+        "from": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "to": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "continuous": 0,
+        "oi": 1 if oi else 0,
+    }
+    data = _zerodha_json_get(url, params=params, timeout=25)
+    candles = data.get("candles") if isinstance(data, dict) else None
+    return candles or []
+
+
+def _zerodha_find_nifty_index_token():
+    rows = _zerodha_get_csv_rows("https://api.kite.trade/instruments/NSE")
+    candidates = []
+    for row in rows:
+        ts = (row.get("tradingsymbol") or "").strip().upper()
+        name = (row.get("name") or "").strip().upper()
+        segment = (row.get("segment") or "").strip().upper()
+        if ts == "NIFTY 50" or name == "NIFTY 50":
+            try:
+                tok = int(float(row.get("instrument_token") or 0))
+            except Exception:
+                continue
+            if tok:
+                candidates.append((0 if segment == "INDICES" else 1, tok))
+    if not candidates:
+        raise RuntimeError("Could not find NIFTY 50 index token in NSE instrument dump")
+    candidates.sort()
+    return candidates[0][1]
+
+
+def _zerodha_nifty_0915_open(session_date):
+    token = _zerodha_find_nifty_index_token()
+    start = datetime.combine(session_date, datetime.min.time()).replace(
+        hour=9, minute=15, second=0, tzinfo=ZERODHA_IST
+    )
+    end = start + timedelta(minutes=2)
+    candles = _zerodha_historical_candles(token, start, end, oi=False)
+    if not candles:
+        raise RuntimeError("No NIFTY 09:15 historical candle found for today")
+    first = candles[0]
+    if not isinstance(first, (list, tuple)) or len(first) < 5:
+        raise RuntimeError("Unexpected NIFTY historical candle format")
+    return float(first[1])
+
+
+def _zerodha_build_nifty_fixed_basket(session_date, nifty_open):
+    rows = _zerodha_get_csv_rows("https://api.kite.trade/instruments/NFO")
+    options = []
+    for row in rows:
+        if (row.get("name") or "").strip().upper() != "NIFTY":
+            continue
+        itype = (row.get("instrument_type") or "").strip().upper()
+        if itype not in {"CE", "PE"}:
+            continue
+        expiry_txt = (row.get("expiry") or "").strip()
+        if not expiry_txt:
+            continue
+        try:
+            expiry = datetime.strptime(expiry_txt, "%Y-%m-%d").date()
+            strike = float(row.get("strike") or 0)
+            token = int(float(row.get("instrument_token") or 0))
+            lot = int(float(row.get("lot_size") or 0))
+        except Exception:
+            continue
+        if expiry < session_date or not token or not strike:
+            continue
+        options.append({
+            "tradingsymbol": (row.get("tradingsymbol") or "").strip(),
+            "exchange": (row.get("exchange") or "NFO").strip() or "NFO",
+            "instrument_token": token,
+            "expiry": expiry,
+            "strike": strike,
+            "instrument_type": itype,
+            "lot_size": lot,
+        })
+
+    if not options:
+        raise RuntimeError("No active NIFTY options found")
+
+    nearest_expiry = min(x["expiry"] for x in options)
+    expiry_rows = [x for x in options if x["expiry"] == nearest_expiry]
+    strikes = sorted({x["strike"] for x in expiry_rows})
+    if len(strikes) < 5:
+        raise RuntimeError("Nearest NIFTY expiry has fewer than 5 strikes")
+
+    atm_i = min(range(len(strikes)), key=lambda i: abs(strikes[i] - nifty_open))
+    if atm_i < 2 or atm_i > len(strikes) - 3:
+        raise RuntimeError("Could not form fixed ATM +/-2 strike basket")
+
+    selected_strikes = strikes[atm_i - 2:atm_i + 3]
+    atm_strike = strikes[atm_i]
+    selected_rows = [
+        x for x in expiry_rows
+        if x["strike"] in selected_strikes and x["instrument_type"] in {"CE", "PE"}
+    ]
+    if len(selected_rows) != 10:
+        raise RuntimeError(
+            f"Expected 10 fixed NIFTY contracts (5 CE + 5 PE), got {len(selected_rows)}"
+        )
+    return nearest_expiry, atm_strike, selected_strikes, selected_rows
+
+
+def _zerodha_option_0915_oi(option_row, session_date):
+    start = datetime.combine(session_date, datetime.min.time()).replace(
+        hour=9, minute=15, second=0, tzinfo=ZERODHA_IST
+    )
+    end = start + timedelta(minutes=2)
+    candles = _zerodha_historical_candles(
+        option_row["instrument_token"], start, end, oi=True
+    )
+    if not candles:
+        raise RuntimeError(
+            f"No 09:15 OI candle for {option_row['tradingsymbol']}"
+        )
+    first = candles[0]
+    if not isinstance(first, (list, tuple)) or len(first) < 7:
+        raise RuntimeError(
+            f"Historical OI missing for {option_row['tradingsymbol']}"
+        )
+    return int(first[6])
+
+
+def _zerodha_nifty_snapshot():
+    now_ist = datetime.now(ZERODHA_IST)
+    session_date = now_ist.date()
+    session_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now_ist < session_start:
+        raise RuntimeError("NIFTY 09:15 session has not started yet")
+
+    nifty_open = _zerodha_nifty_0915_open(session_date)
+    nearest_expiry, atm_strike, selected_strikes, selected_rows = (
+        _zerodha_build_nifty_fixed_basket(session_date, nifty_open)
+    )
+
+    baseline = {}
+    for row in selected_rows:
+        key = f"{row['exchange']}:{row['tradingsymbol']}"
+        baseline[key] = _zerodha_option_0915_oi(row, session_date)
+
+    quote_keys = [f"{x['exchange']}:{x['tradingsymbol']}" for x in selected_rows]
+    quote_data = _zerodha_json_get(
+        "https://api.kite.trade/quote",
+        params=[("i", key) for key in quote_keys],
+    )
+    spot_data = _zerodha_json_get(
+        "https://api.kite.trade/quote/ltp",
+        params=[("i", "NSE:NIFTY 50")],
+    )
+    nifty_now = float((spot_data.get("NSE:NIFTY 50") or {}).get("last_price"))
+
+    contracts = []
+    ce_baseline = pe_baseline = 0
+    ce_current = pe_current = 0
+    ce_coi = pe_coi = 0
+    ce_lots = pe_lots = 0.0
+
+    for row in sorted(selected_rows, key=lambda r: (r["strike"], r["instrument_type"])):
+        key = f"{row['exchange']}:{row['tradingsymbol']}"
+        q = quote_data.get(key) or {}
+        current_oi = int(q.get("oi") or 0)
+        base_oi = int(baseline[key])
+        coi = current_oi - base_oi
+        lots = (coi / row["lot_size"]) if row["lot_size"] else 0.0
+
+        if row["instrument_type"] == "CE":
+            ce_baseline += base_oi
+            ce_current += current_oi
+            ce_coi += coi
+            ce_lots += lots
+        else:
+            pe_baseline += base_oi
+            pe_current += current_oi
+            pe_coi += coi
+            pe_lots += lots
+
+        contracts.append({
+            "key": key,
+            "strike": row["strike"],
+            "type": row["instrument_type"],
+            "lot_size": row["lot_size"],
+            "baseline_oi_raw": base_oi,
+            "current_oi_raw": current_oi,
+            "coi_raw": coi,
+            "coi_lots": round(lots, 2),
+        })
+
+    return {
+        "session_date": session_date.isoformat(),
+        "nifty_open": nifty_open,
+        "nifty_now": nifty_now,
+        "nifty_move": nifty_now - nifty_open,
+        "nearest_expiry": nearest_expiry.isoformat(),
+        "atm_strike": atm_strike,
+        "selected_strikes": selected_strikes,
+        "ce_baseline_oi_raw": ce_baseline,
+        "pe_baseline_oi_raw": pe_baseline,
+        "ce_current_oi_raw": ce_current,
+        "pe_current_oi_raw": pe_current,
+        "ce_coi_raw": ce_coi,
+        "pe_coi_raw": pe_coi,
+        "ce_coi_lots": ce_lots,
+        "pe_coi_lots": pe_lots,
+        "gap_raw": ce_coi - pe_coi,
+        "contracts": contracts,
+    }
+
+
+@app.get("/zerodha-nifty-coi-monitor")
+def zerodha_nifty_coi_monitor():
+    """
+    Read-only NIFTY COI monitor.
+
+    Fixed rules:
+      - NIFTY 09:15 IST open determines ATM.
+      - Fixed basket = ATM +/- 2 strikes, nearest expiry, 5 strikes total.
+      - 09:15 option OI is the baseline for the whole session.
+      - CE/PE COI = current total OI - 09:15 total OI.
+      - Pushover event fires when CE or PE crosses upward through +100,000 raw COI.
+      - Same side staying above threshold does not repeat-alert.
+    """
+    if not zerodha_access_token:
+        return jsonify({
+            "ok": False,
+            "error": "Zerodha access token missing. Open /zerodha-login and authenticate first."
+        }), 401
+
+    try:
+        snap = _zerodha_nifty_snapshot()
+        threshold = ZERODHA_NIFTY_COI_THRESHOLD
+        state = _zerodha_read_nifty_state()
+
+        # New trading date => start fresh crossing state.
+        if state.get("session_date") != snap["session_date"]:
+            state = {
+                "session_date": snap["session_date"],
+                "initialized": False,
+                "ce_above": False,
+                "pe_above": False,
+            }
+
+        current_ce_above = snap["ce_coi_raw"] >= threshold
+        current_pe_above = snap["pe_coi_raw"] >= threshold
+
+        # First observation initializes current threshold state silently.
+        # This avoids a duplicate alert after a service deploy/restart while
+        # COI is already above +1L.
+        if not state.get("initialized"):
+            ce_cross = False
+            pe_cross = False
+            state["initialized"] = True
+        else:
+            ce_cross = (not bool(state.get("ce_above"))) and current_ce_above
+            pe_cross = (not bool(state.get("pe_above"))) and current_pe_above
+
+        alert_sent = False
+        alert_title = None
+        winner = None
+
+        if ce_cross or pe_cross:
+            if ce_cross and pe_cross:
+                if snap["ce_coi_raw"] > snap["pe_coi_raw"]:
+                    winner = "CE"
+                elif snap["pe_coi_raw"] > snap["ce_coi_raw"]:
+                    winner = "PE"
+                else:
+                    winner = "BOTH"
+                alert_title = "NIFTY CE + PE COI HIT +1L"
+            elif ce_cross:
+                winner = "CE"
+                alert_title = "NIFTY CE COI WINS +1L"
+            else:
+                winner = "PE"
+                alert_title = "NIFTY PE COI WINS +1L"
+
+            strikes_text = " | ".join(
+                f"{int(x) if float(x).is_integer() else x:g}"
+                for x in snap["selected_strikes"]
+            )
+            move = snap["nifty_move"]
+            gap = snap["gap_raw"]
+
+            message = (
+                f"SOURCE ZERODHA | WINNER {winner} | "
+                f"CE COI {snap['ce_coi_raw']:+,d} RAW "
+                f"({snap['ce_coi_lots']:+,.2f} lots) | "
+                f"PE COI {snap['pe_coi_raw']:+,d} RAW "
+                f"({snap['pe_coi_lots']:+,.2f} lots) | "
+                f"GAP {gap:+,d} | "
+                f"NIFTY {snap['nifty_now']:,.2f} | "
+                f"NIFTY MOVE {move:+,.2f} pts | "
+                f"09:15 OPEN {snap['nifty_open']:,.2f} | "
+                f"ATM {snap['atm_strike']:,.0f} | "
+                f"STRIKES {strikes_text} | "
+                f"EXPIRY {snap['nearest_expiry']}"
+            )
+            alert_sent = send_pushover(alert_title, message)
+
+        state.update({
+            "session_date": snap["session_date"],
+            "ce_above": current_ce_above,
+            "pe_above": current_pe_above,
+            "last_ce_coi_raw": snap["ce_coi_raw"],
+            "last_pe_coi_raw": snap["pe_coi_raw"],
+            "last_checked_at_ist": datetime.now(ZERODHA_IST).isoformat(),
+            "last_alert_title": alert_title if alert_sent else state.get("last_alert_title"),
+        })
+        _zerodha_write_nifty_state(state)
+
+        return jsonify({
+            "ok": True,
+            "mode": "READ_ONLY_COI_MONITOR",
+            "threshold_raw": threshold,
+            "alert_triggered": bool(ce_cross or pe_cross),
+            "alert_sent": alert_sent,
+            "alert_title": alert_title,
+            "winner": winner,
+            "state": {
+                "ce_above_threshold": current_ce_above,
+                "pe_above_threshold": current_pe_above,
+            },
+            **snap,
+        })
+
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/zerodha-nifty-coi-state")
+def zerodha_nifty_coi_state():
+    """Safe debug state. No API secret/access token is returned."""
+    return jsonify({
+        "ok": True,
+        "threshold_raw": ZERODHA_NIFTY_COI_THRESHOLD,
+        "state": _zerodha_read_nifty_state(),
+    })
+
 @app.get("/")
 def home():
 
