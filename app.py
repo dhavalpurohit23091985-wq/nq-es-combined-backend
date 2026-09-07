@@ -1335,9 +1335,9 @@ def _nvda_alert_payload(direction, session_open, close_price):
     )
 
     if direction == 1:
-        title = "NVDA +1% STATE"
+        title = "COINALYZE NVDA +1% STATE"
         message = (
-            "NVDA +1% STATE"
+            "COINALYZE NVDA +1% STATE"
             f" | 3:30 OPEN {session_open:.2f}"
             f" | +1% LEVEL {upper:.2f}"
             f" | CLOSE {close_price:.2f}"
@@ -1346,9 +1346,9 @@ def _nvda_alert_payload(direction, session_open, close_price):
         )
 
     else:
-        title = "NVDA -1% STATE"
+        title = "COINALYZE NVDA -1% STATE"
         message = (
-            "NVDA -1% STATE"
+            "COINALYZE NVDA -1% STATE"
             f" | 3:30 OPEN {session_open:.2f}"
             f" | -1% LEVEL {lower:.2f}"
             f" | CLOSE {close_price:.2f}"
