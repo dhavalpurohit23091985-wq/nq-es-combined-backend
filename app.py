@@ -1210,6 +1210,403 @@ def debug_coinalyze_nvda_5m():
     })
 
 
+
+# ==================================================
+# COINALYZE NVDA 3:30 IST FIXED OPEN ±1% STATE
+# ==================================================
+
+NVDA_COINALYZE_SYMBOL = os.environ.get(
+    "NVDA_COINALYZE_SYMBOL",
+    "NVDAUSDT_PERP.A"
+)
+
+NVDA_MOVE_PCT = float(
+    os.environ.get(
+        "NVDA_MOVE_PCT",
+        "1.0"
+    )
+) / 100.0
+
+NVDA_IST = ZoneInfo("Asia/Kolkata")
+
+nvda_session_date_ist = None
+nvda_session_open = None
+nvda_state = 0
+nvda_last_processed_candle_ts = None
+
+
+def _nvda_active_anchor_ist(now_ist):
+
+    anchor = now_ist.replace(
+        hour=3,
+        minute=30,
+        second=0,
+        microsecond=0
+    )
+
+    if now_ist < anchor:
+        anchor -= timedelta(days=1)
+
+    return anchor
+
+
+def _nvda_fetch_5m_history(from_ts, to_ts):
+
+    response, error = coinalyze_get(
+        "https://api.coinalyze.net/v1/ohlcv-history",
+        params={
+            "symbols": NVDA_COINALYZE_SYMBOL,
+            "interval": "5min",
+            "from": int(from_ts),
+            "to": int(to_ts)
+        },
+        timeout=15,
+        stage="nvda-5m-state"
+    )
+
+    if error:
+        return None, error
+
+    try:
+        payload = response.json()
+
+    except ValueError:
+        return None, {
+            "stage": "nvda-5m-state",
+            "error": "invalid json"
+        }
+
+    if (
+        not isinstance(payload, list)
+        or not payload
+        or not isinstance(payload[0], dict)
+    ):
+        return [], None
+
+    history = payload[0].get(
+        "history",
+        []
+    )
+
+    if not isinstance(history, list):
+        history = []
+
+    history = [
+        row
+        for row in history
+        if isinstance(row, dict)
+    ]
+
+    history.sort(
+        key=lambda row: int(
+            row.get("t", 0)
+        )
+    )
+
+    return history, None
+
+
+def _nvda_find_session_open(history, anchor_ist):
+
+    target_ts = int(
+        anchor_ist.astimezone(
+            timezone.utc
+        ).timestamp()
+    )
+
+    for row in history:
+        try:
+            if int(row.get("t")) == target_ts:
+                return float(row.get("o"))
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
+def _nvda_alert_payload(direction, session_open, close_price):
+
+    upper = session_open * (
+        1 + NVDA_MOVE_PCT
+    )
+
+    lower = session_open * (
+        1 - NVDA_MOVE_PCT
+    )
+
+    if direction == 1:
+        title = "NVDA +1% STATE"
+        message = (
+            "NVDA +1% STATE"
+            f" | 3:30 OPEN {session_open:.2f}"
+            f" | +1% LEVEL {upper:.2f}"
+            f" | CLOSE {close_price:.2f}"
+            f" | NEXT -1% LEVEL {lower:.2f}"
+            f" | SOURCE COINALYZE {NVDA_COINALYZE_SYMBOL}"
+        )
+
+    else:
+        title = "NVDA -1% STATE"
+        message = (
+            "NVDA -1% STATE"
+            f" | 3:30 OPEN {session_open:.2f}"
+            f" | -1% LEVEL {lower:.2f}"
+            f" | CLOSE {close_price:.2f}"
+            f" | NEXT +1% LEVEL {upper:.2f}"
+            f" | SOURCE COINALYZE {NVDA_COINALYZE_SYMBOL}"
+        )
+
+    return title, message
+
+
+@app.get("/nvda-5m-alert")
+def nvda_5m_alert():
+
+    global nvda_session_date_ist
+    global nvda_session_open
+    global nvda_state
+    global nvda_last_processed_candle_ts
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    now_ist = now_utc.astimezone(
+        NVDA_IST
+    )
+
+    anchor_ist = _nvda_active_anchor_ist(
+        now_ist
+    )
+
+    anchor_date = anchor_ist.date().isoformat()
+
+    # Pull enough history to include the active 03:30 IST candle
+    # plus all confirmed 5-minute closes since then.
+    from_utc = (
+        anchor_ist
+        - timedelta(minutes=5)
+    ).astimezone(
+        timezone.utc
+    )
+
+    history, error = _nvda_fetch_5m_history(
+        from_utc.timestamp(),
+        now_utc.timestamp()
+    )
+
+    if error:
+        return jsonify({
+            "ok": False,
+            "error": error
+        }), 500
+
+    if not history:
+        return jsonify({
+            "ok": False,
+            "error": "no NVDA 5-minute history returned",
+            "symbol": NVDA_COINALYZE_SYMBOL
+        }), 503
+
+    session_open = _nvda_find_session_open(
+        history,
+        anchor_ist
+    )
+
+    if session_open is None:
+        return jsonify({
+            "ok": False,
+            "error": "03:30 IST candle open not found",
+            "session_date_ist": anchor_date,
+            "symbol": NVDA_COINALYZE_SYMBOL
+        }), 503
+
+    # New 03:30 IST session -> reset state exactly like the Pine script.
+    if (
+        nvda_session_date_ist != anchor_date
+        or nvda_session_open is None
+    ):
+        nvda_session_date_ist = anchor_date
+        nvda_session_open = session_open
+        nvda_state = 0
+        nvda_last_processed_candle_ts = None
+
+        print(
+            "[NVDA NEW 3:30 SESSION] "
+            f"date_ist={anchor_date} | "
+            f"open={session_open:.2f}",
+            flush=True
+        )
+
+    upper = nvda_session_open * (
+        1 + NVDA_MOVE_PCT
+    )
+
+    lower = nvda_session_open * (
+        1 - NVDA_MOVE_PCT
+    )
+
+    now_ts = int(
+        now_utc.timestamp()
+    )
+
+    confirmed_rows = []
+
+    for row in history:
+        try:
+            candle_ts = int(
+                row.get("t")
+            )
+            close_price = float(
+                row.get("c")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        # Confirm only after the full 5-minute candle has closed.
+        if candle_ts + 300 <= now_ts:
+            confirmed_rows.append(
+                (candle_ts, close_price)
+            )
+
+    if not confirmed_rows:
+        return jsonify({
+            "ok": True,
+            "symbol": NVDA_COINALYZE_SYMBOL,
+            "session_open": round(nvda_session_open, 4),
+            "upper_level": round(upper, 4),
+            "lower_level": round(lower, 4),
+            "state": nvda_state,
+            "message": "no confirmed 5-minute candle yet"
+        })
+
+    confirmed_rows.sort(
+        key=lambda item: item[0]
+    )
+
+    signals_sent = []
+
+    # On a fresh process, initialize at the latest confirmed candle without
+    # replaying historical alerts. Future calls then process only new closes.
+    if nvda_last_processed_candle_ts is None:
+
+        latest_ts, latest_close = confirmed_rows[-1]
+
+        inferred_state = 0
+
+        for candle_ts, close_price in confirmed_rows:
+
+            if (
+                inferred_state != 1
+                and close_price >= upper
+            ):
+                inferred_state = 1
+
+            elif (
+                inferred_state != -1
+                and close_price <= lower
+            ):
+                inferred_state = -1
+
+        nvda_state = inferred_state
+        nvda_last_processed_candle_ts = latest_ts
+
+        print(
+            "[NVDA INIT] "
+            f"state={nvda_state} | "
+            f"last_close={latest_close:.2f} | "
+            f"last_ts={latest_ts}",
+            flush=True
+        )
+
+    else:
+
+        for candle_ts, close_price in confirmed_rows:
+
+            if candle_ts <= nvda_last_processed_candle_ts:
+                continue
+
+            direction = 0
+
+            if (
+                nvda_state != 1
+                and close_price >= upper
+            ):
+                direction = 1
+
+            elif (
+                nvda_state != -1
+                and close_price <= lower
+            ):
+                direction = -1
+
+            if direction != 0:
+
+                nvda_state = direction
+
+                title, message = _nvda_alert_payload(
+                    direction,
+                    nvda_session_open,
+                    close_price
+                )
+
+                sent = send_pushover(
+                    title,
+                    message
+                )
+
+                signals_sent.append({
+                    "title": title,
+                    "message": message,
+                    "pushover_sent": bool(sent),
+                    "candle_ts": candle_ts
+                })
+
+                print(
+                    f"[NVDA STATE ALERT] "
+                    f"{title} | {message}",
+                    flush=True
+                )
+
+            nvda_last_processed_candle_ts = candle_ts
+
+    latest_ts, latest_close = confirmed_rows[-1]
+
+    latest_ist = datetime.fromtimestamp(
+        latest_ts,
+        tz=timezone.utc
+    ).astimezone(
+        NVDA_IST
+    )
+
+    return jsonify({
+        "ok": True,
+        "symbol": NVDA_COINALYZE_SYMBOL,
+        "session_date_ist": nvda_session_date_ist,
+        "session_open": round(nvda_session_open, 4),
+        "upper_level": round(upper, 4),
+        "lower_level": round(lower, 4),
+        "state": nvda_state,
+        "last_confirmed_5m_open_ist": latest_ist.isoformat(),
+        "last_confirmed_close": round(latest_close, 4),
+        "last_processed_candle_ts": nvda_last_processed_candle_ts,
+        "signals_sent": signals_sent
+    })
+
+
+@app.get("/debug/coinalyze-nvda-state")
+def debug_coinalyze_nvda_state():
+
+    return jsonify({
+        "symbol": NVDA_COINALYZE_SYMBOL,
+        "move_pct": NVDA_MOVE_PCT * 100,
+        "session_date_ist": nvda_session_date_ist,
+        "session_open": nvda_session_open,
+        "state": nvda_state,
+        "last_processed_candle_ts": nvda_last_processed_candle_ts
+    })
+
+
 # ==================================================
 # HOME
 # ==================================================
