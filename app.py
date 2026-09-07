@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import requests
 
 
@@ -1612,6 +1612,120 @@ def debug_coinalyze_nvda_state():
 # ==================================================
 # HOME
 # ==================================================
+
+
+# ==========================================================
+# ZERODHA / KITE CONNECT AUTH
+# ==========================================================
+ZERODHA_API_KEY = os.getenv("ZERODHA_API_KEY", "").strip()
+ZERODHA_API_SECRET = os.getenv("ZERODHA_API_SECRET", "").strip()
+zerodha_access_token = None
+zerodha_access_token_created_at = None
+
+
+@app.get("/zerodha-login")
+def zerodha_login():
+    """Start the official Kite Connect login flow."""
+    if not ZERODHA_API_KEY or not ZERODHA_API_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "ZERODHA_API_KEY / ZERODHA_API_SECRET missing in environment"
+        }), 500
+
+    login_url = (
+        "https://kite.zerodha.com/connect/login"
+        f"?v=3&api_key={ZERODHA_API_KEY}"
+    )
+    return redirect(login_url, code=302)
+
+
+@app.get("/zerodha-callback")
+def zerodha_callback():
+    """Exchange Kite request_token for access_token without exposing secrets."""
+    global zerodha_access_token, zerodha_access_token_created_at
+
+    if not ZERODHA_API_KEY or not ZERODHA_API_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "ZERODHA_API_KEY / ZERODHA_API_SECRET missing in environment"
+        }), 500
+
+    status = (request.args.get("status") or "").strip().lower()
+    request_token = (request.args.get("request_token") or "").strip()
+
+    if status == "error":
+        return jsonify({
+            "ok": False,
+            "error": request.args.get("message") or "Kite login returned an error"
+        }), 400
+
+    if not request_token:
+        return jsonify({
+            "ok": False,
+            "error": "request_token missing from Zerodha callback"
+        }), 400
+
+    import hashlib
+    checksum = hashlib.sha256(
+        f"{ZERODHA_API_KEY}{request_token}{ZERODHA_API_SECRET}".encode("utf-8")
+    ).hexdigest()
+
+    try:
+        resp = requests.post(
+            "https://api.kite.trade/session/token",
+            data={
+                "api_key": ZERODHA_API_KEY,
+                "request_token": request_token,
+                "checksum": checksum,
+            },
+            headers={"X-Kite-Version": "3"},
+            timeout=20,
+        )
+        data = resp.json()
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"Kite token exchange failed: {exc}"
+        }), 502
+
+    if resp.status_code >= 400 or data.get("status") != "success":
+        return jsonify({
+            "ok": False,
+            "error": data.get("message") or "Kite token exchange failed",
+            "http_status": resp.status_code,
+        }), 502
+
+    token = ((data.get("data") or {}).get("access_token") or "").strip()
+    if not token:
+        return jsonify({
+            "ok": False,
+            "error": "Kite response did not contain access_token"
+        }), 502
+
+    zerodha_access_token = token
+    zerodha_access_token_created_at = datetime.now(timezone.utc).isoformat()
+
+    user_id = (data.get("data") or {}).get("user_id")
+    return jsonify({
+        "ok": True,
+        "message": "Zerodha login successful. Access token stored in this web-service process.",
+        "user_id": user_id,
+        "token_created_at_utc": zerodha_access_token_created_at,
+        "next": "Use /zerodha-auth-status to verify token state. Token value is intentionally not returned."
+    })
+
+
+@app.get("/zerodha-auth-status")
+def zerodha_auth_status():
+    """Safe status endpoint; never returns the access token itself."""
+    return jsonify({
+        "ok": True,
+        "api_key_configured": bool(ZERODHA_API_KEY),
+        "api_secret_configured": bool(ZERODHA_API_SECRET),
+        "access_token_present": bool(zerodha_access_token),
+        "token_created_at_utc": zerodha_access_token_created_at,
+    })
+
 
 @app.get("/")
 def home():
