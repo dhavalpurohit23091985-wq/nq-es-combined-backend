@@ -2,6 +2,8 @@ import os
 import time
 import threading
 import json
+import csv
+import io
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
@@ -1725,6 +1727,181 @@ def zerodha_auth_status():
         "access_token_present": bool(zerodha_access_token),
         "token_created_at_utc": zerodha_access_token_created_at,
     })
+
+
+# ==========================================================
+# ZERODHA NIFTY SPOT + FIXED 5-STRIKE OI TEST
+# ==========================================================
+ZERODHA_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _zerodha_headers():
+    if not zerodha_access_token:
+        raise RuntimeError("Zerodha access token is not present. Open /zerodha-login and authenticate first.")
+    return {
+        "Authorization": f"token {ZERODHA_API_KEY}:{zerodha_access_token}",
+        "X-Kite-Version": "3",
+    }
+
+
+def _zerodha_json_get(url, *, params=None, timeout=25):
+    resp = requests.get(url, headers=_zerodha_headers(), params=params, timeout=timeout)
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"Kite returned non-JSON response (HTTP {resp.status_code})")
+
+    if resp.status_code >= 400 or data.get("status") != "success":
+        msg = data.get("message") or f"Kite HTTP {resp.status_code}"
+        raise RuntimeError(msg)
+    return data.get("data") or {}
+
+
+@app.get("/zerodha-nifty-oi-test")
+def zerodha_nifty_oi_test():
+    """
+    Read-only test endpoint:
+      1) NIFTY 50 spot
+      2) nearest NIFTY option expiry
+      3) closest ATM strike
+      4) ATM +/- 2 strikes (5 strikes total)
+      5) CE/PE full quotes including current OI
+
+    No orders are placed.
+    """
+    if not ZERODHA_API_KEY or not ZERODHA_API_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "ZERODHA_API_KEY / ZERODHA_API_SECRET missing in environment"
+        }), 500
+
+    if not zerodha_access_token:
+        return jsonify({
+            "ok": False,
+            "error": "Zerodha access token missing. Open /zerodha-login and authenticate first."
+        }), 401
+
+    try:
+        # 1) Spot quote
+        spot_data = _zerodha_json_get(
+            "https://api.kite.trade/quote/ltp",
+            params=[("i", "NSE:NIFTY 50")],
+        )
+        spot_row = spot_data.get("NSE:NIFTY 50") or {}
+        spot = float(spot_row.get("last_price"))
+
+        # 2) NFO instrument dump. Zerodha recommends refreshing this daily.
+        inst_resp = requests.get(
+            "https://api.kite.trade/instruments/NFO",
+            headers=_zerodha_headers(),
+            timeout=35,
+        )
+        if inst_resp.status_code >= 400:
+            raise RuntimeError(f"NFO instrument dump failed: HTTP {inst_resp.status_code}")
+
+        reader = csv.DictReader(io.StringIO(inst_resp.text))
+        today_ist = datetime.now(ZERODHA_IST).date()
+        nifty_options = []
+
+        for row in reader:
+            if (row.get("name") or "").strip().upper() != "NIFTY":
+                continue
+            itype = (row.get("instrument_type") or "").strip().upper()
+            if itype not in {"CE", "PE"}:
+                continue
+            expiry_txt = (row.get("expiry") or "").strip()
+            if not expiry_txt:
+                continue
+            try:
+                expiry_date = datetime.strptime(expiry_txt, "%Y-%m-%d").date()
+                strike = float(row.get("strike") or 0)
+            except Exception:
+                continue
+            if expiry_date < today_ist:
+                continue
+            nifty_options.append({
+                "tradingsymbol": (row.get("tradingsymbol") or "").strip(),
+                "exchange": (row.get("exchange") or "NFO").strip() or "NFO",
+                "instrument_token": int(float(row.get("instrument_token") or 0)),
+                "expiry": expiry_date,
+                "strike": strike,
+                "instrument_type": itype,
+                "lot_size": int(float(row.get("lot_size") or 0)),
+            })
+
+        if not nifty_options:
+            raise RuntimeError("No active NIFTY CE/PE contracts found in NFO instrument dump")
+
+        nearest_expiry = min(x["expiry"] for x in nifty_options)
+        expiry_rows = [x for x in nifty_options if x["expiry"] == nearest_expiry]
+        strikes = sorted({x["strike"] for x in expiry_rows})
+        if len(strikes) < 5:
+            raise RuntimeError("Nearest NIFTY expiry has fewer than 5 strikes in instrument dump")
+
+        # Pick the available strike closest to spot, then 2 strikes on each side.
+        atm_index = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+        if atm_index < 2 or atm_index > len(strikes) - 3:
+            raise RuntimeError("Could not form ATM +/- 2 strike basket from available strikes")
+
+        selected_strikes = strikes[atm_index - 2: atm_index + 3]
+        atm_strike = strikes[atm_index]
+
+        selected_rows = [
+            x for x in expiry_rows
+            if x["strike"] in selected_strikes and x["instrument_type"] in {"CE", "PE"}
+        ]
+
+        # Expect 5 CE + 5 PE.
+        quote_keys = [f"{x['exchange']}:{x['tradingsymbol']}" for x in selected_rows]
+        quote_data = _zerodha_json_get(
+            "https://api.kite.trade/quote",
+            params=[("i", key) for key in quote_keys],
+        )
+
+        contracts = []
+        for x in sorted(selected_rows, key=lambda r: (r["strike"], r["instrument_type"])):
+            key = f"{x['exchange']}:{x['tradingsymbol']}"
+            q = quote_data.get(key) or {}
+            contracts.append({
+                "key": key,
+                "strike": x["strike"],
+                "type": x["instrument_type"],
+                "expiry": x["expiry"].isoformat(),
+                "lot_size": x["lot_size"],
+                "instrument_token": x["instrument_token"],
+                "last_price": q.get("last_price"),
+                "oi_raw": q.get("oi"),
+                "oi_lots": (
+                    (q.get("oi") / x["lot_size"])
+                    if isinstance(q.get("oi"), (int, float)) and x["lot_size"]
+                    else None
+                ),
+                "oi_day_high": q.get("oi_day_high"),
+                "oi_day_low": q.get("oi_day_low"),
+            })
+
+        ce_oi_raw = sum((c.get("oi_raw") or 0) for c in contracts if c["type"] == "CE")
+        pe_oi_raw = sum((c.get("oi_raw") or 0) for c in contracts if c["type"] == "PE")
+
+        return jsonify({
+            "ok": True,
+            "mode": "READ_ONLY_TEST",
+            "nifty_spot": spot,
+            "nearest_expiry": nearest_expiry.isoformat(),
+            "atm_strike": atm_strike,
+            "selected_strikes": selected_strikes,
+            "contracts_returned": len(contracts),
+            "ce_total_oi_raw": ce_oi_raw,
+            "pe_total_oi_raw": pe_oi_raw,
+            "contracts": contracts,
+            "note": "This endpoint only verifies spot, expiry, fixed 5-strike selection and current OI. COI baseline/threshold logic is not enabled yet.",
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+        }), 500
 
 
 @app.get("/")
