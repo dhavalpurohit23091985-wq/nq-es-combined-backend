@@ -92,33 +92,78 @@ def discover_nvda_pair() -> str:
         log(f"[PAIR] using override {PAIR_OVERRIDE}")
         return PAIR_OVERRIDE
 
-    r = HTTP.get(
-        ACTIVE_URL,
-        params=[("margin_currency_short_name[]", "USDT")],
-        timeout=15,
-    )
-    r.raise_for_status()
-    instruments = r.json()
-
-    if not isinstance(instruments, list):
-        raise RuntimeError(f"Unexpected active_instruments response: {type(instruments)}")
-
-    matches = [
-        str(x) for x in instruments
-        if "NVDA" in str(x).upper()
-    ]
-
-    if not matches:
-        raise RuntimeError(
-            "No active CoinDCX futures instrument containing 'NVDA' was found."
+    # 1) Legacy/crypto futures active-instruments endpoint.
+    active_matches = []
+    try:
+        r = HTTP.get(
+            ACTIVE_URL,
+            params=[("margin_currency_short_name[]", "USDT")],
+            timeout=15,
         )
+        r.raise_for_status()
+        instruments = r.json()
+        if isinstance(instruments, list):
+            active_matches = [
+                str(x) for x in instruments
+                if "NVDA" in str(x).upper()
+            ]
+            log(f"[PAIR DISCOVERY] active_instruments NVDA matches={active_matches}")
+        else:
+            log(f"[PAIR DISCOVERY] active_instruments unexpected type={type(instruments)}")
+    except Exception as exc:
+        log(f"[PAIR DISCOVERY] active_instruments failed: {exc}")
 
-    preferred = next(
-        (x for x in matches if x.upper() == "B-NVDA_USDT"),
-        matches[0],
+    if active_matches:
+        preferred = next(
+            (x for x in active_matches if x.upper() == "B-NVDA_USDT"),
+            active_matches[0],
+        )
+        log(f"[PAIR] selected from active_instruments={preferred}")
+        return preferred
+
+    # 2) Fallback: CoinDCX public real-time futures price map.
+    # Global Futures may not appear in the legacy active_instruments list.
+    current_prices_url = (
+        "https://public.coindcx.com/market_data/v3/current_prices/futures/rt"
     )
-    log(f"[PAIR] NVDA candidates={matches} | selected={preferred}")
-    return preferred
+    try:
+        r = HTTP.get(current_prices_url, timeout=15)
+        r.raise_for_status()
+        payload = r.json()
+        prices = payload.get("prices", {}) if isinstance(payload, dict) else {}
+
+        price_matches = [
+            str(pair) for pair in prices.keys()
+            if "NVDA" in str(pair).upper()
+        ]
+        log(f"[PAIR DISCOVERY] current_prices NVDA matches={price_matches}")
+
+        if price_matches:
+            preferred = next(
+                (x for x in price_matches if x.upper() == "B-NVDA_USDT"),
+                price_matches[0],
+            )
+            log(f"[PAIR] selected from current_prices={preferred}")
+            return preferred
+
+        # Useful diagnostic if CoinDCX names Global Futures differently.
+        global_like = []
+        for pair, info in prices.items():
+            haystack = f"{pair} {info}".upper()
+            if any(token in haystack for token in ("NVIDIA", "NVDA")):
+                global_like.append(str(pair))
+        if global_like:
+            log(f"[PAIR DISCOVERY] NVIDIA-like candidates={global_like}")
+
+    except Exception as exc:
+        log(f"[PAIR DISCOVERY] current_prices failed: {exc}")
+
+    raise RuntimeError(
+        "NVDA was not exposed by CoinDCX's documented futures active-instruments "
+        "or public current-prices endpoints. The app's Global Futures product may "
+        "use a separate API/symbol namespace. Set COINDCX_PAIR only after the exact "
+        "Global Futures API symbol is confirmed."
+    )
 
 
 def get_candles(pair: str, start_utc: datetime, end_utc: datetime) -> list:
