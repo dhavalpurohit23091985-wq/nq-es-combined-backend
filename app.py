@@ -2507,12 +2507,13 @@ def zerodha_nifty_coi_monitor():
         current_ce_above = snap["ce_coi_raw"] >= threshold
         current_pe_above = snap["pe_coi_raw"] >= threshold
 
-        # First observation initializes current threshold state silently.
-        # This avoids a duplicate alert after a service deploy/restart while
-        # COI is already above +1L.
+        # First successful observation of a NEW trading day must not suppress
+        # a threshold that has already been crossed since the 09:15 baseline.
+        # Same-day deploy/restart duplicates are still prevented because the
+        # persisted state keeps initialized=True plus the last ce_above/pe_above.
         if not state.get("initialized"):
-            ce_cross = False
-            pe_cross = False
+            ce_cross = current_ce_above
+            pe_cross = current_pe_above
             state["initialized"] = True
         else:
             ce_cross = (not bool(state.get("ce_above"))) and current_ce_above
