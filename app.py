@@ -2471,15 +2471,16 @@ def _zerodha_nifty_snapshot():
 @app.get("/zerodha-nifty-coi-monitor")
 def zerodha_nifty_coi_monitor():
     """
-    Read-only NIFTY COI monitor.
+    Read-only NIFTY NET COI monitor.
 
     Fixed rules:
       - NIFTY 09:15 IST open determines ATM.
       - Fixed basket = ATM +/- 2 strikes, nearest expiry, 5 strikes total.
       - 09:15 option OI is the baseline for the whole session.
       - CE/PE COI = current total OI - 09:15 total OI.
-      - Pushover event fires when CE or PE crosses upward through +100,000 raw COI.
-      - Same side staying above threshold does not repeat-alert.
+      - NET GAP = CE COI - PE COI.
+      - Alert when NET GAP crosses +100,000 (CE dominant) or -100,000 (PE dominant).
+      - Same net side does not repeat-alert; opposite threshold is a flip.
     """
     if not zerodha_access_token:
         return jsonify({
@@ -2492,66 +2493,62 @@ def zerodha_nifty_coi_monitor():
         threshold = ZERODHA_NIFTY_COI_THRESHOLD
         state = _zerodha_read_nifty_state()
 
-        # New trading date => start fresh crossing state.
         if state.get("session_date") != snap["session_date"]:
             prior_baseline = state.get("baseline") if isinstance(state, dict) else None
             state = {
                 "session_date": snap["session_date"],
                 "initialized": False,
-                "ce_above": False,
-                "pe_above": False,
+                "net_state": 0,
             }
             if isinstance(prior_baseline, dict) and prior_baseline.get("session_date") == snap["session_date"]:
                 state["baseline"] = prior_baseline
 
-        current_ce_above = snap["ce_coi_raw"] >= threshold
-        current_pe_above = snap["pe_coi_raw"] >= threshold
+        gap = snap["gap_raw"]  # CE COI - PE COI
+        current_net_state = 1 if gap >= threshold else (-1 if gap <= -threshold else 0)
 
-        # First successful observation of a NEW trading day must not suppress
-        # a threshold that has already been crossed since the 09:15 baseline.
-        # Same-day deploy/restart duplicates are still prevented because the
-        # persisted state keeps initialized=True plus the last ce_above/pe_above.
+        # Fresh trading day: if the first successful observation is already
+        # outside +/-1L, allow that first net-dominance alert.
         if not state.get("initialized"):
-            ce_cross = current_ce_above
-            pe_cross = current_pe_above
+            net_cross = current_net_state != 0
             state["initialized"] = True
         else:
-            ce_cross = (not bool(state.get("ce_above"))) and current_ce_above
-            pe_cross = (not bool(state.get("pe_above"))) and current_pe_above
+            previous_net_state = int(state.get("net_state", 0) or 0)
+            net_cross = current_net_state != 0 and current_net_state != previous_net_state
 
         alert_sent = False
         alert_title = None
         winner = None
 
-        if ce_cross or pe_cross:
-            if ce_cross and pe_cross:
-                if snap["ce_coi_raw"] > snap["pe_coi_raw"]:
-                    winner = "CE"
-                elif snap["pe_coi_raw"] > snap["ce_coi_raw"]:
-                    winner = "PE"
-                else:
-                    winner = "BOTH"
-                alert_title = "NIFTY CE + PE COI HIT +1L"
-            elif ce_cross:
+        if net_cross:
+            if current_net_state == 1:
                 winner = "CE"
-                alert_title = "NIFTY CE COI WINS +1L"
+                alert_title = "NIFTY COI CE WINS +1L NET"
             else:
                 winner = "PE"
-                alert_title = "NIFTY PE COI WINS +1L"
+                alert_title = "NIFTY COI PE WINS +1L NET"
 
             strikes_text = " | ".join(
                 f"{int(x) if float(x).is_integer() else x:g}"
                 for x in snap["selected_strikes"]
             )
             move = snap["nifty_move"]
-            gap = snap["gap_raw"]
+
+            # Percentage share is based on absolute CE/PE COI magnitude so the
+            # display remains meaningful even if one side's COI is negative.
+            ce_abs = abs(snap["ce_coi_raw"])
+            pe_abs = abs(snap["pe_coi_raw"])
+            total_abs = ce_abs + pe_abs
+            if total_abs > 0:
+                ce_pct = ce_abs / total_abs * 100.0
+                pe_pct = pe_abs / total_abs * 100.0
+            else:
+                ce_pct = 0.0
+                pe_pct = 0.0
 
             message = (
                 f"SOURCE ZERODHA | WINNER {winner} | "
-                f"CE COI {snap['ce_coi_raw']:+,d} RAW "
-                f"({snap['ce_coi_lots']:+,.2f} lots) | "
-                f"PE COI {snap['pe_coi_raw']:+,d} RAW "
-                f"({snap['pe_coi_lots']:+,.2f} lots) | "
+                f"CE COI {snap['ce_coi_raw']:+,d} ({ce_pct:.2f}%) | "
+                f"PE COI {snap['pe_coi_raw']:+,d} ({pe_pct:.2f}%) | "
                 f"GAP {gap:+,d} | "
                 f"NIFTY {snap['nifty_now']:,.2f} | "
                 f"NIFTY MOVE {move:+,.2f} pts | "
@@ -2564,8 +2561,8 @@ def zerodha_nifty_coi_monitor():
 
         state.update({
             "session_date": snap["session_date"],
-            "ce_above": current_ce_above,
-            "pe_above": current_pe_above,
+            "net_state": current_net_state,
+            "last_gap_raw": gap,
             "last_ce_coi_raw": snap["ce_coi_raw"],
             "last_pe_coi_raw": snap["pe_coi_raw"],
             "last_checked_at_ist": datetime.now(ZERODHA_IST).isoformat(),
@@ -2575,15 +2572,17 @@ def zerodha_nifty_coi_monitor():
 
         return jsonify({
             "ok": True,
-            "mode": "READ_ONLY_COI_MONITOR",
+            "mode": "READ_ONLY_NET_COI_MONITOR",
             "threshold_raw": threshold,
-            "alert_triggered": bool(ce_cross or pe_cross),
+            "alert_triggered": bool(net_cross),
             "alert_sent": alert_sent,
             "alert_title": alert_title,
             "winner": winner,
+            "net_gap_raw": gap,
             "state": {
-                "ce_above_threshold": current_ce_above,
-                "pe_above_threshold": current_pe_above,
+                "net_state": current_net_state,
+                "ce_net_dominant": current_net_state == 1,
+                "pe_net_dominant": current_net_state == -1,
             },
             **snap,
         })
