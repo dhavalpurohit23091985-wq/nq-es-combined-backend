@@ -377,6 +377,16 @@ def usd(x):
     return f"${x:,.2f}"
 
 
+def side_percentages(long_value, short_value):
+    total = float(long_value) + float(short_value)
+    if total <= 0:
+        return 0.0, 0.0
+
+    long_pct = float(long_value) / total * 100.0
+    short_pct = float(short_value) / total * 100.0
+    return long_pct, short_pct
+
+
 def threshold_for(asset):
     return BTC_THRESHOLD_USD if asset == "BTC" else XAU_THRESHOLD_USD
 
@@ -517,18 +527,24 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_
         else:
             title = f"{asset} DIRECT SHORT WINS +{threshold_m:g}M"
 
+        long_pct, short_pct = side_percentages(long_total, short_total)
+
         lines = [
-            f"LONG: {usd(long_total)}",
-            f"SHORT: {usd(short_total)}",
+            f"LONG: {usd(long_total)} ({long_pct:.2f}%)",
+            f"SHORT: {usd(short_total)} ({short_pct:.2f}%)",
             f"GAP: {usd(gap)}",
             "",
         ]
 
         for ex in EXCHANGES:
+            ex_long = by_exchange[asset][ex]["long"]
+            ex_short = by_exchange[asset][ex]["short"]
+            ex_long_pct, ex_short_pct = side_percentages(ex_long, ex_short)
+
             lines.append(
                 f"{ex.title():7s} "
-                f"L {usd(by_exchange[asset][ex]['long'])} | "
-                f"S {usd(by_exchange[asset][ex]['short'])}"
+                f"L {usd(ex_long)} ({ex_long_pct:.2f}%) | "
+                f"S {usd(ex_short)} ({ex_short_pct:.2f}%)"
             )
 
         await asyncio.to_thread(
