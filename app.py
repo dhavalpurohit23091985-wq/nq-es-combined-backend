@@ -24,6 +24,7 @@ PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY")
 CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
+DIRECT_LIQ_SECRET = os.environ.get("DIRECT_LIQ_SECRET", "").strip()
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
@@ -158,6 +159,54 @@ marginpad_xau_seen_set = set()
 
 
 # ==================================================
+# COMBINED LIQUIDATION STATE - MARGINPAD + DIRECT
+# ==================================================
+# MarginPad remains the base source. The direct worker contributes only
+# supplemental exchanges: Bitget, Aster, CoinEx and Lighter.
+# Coinalyze is intentionally NOT part of this combined execution signal.
+
+COMBINED_LIQ_THRESHOLDS = {
+    "BTC": 5_000_000.0,
+    "XAU": 1_000_000.0,
+}
+
+COMBINED_DIRECT_EXCHANGES = (
+    "bitget",
+    "aster",
+    "coinex",
+    "lighter",
+)
+
+COMBINED_SOURCE_KEYS = (
+    "marginpad",
+    *COMBINED_DIRECT_EXCHANGES,
+)
+
+COMBINED_DIRECT_SEEN_MAX = 40_000
+
+combined_liq = {
+    "BTC": {"long": 0.0, "short": 0.0},
+    "XAU": {"long": 0.0, "short": 0.0},
+}
+
+combined_by_source = {
+    asset: {
+        source: {"long": 0.0, "short": 0.0}
+        for source in COMBINED_SOURCE_KEYS
+    }
+    for asset in ("BTC", "XAU")
+}
+
+combined_cycle_ref_price = {"BTC": None, "XAU": None}
+combined_latest_price = {"BTC": None, "XAU": None}
+combined_last_alert = {"BTC": None, "XAU": None}
+
+combined_direct_seen_queue = deque()
+combined_direct_seen_set = set()
+_combined_liq_lock = threading.RLock()
+
+
+# ==================================================
 # XAU FRESH LIQUIDATION SETTINGS
 # ==================================================
 
@@ -209,6 +258,256 @@ def send_pushover(title, message):
 
     except requests.RequestException:
         return False
+
+
+def _combined_remember_direct_event(event_key):
+    if not event_key:
+        return False
+
+    if event_key in combined_direct_seen_set:
+        return False
+
+    if len(combined_direct_seen_queue) >= COMBINED_DIRECT_SEEN_MAX:
+        old = combined_direct_seen_queue.popleft()
+        combined_direct_seen_set.discard(old)
+
+    combined_direct_seen_queue.append(event_key)
+    combined_direct_seen_set.add(event_key)
+    return True
+
+
+def _combined_reset_asset(asset, reset_price=None):
+    global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
+    global marginpad_btc_cycle_ref_price
+    global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
+    global marginpad_xau_cycle_ref_price
+
+    combined_liq[asset]["long"] = 0.0
+    combined_liq[asset]["short"] = 0.0
+
+    for source in COMBINED_SOURCE_KEYS:
+        combined_by_source[asset][source]["long"] = 0.0
+        combined_by_source[asset][source]["short"] = 0.0
+
+    combined_cycle_ref_price[asset] = reset_price
+
+    # Keep the old MarginPad read-only/debug fields aligned with the
+    # current combined cycle instead of letting them grow independently.
+    if asset == "BTC":
+        marginpad_btc_long_cumulative = 0.0
+        marginpad_btc_short_cumulative = 0.0
+        marginpad_btc_cycle_ref_price = reset_price
+    else:
+        marginpad_xau_long_cumulative = 0.0
+        marginpad_xau_short_cumulative = 0.0
+        marginpad_xau_cycle_ref_price = reset_price
+
+
+def add_combined_liquidation_batch(
+    asset,
+    source,
+    exchange,
+    long_usd,
+    short_usd,
+    event_key=None,
+    price=None,
+):
+    """Add one atomic batch to the shared MarginPad + Direct cycle.
+
+    MarginPad calls this once per successfully processed closed minute with
+    both sides together. The direct worker calls the HTTP endpoint once per
+    liquidation event, so only one side is normally non-zero there.
+    """
+
+    global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
+    global marginpad_btc_last_alert_snapshot
+    global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
+
+    asset = str(asset or "").upper().strip()
+    source = str(source or "").lower().strip()
+    exchange = str(exchange or source or "").lower().strip()
+
+    if asset not in COMBINED_LIQ_THRESHOLDS:
+        return {"ok": False, "error": "unsupported_asset"}
+
+    if source == "marginpad":
+        source_key = "marginpad"
+    elif source == "direct" and exchange in COMBINED_DIRECT_EXCHANGES:
+        source_key = exchange
+    else:
+        return {"ok": False, "error": "unsupported_source"}
+
+    try:
+        long_usd = float(long_usd or 0.0)
+        short_usd = float(short_usd or 0.0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_amount"}
+
+    if long_usd < 0 or short_usd < 0:
+        return {"ok": False, "error": "negative_amount"}
+
+    alert_snapshot = None
+
+    with _combined_liq_lock:
+        if source == "direct":
+            if not _combined_remember_direct_event(str(event_key or "")):
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "asset": asset,
+                    "source": source_key,
+                    "combined_long_usd": round(combined_liq[asset]["long"], 2),
+                    "combined_short_usd": round(combined_liq[asset]["short"], 2),
+                    "alert_sent": False,
+                }
+
+        if price is not None:
+            try:
+                p = float(price)
+                if p > 0:
+                    combined_latest_price[asset] = p
+                    if combined_cycle_ref_price[asset] is None:
+                        combined_cycle_ref_price[asset] = p
+            except (TypeError, ValueError):
+                pass
+
+        combined_liq[asset]["long"] += long_usd
+        combined_liq[asset]["short"] += short_usd
+        combined_by_source[asset][source_key]["long"] += long_usd
+        combined_by_source[asset][source_key]["short"] += short_usd
+
+        if source_key == "marginpad":
+            if asset == "BTC":
+                marginpad_btc_long_cumulative += long_usd
+                marginpad_btc_short_cumulative += short_usd
+            else:
+                marginpad_xau_long_cumulative += long_usd
+                marginpad_xau_short_cumulative += short_usd
+
+        cycle_long = combined_liq[asset]["long"]
+        cycle_short = combined_liq[asset]["short"]
+        threshold = COMBINED_LIQ_THRESHOLDS[asset]
+        long_hit = cycle_long >= threshold
+        short_hit = cycle_short >= threshold
+
+        if long_hit or short_hit:
+            if long_hit and short_hit:
+                winner = "BOTH HIT SAME CYCLE"
+                title = f"{asset} COMBINED BOTH HIT +{threshold/1_000_000:g}M"
+            elif long_hit:
+                winner = "LONG"
+                title = f"{asset} COMBINED LONG WINS +{threshold/1_000_000:g}M"
+            else:
+                winner = "SHORT"
+                title = f"{asset} COMBINED SHORT WINS +{threshold/1_000_000:g}M"
+
+            cycle_total = cycle_long + cycle_short
+            long_pct = (cycle_long / cycle_total * 100.0) if cycle_total > 0 else 0.0
+            short_pct = (cycle_short / cycle_total * 100.0) if cycle_total > 0 else 0.0
+            gap = abs(cycle_long - cycle_short)
+
+            source_lines = []
+            for src_name in COMBINED_SOURCE_KEYS:
+                src_long = combined_by_source[asset][src_name]["long"]
+                src_short = combined_by_source[asset][src_name]["short"]
+                if src_long > 0 or src_short > 0:
+                    label = "MarginPad" if src_name == "marginpad" else src_name.title()
+                    source_lines.append(
+                        f"{label}: L ${src_long:,.0f} | S ${src_short:,.0f}"
+                    )
+
+            current_price = combined_latest_price.get(asset)
+            ref_price = combined_cycle_ref_price.get(asset)
+            move = None
+            if current_price is not None and ref_price is not None:
+                move = abs(current_price - ref_price)
+
+            alert_snapshot = {
+                "asset": asset,
+                "winner": winner,
+                "title": title,
+                "long": cycle_long,
+                "short": cycle_short,
+                "gap": gap,
+                "long_pct": long_pct,
+                "short_pct": short_pct,
+                "price": current_price,
+                "move": move,
+                "sources": source_lines,
+                "ts": int(time.time()),
+            }
+
+            combined_last_alert[asset] = dict(alert_snapshot)
+
+            if asset == "BTC":
+                marginpad_btc_last_alert_snapshot = {
+                    "ts": int(time.time()),
+                    "long": combined_by_source[asset]["marginpad"]["long"],
+                    "short": combined_by_source[asset]["marginpad"]["short"],
+                    "winner": winner,
+                }
+
+            _combined_reset_asset(asset, current_price)
+
+        result = {
+            "ok": True,
+            "duplicate": False,
+            "asset": asset,
+            "source": source_key,
+            "combined_long_usd": round(cycle_long, 2),
+            "combined_short_usd": round(cycle_short, 2),
+            "threshold_usd": threshold,
+            "winner": alert_snapshot["winner"] if alert_snapshot else None,
+            "alert_sent": False,
+            "reset": bool(alert_snapshot),
+        }
+
+    if alert_snapshot:
+        price_text = "NA"
+        if alert_snapshot["price"] is not None:
+            if asset == "BTC":
+                price_text = f"{alert_snapshot['price']:,.0f}"
+            else:
+                price_text = f"{alert_snapshot['price']:,.2f}"
+
+        move_text = "NA"
+        if alert_snapshot["move"] is not None:
+            move_text = (
+                f"{alert_snapshot['move']:,.0f} pts"
+                if asset == "BTC"
+                else f"{alert_snapshot['move']:,.2f} pts"
+            )
+
+        breakdown = "\n".join(alert_snapshot["sources"]) or "No source breakdown"
+        message = (
+            f"SOURCE COMBINED | WINNER {alert_snapshot['winner']} | "
+            f"LONG ${alert_snapshot['long']:,.0f} ({alert_snapshot['long_pct']:.2f}%) | "
+            f"SHORT ${alert_snapshot['short']:,.0f} ({alert_snapshot['short_pct']:.2f}%) | "
+            f"GAP ${alert_snapshot['gap']:,.0f} | "
+            f"{asset} {price_text} | {asset} MOVE {move_text}\n"
+            f"{breakdown}"
+        )
+
+        sent = send_pushover(alert_snapshot["title"], message)
+        result["alert_sent"] = sent
+
+        print(
+            f"[COMBINED ALERT] {alert_snapshot['title']} "
+            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} "
+            f"sent={sent}",
+            flush=True,
+        )
+
+    else:
+        print(
+            f"[COMBINED {asset}] {source_key.upper()} "
+            f"+L=${long_usd:,.0f} +S=${short_usd:,.0f} | "
+            f"TOTAL L=${result['combined_long_usd']:,.0f} "
+            f"S=${result['combined_short_usd']:,.0f}",
+            flush=True,
+        )
+
+    return result
 
 
 # ==================================================
@@ -1286,6 +1585,15 @@ def _runtime_state_payload():
             'seen_queue': list(marginpad_xau_seen_queue),
         },
 
+        'combined_liquidation': {
+            'totals': combined_liq,
+            'by_source': combined_by_source,
+            'cycle_ref_price': combined_cycle_ref_price,
+            'latest_price': combined_latest_price,
+            'last_alert': combined_last_alert,
+            'direct_seen_queue': list(combined_direct_seen_queue),
+        },
+
         'nvda': {
             'session_date_ist': nvda_session_date_ist,
             'session_open': nvda_session_open,
@@ -1325,6 +1633,9 @@ def _load_runtime_state():
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
     global marginpad_xau_cycle_ref_price, marginpad_xau_processed_through_ms
     global marginpad_xau_seen_queue, marginpad_xau_seen_set
+    global combined_liq, combined_by_source
+    global combined_cycle_ref_price, combined_latest_price, combined_last_alert
+    global combined_direct_seen_queue, combined_direct_seen_set
     global nvda_session_date_ist, nvda_session_open
     global nvda_state, nvda_last_processed_candle_ts
 
@@ -1369,6 +1680,33 @@ def _load_runtime_state():
         marginpad_xau_seen_queue = deque(mxau_seen)
         marginpad_xau_seen_set = set(mxau_seen)
 
+        comb = data.get('combined_liquidation') or {}
+        saved_totals = comb.get('totals') or {}
+        saved_by_source = comb.get('by_source') or {}
+
+        for asset in ("BTC", "XAU"):
+            asset_totals = saved_totals.get(asset) or {}
+            combined_liq[asset]["long"] = float(asset_totals.get("long", 0.0) or 0.0)
+            combined_liq[asset]["short"] = float(asset_totals.get("short", 0.0) or 0.0)
+
+            asset_sources = saved_by_source.get(asset) or {}
+            for source in COMBINED_SOURCE_KEYS:
+                source_totals = asset_sources.get(source) or {}
+                combined_by_source[asset][source]["long"] = float(source_totals.get("long", 0.0) or 0.0)
+                combined_by_source[asset][source]["short"] = float(source_totals.get("short", 0.0) or 0.0)
+
+        saved_ref = comb.get('cycle_ref_price') or {}
+        saved_latest = comb.get('latest_price') or {}
+        saved_last_alert = comb.get('last_alert') or {}
+        for asset in ("BTC", "XAU"):
+            combined_cycle_ref_price[asset] = saved_ref.get(asset)
+            combined_latest_price[asset] = saved_latest.get(asset)
+            combined_last_alert[asset] = saved_last_alert.get(asset)
+
+        direct_seen = list(comb.get('direct_seen_queue') or [])[-COMBINED_DIRECT_SEEN_MAX:]
+        combined_direct_seen_queue = deque(direct_seen)
+        combined_direct_seen_set = set(direct_seen)
+
         nvd = data.get('nvda') or {}
         nvda_session_date_ist = nvd.get('session_date_ist')
         nvda_session_open = nvd.get('session_open')
@@ -1381,6 +1719,8 @@ def _load_runtime_state():
             f'BTC M={marginpad_btc_long_cumulative:.0f}/{marginpad_btc_short_cumulative:.0f} | '
             f'XAU C={xau_long_cumulative:.0f}/{xau_short_cumulative:.0f} | '
             f'XAU M={marginpad_xau_long_cumulative:.0f}/{marginpad_xau_short_cumulative:.0f} | '
+            f'COMB BTC={combined_liq["BTC"]["long"]:.0f}/{combined_liq["BTC"]["short"]:.0f} | '
+            f'COMB XAU={combined_liq["XAU"]["long"]:.0f}/{combined_liq["XAU"]["short"]:.0f} | '
             f'NVDA state={nvda_state}',
             flush=True
         )
@@ -4187,18 +4527,12 @@ def process_marginpad_btc(
     closed_minute_ts
 ):
 
-    global marginpad_btc_long_cumulative
-    global marginpad_btc_short_cumulative
     global marginpad_btc_cycle_ref_price
     global marginpad_btc_processed_through_ms
-    global marginpad_btc_last_alert_snapshot
 
-    btc_price, price_error = (
-        get_marginpad_btc_price()
-    )
+    btc_price, price_error = get_marginpad_btc_price()
 
     if price_error:
-
         return {
             "ok": False,
             "asset": "BTC",
@@ -4207,413 +4541,108 @@ def process_marginpad_btc(
             "error": price_error
         }
 
-    closed_end_ms = (
-        closed_minute_ts
-        + 59
-    ) * 1000 + 999
+    closed_end_ms = (closed_minute_ts + 59) * 1000 + 999
 
-    if (
-        marginpad_btc_processed_through_ms
-        is None
-    ):
+    if marginpad_btc_processed_through_ms is None:
+        marginpad_btc_processed_through_ms = closed_end_ms
+        marginpad_btc_cycle_ref_price = btc_price
 
-        # Initialize at the current closed minute so old
-        # events are not counted on first deployment/restart.
-        marginpad_btc_processed_through_ms = (
-            closed_end_ms
-        )
-
-        marginpad_btc_cycle_ref_price = (
-            btc_price
-        )
-
-        marginpad_btc_long_cumulative = 0.0
-        marginpad_btc_short_cumulative = 0.0
+        with _combined_liq_lock:
+            combined_latest_price["BTC"] = btc_price
+            if combined_cycle_ref_price["BTC"] is None:
+                combined_cycle_ref_price["BTC"] = btc_price
 
         return {
             "ok": True,
             "asset": "BTC",
             "source": "MarginPad",
             "initialized": True,
-
-            "btc_price":
-                round(
-                    btc_price,
-                    2
-                ),
-
-            "long_cumulative_usd":
-                0,
-
-            "short_cumulative_usd":
-                0,
-
-            "cycle_reference_price":
-                marginpad_btc_cycle_ref_price,
-
-            "processed_through_ms":
-                marginpad_btc_processed_through_ms
+            "btc_price": round(btc_price, 2),
+            "combined_long_usd": round(combined_liq["BTC"]["long"], 2),
+            "combined_short_usd": round(combined_liq["BTC"]["short"], 2),
+            "cycle_reference_price": combined_cycle_ref_price["BTC"],
+            "processed_through_ms": marginpad_btc_processed_through_ms
         }
 
-    if (
-        closed_end_ms
-        <=
-        marginpad_btc_processed_through_ms
-    ):
+    if closed_end_ms <= marginpad_btc_processed_through_ms:
+        with _combined_liq_lock:
+            combined_latest_price["BTC"] = btc_price
 
         return {
             "ok": True,
             "asset": "BTC",
             "source": "MarginPad",
             "new_closed_minute": False,
-
-            "btc_price":
-                round(
-                    btc_price,
-                    2
-                ),
-
-            "long_cumulative_usd":
-                round(
-                    marginpad_btc_long_cumulative,
-                    2
-                ),
-
-            "short_cumulative_usd":
-                round(
-                    marginpad_btc_short_cumulative,
-                    2
-                ),
-
-            "cycle_reference_price":
-                marginpad_btc_cycle_ref_price,
-
-            "processed_through_ms":
-                marginpad_btc_processed_through_ms
+            "btc_price": round(btc_price, 2),
+            "combined_long_usd": round(combined_liq["BTC"]["long"], 2),
+            "combined_short_usd": round(combined_liq["BTC"]["short"], 2),
+            "cycle_reference_price": combined_cycle_ref_price["BTC"],
+            "processed_through_ms": marginpad_btc_processed_through_ms
         }
 
-    fresh, error = (
-        get_marginpad_fresh_btc_liquidations(
-            marginpad_btc_processed_through_ms,
-            closed_minute_ts
-        )
+    fresh, error = get_marginpad_fresh_btc_liquidations(
+        marginpad_btc_processed_through_ms,
+        closed_minute_ts
     )
 
     if error:
-
         return {
             "ok": False,
             "asset": "BTC",
             "source": "MarginPad",
             "alert_sent": False,
-
-            "long_cumulative_usd":
-                round(
-                    marginpad_btc_long_cumulative,
-                    2
-                ),
-
-            "short_cumulative_usd":
-                round(
-                    marginpad_btc_short_cumulative,
-                    2
-                ),
-
-            "processed_through_ms":
-                marginpad_btc_processed_through_ms,
-
-            "error":
-                error
+            "combined_long_usd": round(combined_liq["BTC"]["long"], 2),
+            "combined_short_usd": round(combined_liq["BTC"]["short"], 2),
+            "processed_through_ms": marginpad_btc_processed_through_ms,
+            "error": error
         }
 
-    fresh_long = (
-        fresh["fresh_long_usd"]
-    )
-
-    fresh_short = (
-        fresh["fresh_short_usd"]
-    )
-
-    marginpad_btc_long_cumulative += (
-        fresh_long
-    )
-
-    marginpad_btc_short_cumulative += (
-        fresh_short
-    )
+    fresh_long = fresh["fresh_long_usd"]
+    fresh_short = fresh["fresh_short_usd"]
 
     # Advance only after a successful MarginPad fetch/parse.
-    marginpad_btc_processed_through_ms = (
-        closed_end_ms
+    marginpad_btc_processed_through_ms = closed_end_ms
+
+    combined_result = add_combined_liquidation_batch(
+        asset="BTC",
+        source="marginpad",
+        exchange="marginpad",
+        long_usd=fresh_long,
+        short_usd=fresh_short,
+        event_key=f"marginpad-btc|{closed_end_ms}",
+        price=btc_price,
     )
-
-    cycle_long = (
-        marginpad_btc_long_cumulative
-    )
-
-    cycle_short = (
-        marginpad_btc_short_cumulative
-    )
-
-    cycle_gap = abs(
-        cycle_long
-        -
-        cycle_short
-    )
-
-    long_hit = (
-        cycle_long
-        >=
-        MARGINPAD_BTC_LIQ_THRESHOLD
-    )
-
-    short_hit = (
-        cycle_short
-        >=
-        MARGINPAD_BTC_LIQ_THRESHOLD
-    )
-
-    alert_sent = False
-    cycle_winner = None
-
-    btc_price_move = None
-    low_move = False
-
-    if (
-        marginpad_btc_cycle_ref_price
-        is not None
-    ):
-
-        btc_price_move = abs(
-            btc_price
-            -
-            marginpad_btc_cycle_ref_price
-        )
-
-        low_move = (
-            btc_price_move
-            <
-            MARGINPAD_BTC_LOW_MOVE_POINTS
-        )
-
-    if (
-        long_hit
-        or
-        short_hit
-    ):
-
-        if (
-            long_hit
-            and
-            short_hit
-        ):
-
-            cycle_winner = (
-                "BOTH HIT SAME MINUTE"
-            )
-
-            alert_title = (
-                "BTC MARGINPAD BOTH HIT +5M"
-            )
-
-        elif long_hit:
-
-            cycle_winner = "LONG"
-
-            alert_title = (
-                "BTC MARGINPAD LONG WINS +5M"
-            )
-
-        else:
-
-            cycle_winner = "SHORT"
-
-            alert_title = (
-                "BTC MARGINPAD SHORT WINS +5M"
-            )
-
-        move_text = (
-            f"{btc_price_move:,.0f} pts"
-            if
-            btc_price_move
-            is not None
-            else
-            "NA"
-        )
-
-        low_move_text = (
-            " | LOW-MOVE YES"
-            if low_move
-            else
-            ""
-        )
-
-        cycle_total = (
-            cycle_long
-            +
-            cycle_short
-        )
-
-        long_pct = (
-            cycle_long
-            /
-            cycle_total
-            *
-            100
-        ) if cycle_total > 0 else 0
-
-        short_pct = (
-            cycle_short
-            /
-            cycle_total
-            *
-            100
-        ) if cycle_total > 0 else 0
-
-        # Save this cycle before reset so a Coinalyze alert arriving shortly
-        # afterwards can reference the completed MarginPad cycle.
-        marginpad_btc_last_alert_snapshot = {
-            "ts": closed_minute_ts,
-            "long": cycle_long,
-            "short": cycle_short,
-            "winner": cycle_winner,
-        }
-
-        reference_text = _btc_reference_text(
-            "COINALYZE",
-            closed_minute_ts
-        )
-
-        alert_sent = send_pushover(
-            alert_title,
-            (
-                f"SOURCE MARGINPAD | "
-                f"WINNER "
-                f"{cycle_winner} | "
-                f"LONG "
-                f"${cycle_long:,.0f} "
-                f"({long_pct:.2f}%) | "
-                f"SHORT "
-                f"${cycle_short:,.0f} "
-                f"({short_pct:.2f}%) | "
-                f"GAP "
-                f"${cycle_gap:,.0f} | "
-                f"BTC "
-                f"{btc_price:,.0f} | "
-                f"BTC MOVE "
-                f"{move_text}"
-                f"{low_move_text}"
-                f"\n{reference_text}"
-            )
-        )
-
-        marginpad_btc_long_cumulative = 0.0
-        marginpad_btc_short_cumulative = 0.0
-
-        marginpad_btc_cycle_ref_price = (
-            btc_price
-        )
 
     return {
         "ok": True,
         "asset": "BTC",
         "source": "MarginPad",
         "initialized": False,
-
-        "price":
-            round(
-                btc_price,
-                2
-            ),
-
-        "events_returned":
-            fresh[
-                "events_returned"
-            ],
-
-        "events_accepted":
-            fresh[
-                "events_accepted"
-            ],
-
-        "exchanges_seen":
-            fresh[
-                "exchanges_seen"
-            ],
-
-        "fresh_long_usd":
-            fresh_long,
-
-        "fresh_short_usd":
-            fresh_short,
-
-        "cycle_long_before_reset":
-            round(
-                cycle_long,
-                2
-            ),
-
-        "cycle_short_before_reset":
-            round(
-                cycle_short,
-                2
-            ),
-
-        "cycle_gap_usd":
-            round(
-                cycle_gap,
-                2
-            ),
-
-        "long_cumulative_usd":
-            round(
-                marginpad_btc_long_cumulative,
-                2
-            ),
-
-        "short_cumulative_usd":
-            round(
-                marginpad_btc_short_cumulative,
-                2
-            ),
-
-        "threshold_usd":
-            MARGINPAD_BTC_LIQ_THRESHOLD,
-
-        "cycle_winner":
-            cycle_winner,
-
-        "alert_sent":
-            alert_sent,
-
-        "price_move_points":
-            (
-                round(
-                    btc_price_move,
-                    2
-                )
-                if
-                btc_price_move
-                is not None
-                else
-                None
-            ),
-
-        "low_move":
-            low_move,
-
-        "cycle_reference_price":
-            marginpad_btc_cycle_ref_price,
-
-        "processed_through_ms":
-            marginpad_btc_processed_through_ms,
-
-        "seen_event_cache":
-            len(
-                marginpad_seen_set
-            )
+        "price": round(btc_price, 2),
+        "events_returned": fresh["events_returned"],
+        "events_accepted": fresh["events_accepted"],
+        "exchanges_seen": fresh["exchanges_seen"],
+        "fresh_long_usd": fresh_long,
+        "fresh_short_usd": fresh_short,
+        "combined_long_before_reset": combined_result["combined_long_usd"],
+        "combined_short_before_reset": combined_result["combined_short_usd"],
+        "threshold_usd": COMBINED_LIQ_THRESHOLDS["BTC"],
+        "cycle_winner": combined_result.get("winner"),
+        "alert_sent": combined_result.get("alert_sent", False),
+        "combined_reset": combined_result.get("reset", False),
+        "current_combined_long_usd": round(combined_liq["BTC"]["long"], 2),
+        "current_combined_short_usd": round(combined_liq["BTC"]["short"], 2),
+        "marginpad_long_in_current_cycle": round(marginpad_btc_long_cumulative, 2),
+        "marginpad_short_in_current_cycle": round(marginpad_btc_short_cumulative, 2),
+        "cycle_reference_price": combined_cycle_ref_price["BTC"],
+        "processed_through_ms": marginpad_btc_processed_through_ms,
+        "seen_event_cache": len(marginpad_seen_set)
     }
 
+
+# ==================================================
+# XAU PROCESSOR - MARGINPAD
+# ==================================================
 
 # ==================================================
 # XAU PROCESSOR - MARGINPAD
@@ -4623,17 +4652,12 @@ def process_marginpad_xau(
     closed_minute_ts
 ):
 
-    global marginpad_xau_long_cumulative
-    global marginpad_xau_short_cumulative
     global marginpad_xau_cycle_ref_price
     global marginpad_xau_processed_through_ms
 
-    xau_price, price_error = (
-        get_marginpad_xau_price()
-    )
+    xau_price, price_error = get_marginpad_xau_price()
 
     if price_error:
-
         return {
             "ok": False,
             "asset": "XAU",
@@ -4642,25 +4666,16 @@ def process_marginpad_xau(
             "error": price_error
         }
 
-    closed_end_ms = (
-        closed_minute_ts
-        + 59
-    ) * 1000 + 999
+    closed_end_ms = (closed_minute_ts + 59) * 1000 + 999
 
     if marginpad_xau_processed_through_ms is None:
+        marginpad_xau_processed_through_ms = closed_end_ms
+        marginpad_xau_cycle_ref_price = xau_price
 
-        # Start clean at the current closed minute so a deploy/restart
-        # cannot replay old XAU liquidation events into the new cycle.
-        marginpad_xau_processed_through_ms = (
-            closed_end_ms
-        )
-
-        marginpad_xau_cycle_ref_price = (
-            xau_price
-        )
-
-        marginpad_xau_long_cumulative = 0.0
-        marginpad_xau_short_cumulative = 0.0
+        with _combined_liq_lock:
+            combined_latest_price["XAU"] = xau_price
+            if combined_cycle_ref_price["XAU"] is None:
+                combined_cycle_ref_price["XAU"] = xau_price
 
         return {
             "ok": True,
@@ -4668,13 +4683,15 @@ def process_marginpad_xau(
             "source": "MarginPad",
             "initialized": True,
             "xau_price": round(xau_price, 2),
-            "long_cumulative_usd": 0,
-            "short_cumulative_usd": 0,
-            "cycle_reference_price": marginpad_xau_cycle_ref_price,
+            "combined_long_usd": round(combined_liq["XAU"]["long"], 2),
+            "combined_short_usd": round(combined_liq["XAU"]["short"], 2),
+            "cycle_reference_price": combined_cycle_ref_price["XAU"],
             "processed_through_ms": marginpad_xau_processed_through_ms
         }
 
     if closed_end_ms <= marginpad_xau_processed_through_ms:
+        with _combined_liq_lock:
+            combined_latest_price["XAU"] = xau_price
 
         return {
             "ok": True,
@@ -4682,40 +4699,25 @@ def process_marginpad_xau(
             "source": "MarginPad",
             "new_closed_minute": False,
             "xau_price": round(xau_price, 2),
-            "long_cumulative_usd": round(
-                marginpad_xau_long_cumulative,
-                2
-            ),
-            "short_cumulative_usd": round(
-                marginpad_xau_short_cumulative,
-                2
-            ),
-            "cycle_reference_price": marginpad_xau_cycle_ref_price,
+            "combined_long_usd": round(combined_liq["XAU"]["long"], 2),
+            "combined_short_usd": round(combined_liq["XAU"]["short"], 2),
+            "cycle_reference_price": combined_cycle_ref_price["XAU"],
             "processed_through_ms": marginpad_xau_processed_through_ms
         }
 
-    fresh, error = (
-        get_marginpad_fresh_xau_liquidations(
-            marginpad_xau_processed_through_ms,
-            closed_minute_ts
-        )
+    fresh, error = get_marginpad_fresh_xau_liquidations(
+        marginpad_xau_processed_through_ms,
+        closed_minute_ts
     )
 
     if error:
-
         return {
             "ok": False,
             "asset": "XAU",
             "source": "MarginPad",
             "alert_sent": False,
-            "long_cumulative_usd": round(
-                marginpad_xau_long_cumulative,
-                2
-            ),
-            "short_cumulative_usd": round(
-                marginpad_xau_short_cumulative,
-                2
-            ),
+            "combined_long_usd": round(combined_liq["XAU"]["long"], 2),
+            "combined_short_usd": round(combined_liq["XAU"]["short"], 2),
             "processed_through_ms": marginpad_xau_processed_through_ms,
             "error": error
         }
@@ -4723,85 +4725,18 @@ def process_marginpad_xau(
     fresh_long = fresh["fresh_long_usd"]
     fresh_short = fresh["fresh_short_usd"]
 
-    marginpad_xau_long_cumulative += fresh_long
-    marginpad_xau_short_cumulative += fresh_short
-
     # Advance only after a successful MarginPad fetch/parse.
-    marginpad_xau_processed_through_ms = (
-        closed_end_ms
+    marginpad_xau_processed_through_ms = closed_end_ms
+
+    combined_result = add_combined_liquidation_batch(
+        asset="XAU",
+        source="marginpad",
+        exchange="marginpad",
+        long_usd=fresh_long,
+        short_usd=fresh_short,
+        event_key=f"marginpad-xau|{closed_end_ms}",
+        price=xau_price,
     )
-
-    cycle_long = marginpad_xau_long_cumulative
-    cycle_short = marginpad_xau_short_cumulative
-    cycle_gap = abs(cycle_long - cycle_short)
-
-    long_hit = (
-        cycle_long >= MARGINPAD_XAU_LIQ_THRESHOLD
-    )
-
-    short_hit = (
-        cycle_short >= MARGINPAD_XAU_LIQ_THRESHOLD
-    )
-
-    alert_sent = False
-    cycle_winner = None
-
-    xau_price_move = None
-
-    if marginpad_xau_cycle_ref_price is not None:
-        xau_price_move = abs(
-            xau_price
-            - marginpad_xau_cycle_ref_price
-        )
-
-    if long_hit or short_hit:
-
-        if long_hit and short_hit:
-            cycle_winner = "BOTH HIT SAME MINUTE"
-            alert_title = "XAU MARGINPAD BOTH HIT +1M"
-
-        elif long_hit:
-            cycle_winner = "LONG"
-            alert_title = "XAU MARGINPAD LONG WINS +1M"
-
-        else:
-            cycle_winner = "SHORT"
-            alert_title = "XAU MARGINPAD SHORT WINS +1M"
-
-        move_text = (
-            f"{xau_price_move:,.2f} pts"
-            if xau_price_move is not None
-            else "NA"
-        )
-
-        cycle_total = cycle_long + cycle_short
-
-        long_pct = (
-            cycle_long / cycle_total * 100
-        ) if cycle_total > 0 else 0
-
-        short_pct = (
-            cycle_short / cycle_total * 100
-        ) if cycle_total > 0 else 0
-
-        alert_sent = send_pushover(
-            alert_title,
-            (
-                f"SOURCE MARGINPAD | "
-                f"WINNER {cycle_winner} | "
-                f"LONG ${cycle_long:,.0f} "
-                f"({long_pct:.2f}%) | "
-                f"SHORT ${cycle_short:,.0f} "
-                f"({short_pct:.2f}%) | "
-                f"GAP ${cycle_gap:,.0f} | "
-                f"XAU {xau_price:,.2f} | "
-                f"XAU MOVE {move_text}"
-            )
-        )
-
-        marginpad_xau_long_cumulative = 0.0
-        marginpad_xau_short_cumulative = 0.0
-        marginpad_xau_cycle_ref_price = xau_price
 
     return {
         "ok": True,
@@ -4814,32 +4749,25 @@ def process_marginpad_xau(
         "exchanges_seen": fresh["exchanges_seen"],
         "fresh_long_usd": fresh_long,
         "fresh_short_usd": fresh_short,
-        "cycle_long_before_reset": round(cycle_long, 2),
-        "cycle_short_before_reset": round(cycle_short, 2),
-        "cycle_gap_usd": round(cycle_gap, 2),
-        "long_cumulative_usd": round(
-            marginpad_xau_long_cumulative,
-            2
-        ),
-        "short_cumulative_usd": round(
-            marginpad_xau_short_cumulative,
-            2
-        ),
-        "threshold_usd": MARGINPAD_XAU_LIQ_THRESHOLD,
-        "cycle_winner": cycle_winner,
-        "alert_sent": alert_sent,
-        "price_move_points": (
-            round(xau_price_move, 2)
-            if xau_price_move is not None
-            else None
-        ),
-        "cycle_reference_price": marginpad_xau_cycle_ref_price,
+        "combined_long_before_reset": combined_result["combined_long_usd"],
+        "combined_short_before_reset": combined_result["combined_short_usd"],
+        "threshold_usd": COMBINED_LIQ_THRESHOLDS["XAU"],
+        "cycle_winner": combined_result.get("winner"),
+        "alert_sent": combined_result.get("alert_sent", False),
+        "combined_reset": combined_result.get("reset", False),
+        "current_combined_long_usd": round(combined_liq["XAU"]["long"], 2),
+        "current_combined_short_usd": round(combined_liq["XAU"]["short"], 2),
+        "marginpad_long_in_current_cycle": round(marginpad_xau_long_cumulative, 2),
+        "marginpad_short_in_current_cycle": round(marginpad_xau_short_cumulative, 2),
+        "cycle_reference_price": combined_cycle_ref_price["XAU"],
         "processed_through_ms": marginpad_xau_processed_through_ms,
-        "seen_event_cache": len(
-            marginpad_xau_seen_set
-        )
+        "seen_event_cache": len(marginpad_xau_seen_set)
     }
 
+
+# ==================================================
+# XAU PROCESSOR
+# ==================================================
 
 # ==================================================
 # XAU PROCESSOR
@@ -5330,6 +5258,82 @@ def btc_minute_alert():
             "retry_needed": True,
             "alert_sent": False,
             "error": str(e)
+        }), 200
+
+
+# ==================================================
+# COMBINED LIQUIDATION ENDPOINTS
+# ==================================================
+
+@app.post("/direct-liquidation-event")
+def direct_liquidation_event():
+    supplied_secret = request.headers.get("X-Direct-Liq-Secret", "").strip()
+
+    if not DIRECT_LIQ_SECRET or supplied_secret != DIRECT_LIQ_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    asset = str(data.get("asset", "")).upper().strip()
+    exchange = str(data.get("exchange", "")).lower().strip()
+    side = str(data.get("side", "")).lower().strip()
+    event_key = str(data.get("event_key") or data.get("event_id") or "").strip()
+
+    if asset not in ("BTC", "XAU"):
+        return jsonify({"ok": False, "error": "invalid_asset"}), 400
+
+    if exchange not in COMBINED_DIRECT_EXCHANGES:
+        return jsonify({"ok": False, "error": "invalid_exchange"}), 400
+
+    if side not in ("long", "short"):
+        return jsonify({"ok": False, "error": "invalid_side"}), 400
+
+    if not event_key:
+        return jsonify({"ok": False, "error": "missing_event_key"}), 400
+
+    try:
+        amount = float(data.get("notional_usd", 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_notional"}), 400
+
+    if amount <= 0:
+        return jsonify({"ok": False, "error": "invalid_notional"}), 400
+
+    result = add_combined_liquidation_batch(
+        asset=asset,
+        source="direct",
+        exchange=exchange,
+        long_usd=amount if side == "long" else 0.0,
+        short_usd=amount if side == "short" else 0.0,
+        event_key=event_key,
+        price=data.get("price"),
+    )
+
+    return jsonify(result), 200
+
+
+@app.get("/combined-liquidation-state")
+def combined_liquidation_state():
+    if not cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    with _combined_liq_lock:
+        return jsonify({
+            "ok": True,
+            "BTC": {
+                "threshold_usd": COMBINED_LIQ_THRESHOLDS["BTC"],
+                "long_usd": round(combined_liq["BTC"]["long"], 2),
+                "short_usd": round(combined_liq["BTC"]["short"], 2),
+                "by_source": combined_by_source["BTC"],
+                "last_alert": combined_last_alert["BTC"],
+            },
+            "XAU": {
+                "threshold_usd": COMBINED_LIQ_THRESHOLDS["XAU"],
+                "long_usd": round(combined_liq["XAU"]["long"], 2),
+                "short_usd": round(combined_liq["XAU"]["short"], 2),
+                "by_source": combined_by_source["XAU"],
+                "last_alert": combined_last_alert["XAU"],
+            },
+            "direct_seen_count": len(combined_direct_seen_set),
         }), 200
 
 
