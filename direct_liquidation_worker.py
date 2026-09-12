@@ -24,11 +24,15 @@ import websockets
 # - Unsupported XAU markets are skipped instead of guessed.
 # ============================================================
 
-PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "").strip()
-PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "").strip()
-
-BTC_THRESHOLD_USD = float(os.getenv("DIRECT_BTC_THRESHOLD_USD", "5000000"))
-XAU_THRESHOLD_USD = float(os.getenv("DIRECT_XAU_THRESHOLD_USD", "1000000"))
+# Combined backend owns thresholding, alerting, and cycle resets.
+COMBINED_BACKEND_URL = os.getenv(
+    "COMBINED_BACKEND_URL",
+    "https://nq-es-combined-backend.onrender.com",
+).rstrip("/")
+DIRECT_LIQ_SECRET = os.getenv("DIRECT_LIQ_SECRET", "").strip()
+DIRECT_EVENT_URL = f"{COMBINED_BACKEND_URL}/direct-liquidation-event"
+FORWARD_RETRIES = int(os.getenv("DIRECT_FORWARD_RETRIES", "3"))
+FORWARD_TIMEOUT_SECONDS = float(os.getenv("DIRECT_FORWARD_TIMEOUT_SECONDS", "20"))
 
 BITGET_WS = "wss://ws.bitget.com/v3/ws/public"
 
@@ -73,322 +77,11 @@ coinex_markets = {
 
 
 # ============================================================
-# FEED / TRANSPORT HEALTH DEBUG
-# ============================================================
-
-# These diagnostics intentionally separate:
-#   1) transport/message health (WebSocket messages or successful HTTP poll)
-#   2) last accepted liquidation event
-#
-# A quiet market can have no liquidations for many minutes while the feed
-# itself is perfectly healthy. Alert/threshold logic is unchanged.
-
-last_liq_wall = {
-    asset: {ex: None for ex in EXCHANGES}
-    for asset in ASSETS
-}
-
-last_liq_event_ts = {
-    asset: {ex: None for ex in EXCHANGES}
-    for asset in ASSETS
-}
-
-last_transport_wall = {
-    asset: {ex: None for ex in EXCHANGES}
-    for asset in ASSETS
-}
-
-transport_connected = {
-    asset: {ex: False for ex in EXCHANGES}
-    for asset in ASSETS
-}
-
-TRANSPORT_STALE_SECONDS = float(
-    os.getenv("DIRECT_TRANSPORT_STALE_SECONDS", "180")
-)
-
-LIGHTER_MAX_EVENT_AGE_SECONDS = float(
-    os.getenv("DIRECT_LIGHTER_MAX_EVENT_AGE_SECONDS", "120")
-)
-
-ALERT_COOLDOWN_SECONDS = float(
-    os.getenv("DIRECT_ALERT_COOLDOWN_SECONDS", "180")
-)
-
-last_alert_wall = {
-    "BTC": None,
-    "XAU": None,
-}
-
-RAW_EVENT_LOGS = os.getenv("DIRECT_RAW_EVENT_LOGS", "1").strip().lower() not in {
-    "0", "false", "no", "off"
-}
-
-
-# ============================================================
-# PERSISTENT RUNTIME STATE
-# ============================================================
-STATE_FILE = os.getenv(
-    "DIRECT_STATE_FILE",
-    "/var/data/direct_liquidation_state.json",
-).strip()
-
-STATE_SAVE_SECONDS = float(
-    os.getenv("DIRECT_STATE_SAVE_SECONDS", "2")
-)
-
-STATE_VERSION = 1
-state_restored_on_startup = False
-
-
-def mark_transport(asset, exchange):
-    last_transport_wall[asset][exchange] = time.time()
-    transport_connected[asset][exchange] = True
-
-
-def mark_transport_disconnected(exchange, asset=None):
-    if asset is not None:
-        transport_connected[asset][exchange] = False
-        return
-
-    for a in ASSETS:
-        transport_connected[a][exchange] = False
-
-
-def mark_liquidation(asset, exchange, event_ts=None):
-    last_liq_wall[asset][exchange] = time.time()
-    if event_ts not in (None, ""):
-        last_liq_event_ts[asset][exchange] = str(event_ts)
-
-
-def age_seconds(ts):
-    if ts is None:
-        return None
-    return max(0.0, time.time() - ts)
-
-
-def fmt_age(ts):
-    age = age_seconds(ts)
-    if age is None:
-        return "NEVER"
-    return f"{age:.0f}s"
-
-
-def transport_state(asset, exchange):
-    age = age_seconds(last_transport_wall[asset][exchange])
-
-    if not transport_connected[asset][exchange]:
-        return "DISCONNECTED"
-
-    if age is None:
-        return "CONNECTED/WAITING"
-
-    if age >= TRANSPORT_STALE_SECONDS:
-        return "STALE"
-
-    return "ALIVE"
-
-
-def event_timestamp_age_seconds(event_ts):
-    try:
-        ts = float(event_ts)
-    except (TypeError, ValueError):
-        return None
-
-    # Most exchange timestamps here are milliseconds.
-    if ts > 10_000_000_000:
-        ts /= 1000.0
-
-    return time.time() - ts
-
-
-
-# ============================================================
-# PERSISTENCE HELPERS
-# ============================================================
-
-def _copy_asset_exchange_map(source):
-    return {
-        asset: {
-            ex: source[asset][ex]
-            for ex in EXCHANGES
-        }
-        for asset in ASSETS
-    }
-
-
-def build_persistent_state():
-    return {
-        "version": STATE_VERSION,
-        "saved_at_unix": time.time(),
-        "totals": {
-            asset: {
-                "long": float(totals[asset]["long"]),
-                "short": float(totals[asset]["short"]),
-            }
-            for asset in ASSETS
-        },
-        "by_exchange": {
-            asset: {
-                ex: {
-                    "long": float(by_exchange[asset][ex]["long"]),
-                    "short": float(by_exchange[asset][ex]["short"]),
-                }
-                for ex in EXCHANGES
-            }
-            for asset in ASSETS
-        },
-        "last_alert_wall": {
-            asset: last_alert_wall[asset]
-            for asset in ASSETS
-        },
-        "last_liq_wall": _copy_asset_exchange_map(last_liq_wall),
-        "last_liq_event_ts": _copy_asset_exchange_map(last_liq_event_ts),
-        "seen_events": list(seen_queue),
-    }
-
-
-def save_persistent_state():
-    if not STATE_FILE:
-        return False
-
-    try:
-        parent = os.path.dirname(STATE_FILE)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        tmp = STATE_FILE + ".tmp"
-        payload = build_persistent_state()
-
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, separators=(",", ":"))
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp, STATE_FILE)
-        return True
-    except Exception as e:
-        print(
-            f"[PERSIST ERROR] save failed: {type(e).__name__}: {e}",
-            flush=True,
-        )
-        return False
-
-
-def load_persistent_state():
-    global state_restored_on_startup
-
-    state_restored_on_startup = False
-
-    if not STATE_FILE or not os.path.exists(STATE_FILE):
-        print(
-            f"[PERSIST] no existing state file at {STATE_FILE}; "
-            "starting with current in-memory defaults",
-            flush=True,
-        )
-        return False
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        saved_totals = data.get("totals") or {}
-        saved_by_exchange = data.get("by_exchange") or {}
-        saved_last_alert = data.get("last_alert_wall") or {}
-        saved_last_liq_wall = data.get("last_liq_wall") or {}
-        saved_last_liq_event_ts = data.get("last_liq_event_ts") or {}
-        saved_seen = data.get("seen_events") or []
-
-        for asset in ASSETS:
-            asset_totals = saved_totals.get(asset) or {}
-            totals[asset]["long"] = float(asset_totals.get("long", 0.0) or 0.0)
-            totals[asset]["short"] = float(asset_totals.get("short", 0.0) or 0.0)
-
-            asset_by_exchange = saved_by_exchange.get(asset) or {}
-            for ex in EXCHANGES:
-                ex_state = asset_by_exchange.get(ex) or {}
-                by_exchange[asset][ex]["long"] = float(
-                    ex_state.get("long", 0.0) or 0.0
-                )
-                by_exchange[asset][ex]["short"] = float(
-                    ex_state.get("short", 0.0) or 0.0
-                )
-
-                wall_state = (saved_last_liq_wall.get(asset) or {}).get(ex)
-                if wall_state is not None:
-                    try:
-                        last_liq_wall[asset][ex] = float(wall_state)
-                    except (TypeError, ValueError):
-                        pass
-
-                event_ts = (saved_last_liq_event_ts.get(asset) or {}).get(ex)
-                if event_ts not in (None, ""):
-                    last_liq_event_ts[asset][ex] = str(event_ts)
-
-            alert_wall = saved_last_alert.get(asset)
-            if alert_wall is not None:
-                try:
-                    last_alert_wall[asset] = float(alert_wall)
-                except (TypeError, ValueError):
-                    last_alert_wall[asset] = None
-
-        seen_queue.clear()
-        seen_set.clear()
-        for key in saved_seen[-SEEN_LIMIT:]:
-            try:
-                hash(key)
-            except Exception:
-                continue
-            seen_queue.append(key)
-            seen_set.add(key)
-
-        state_restored_on_startup = True
-
-        print(
-            f"[PERSIST] restored state from {STATE_FILE} | "
-            f"BTC L={usd(totals['BTC']['long'])} "
-            f"S={usd(totals['BTC']['short'])} | "
-            f"XAU L={usd(totals['XAU']['long'])} "
-            f"S={usd(totals['XAU']['short'])} | "
-            f"seen={len(seen_queue)}",
-            flush=True,
-        )
-        return True
-
-    except Exception as e:
-        print(
-            f"[PERSIST ERROR] load failed: {type(e).__name__}: {e}",
-            flush=True,
-        )
-        return False
-
-
-async def persistence_loop():
-    while True:
-        await asyncio.sleep(max(1.0, STATE_SAVE_SECONDS))
-        save_persistent_state()
-
-
-# ============================================================
 # HELPERS
 # ============================================================
 
 def usd(x):
     return f"${x:,.2f}"
-
-
-def side_percentages(long_value, short_value):
-    total = float(long_value) + float(short_value)
-    if total <= 0:
-        return 0.0, 0.0
-
-    long_pct = float(long_value) / total * 100.0
-    short_pct = float(short_value) / total * 100.0
-    return long_pct, short_pct
-
-
-def threshold_for(asset):
-    return BTC_THRESHOLD_USD if asset == "BTC" else XAU_THRESHOLD_USD
 
 
 def remember_event(key):
@@ -404,46 +97,77 @@ def remember_event(key):
     return True
 
 
-def send_pushover(title, message):
-    if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
-        print("[PUSHOVER] Missing credentials", flush=True)
-        return False
-
-    try:
-        r = requests.post(
-            "https://api.pushover.net/1/messages.json",
-            data={
-                "token": PUSHOVER_API_TOKEN,
-                "user": PUSHOVER_USER_KEY,
-                "title": title,
-                "message": message,
-                "priority": 1,
-            },
-            timeout=20,
-        )
+def forward_direct_event(asset, exchange, side, notional_usd, event_key):
+    if not DIRECT_LIQ_SECRET:
         print(
-            f"[PUSHOVER] status={r.status_code} body={r.text[:300]}",
-            flush=True,
-        )
-        return r.ok
-    except Exception as e:
-        print(
-            f"[PUSHOVER ERROR] {type(e).__name__}: {e}",
+            "[FORWARD ERROR] DIRECT_LIQ_SECRET is missing",
             flush=True,
         )
         return False
 
+    payload = {
+        "asset": asset,
+        "exchange": exchange,
+        "side": side,
+        "notional_usd": float(notional_usd),
+        "event_key": str(event_key),
+    }
+    headers = {
+        "X-Direct-Liq-Secret": DIRECT_LIQ_SECRET,
+        "Content-Type": "application/json",
+    }
 
-def reset_asset_cycle(asset):
-    totals[asset]["long"] = 0.0
-    totals[asset]["short"] = 0.0
+    attempts = max(1, FORWARD_RETRIES)
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.post(
+                DIRECT_EVENT_URL,
+                json=payload,
+                headers=headers,
+                timeout=FORWARD_TIMEOUT_SECONDS,
+            )
 
-    for ex in EXCHANGES:
-        by_exchange[asset][ex]["long"] = 0.0
-        by_exchange[asset][ex]["short"] = 0.0
+            if r.ok:
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {}
+
+                duplicate = bool(body.get("duplicate"))
+                print(
+                    f"[FORWARDED] {asset} {exchange.upper()} {side.upper()} "
+                    f"{usd(notional_usd)} | status={r.status_code}"
+                    + (" | backend_duplicate" if duplicate else ""),
+                    flush=True,
+                )
+                return True
+
+            print(
+                f"[FORWARD ERROR] {asset} {exchange.upper()} "
+                f"attempt={attempt}/{attempts} status={r.status_code} "
+                f"body={r.text[:300]}",
+                flush=True,
+            )
+
+            # Authentication/validation errors will not improve with retry.
+            if 400 <= r.status_code < 500:
+                return False
+
+        except Exception as e:
+            print(
+                f"[FORWARD ERROR] {asset} {exchange.upper()} "
+                f"attempt={attempt}/{attempts} "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        if attempt < attempts:
+            time.sleep(min(2 ** (attempt - 1), 5))
+
+    return False
 
 
-async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_ts=None, symbol=None):
+async def add_liquidation(asset, exchange, side, notional_usd, event_key):
     if asset not in ASSETS:
         return
 
@@ -461,106 +185,37 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key, event_
     if notional_usd <= 0:
         return
 
+    # Avoid local duplicate traffic. The app.py endpoint also keeps its own
+    # persistent dedupe, so HTTP retries/restarts cannot double-count.
+    if event_key in seen_set:
+        return
+
+    ok = await asyncio.to_thread(
+        forward_direct_event,
+        asset,
+        exchange,
+        side,
+        notional_usd,
+        event_key,
+    )
+
+    if not ok:
+        # Do not mark failed forwards as seen. Polling/stream replay can retry.
+        return
+
     if not remember_event(event_key):
         return
 
-    mark_liquidation(asset, exchange, event_ts)
-
-    if RAW_EVENT_LOGS:
-        print(
-            f"[RAW EVENT] asset={asset} exchange={exchange.upper()} "
-            f"symbol={symbol or '-'} side={side.upper()} "
-            f"usd={usd(notional_usd)} event_ts={event_ts or '-'} "
-            f"recv_unix={time.time():.3f}",
-            flush=True,
-        )
-
     async with lock:
+        # Local totals are STATUS ONLY (forwarded since worker start).
+        # They never trigger alerts or resets. app.py is the canonical state.
         totals[asset][side] += notional_usd
         by_exchange[asset][exchange][side] += notional_usd
 
         print(
-            f"[EVENT] {asset} {exchange.upper()} {side.upper()} "
-            f"{usd(notional_usd)} | "
-            f"TOTAL L={usd(totals[asset]['long'])} "
+            f"[LOCAL FORWARDED TOTAL] {asset} "
+            f"L={usd(totals[asset]['long'])} "
             f"S={usd(totals[asset]['short'])}",
-            flush=True,
-        )
-
-        threshold = threshold_for(asset)
-        long_hit = totals[asset]["long"] >= threshold
-        short_hit = totals[asset]["short"] >= threshold
-
-        if not (long_hit or short_hit):
-            return
-
-        now = time.time()
-        last_alert = last_alert_wall[asset]
-
-        if last_alert is not None:
-            elapsed = now - last_alert
-            if elapsed < ALERT_COOLDOWN_SECONDS:
-                remaining = ALERT_COOLDOWN_SECONDS - elapsed
-                print(
-                    f"[ALERT COOLDOWN] {asset} threshold reached but "
-                    f"next alert allowed in {remaining:.0f}s | "
-                    f"TOTAL L={usd(totals[asset]['long'])} "
-                    f"S={usd(totals[asset]['short'])}",
-                    flush=True,
-                )
-                # Keep accumulating during cooldown. Do NOT reset totals.
-                return
-
-        long_total = totals[asset]["long"]
-        short_total = totals[asset]["short"]
-        gap = abs(long_total - short_total)
-        threshold_m = threshold / 1_000_000
-
-        if long_hit and short_hit:
-            winner = "LONG" if long_total >= short_total else "SHORT"
-            title = (
-                f"{asset} DIRECT BOTH HIT +{threshold_m:g}M "
-                f"({winner} HIGHER)"
-            )
-        elif long_hit:
-            title = f"{asset} DIRECT LONG WINS +{threshold_m:g}M"
-        else:
-            title = f"{asset} DIRECT SHORT WINS +{threshold_m:g}M"
-
-        long_pct, short_pct = side_percentages(long_total, short_total)
-
-        lines = [
-            f"LONG: {usd(long_total)} ({long_pct:.2f}%)",
-            f"SHORT: {usd(short_total)} ({short_pct:.2f}%)",
-            f"GAP: {usd(gap)}",
-            "",
-        ]
-
-        for ex in EXCHANGES:
-            ex_long = by_exchange[asset][ex]["long"]
-            ex_short = by_exchange[asset][ex]["short"]
-            ex_long_pct, ex_short_pct = side_percentages(ex_long, ex_short)
-
-            lines.append(
-                f"{ex.title():7s} "
-                f"L {usd(ex_long)} ({ex_long_pct:.2f}%) | "
-                f"S {usd(ex_short)} ({ex_short_pct:.2f}%)"
-            )
-
-        await asyncio.to_thread(
-            send_pushover,
-            title,
-            "\n".join(lines),
-        )
-
-        last_alert_wall[asset] = time.time()
-        reset_asset_cycle(asset)
-
-        # Persist reset + cooldown timestamp immediately.
-        save_persistent_state()
-
-        print(
-            f"[CYCLE RESET] {asset} cumulative totals reset after alert",
             flush=True,
         )
 
@@ -626,21 +281,13 @@ async def bitget_loop():
                     "(BTC + XAU filter)",
                     flush=True,
                 )
-                print("[BITGET WS] connected", flush=True)
-                for _asset in ASSETS:
-                    transport_connected[_asset]["bitget"] = True
 
                 hb = asyncio.create_task(bitget_heartbeat(ws))
 
                 try:
                     async for raw in ws:
                         if raw == "pong":
-                            for _asset in ASSETS:
-                                mark_transport(_asset, "bitget")
                             continue
-
-                        for _asset in ASSETS:
-                            mark_transport(_asset, "bitget")
 
                         try:
                             msg = json.loads(raw)
@@ -689,8 +336,6 @@ async def bitget_loop():
                                 side,
                                 amount,
                                 key,
-                                event_ts=ts,
-                                symbol=symbol,
                             )
                 finally:
                     hb.cancel()
@@ -700,8 +345,6 @@ async def bitget_loop():
                 f"[BITGET ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
-            mark_transport_disconnected("bitget")
-            print("[BITGET WS] disconnected; reconnecting in 5s", flush=True)
             await asyncio.sleep(5)
 
 
@@ -727,51 +370,8 @@ def iter_aster_force_orders(msg):
         yield msg
 
 
-async def aster_heartbeat(ws):
-    """
-    Aster's forceOrder stream can stay quiet when there are no liquidations.
-    So transport health is verified with an explicit WebSocket ping/pong,
-    instead of treating a quiet application stream as stale.
-    """
-    while True:
-        await asyncio.sleep(60)
-
-        try:
-            pong_waiter = await ws.ping()
-
-            await asyncio.wait_for(
-                pong_waiter,
-                timeout=20,
-            )
-
-            for _asset in ASSETS:
-                transport_connected[_asset]["aster"] = True
-                mark_transport(_asset, "aster")
-
-            print("[ASTER HEARTBEAT] pong OK", flush=True)
-
-        except Exception as e:
-            print(
-                f"[ASTER HEARTBEAT ERROR] "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
-
-            try:
-                await ws.close(
-                    code=1011,
-                    reason="Aster heartbeat failed",
-                )
-            except Exception:
-                pass
-
-            raise
-
-
 async def aster_loop():
     while True:
-        heartbeat_task = None
-
         try:
             print("[ASTER] connecting all-market forceOrder...", flush=True)
 
@@ -779,9 +379,8 @@ async def aster_loop():
                 ASTER_WS,
                 open_timeout=20,
                 close_timeout=10,
-                # Disable library auto-ping because we maintain
-                # an explicit heartbeat and record successful pong health.
-                ping_interval=None,
+                ping_interval=180,
+                ping_timeout=30,
                 max_size=4_000_000,
             ) as ws:
                 print(
@@ -789,24 +388,8 @@ async def aster_loop():
                     "(BTC + XAU/GOLD filter)",
                     flush=True,
                 )
-                print("[ASTER WS] connected", flush=True)
 
-                for _asset in ASSETS:
-                    transport_connected[_asset]["aster"] = True
-                    mark_transport(_asset, "aster")
-
-                heartbeat_task = asyncio.create_task(
-                    aster_heartbeat(ws)
-                )
-
-                while True:
-                    raw = await ws.recv()
-
-                    # Any received application frame also proves the
-                    # connection is active.
-                    for _asset in ASSETS:
-                        mark_transport(_asset, "aster")
-
+                async for raw in ws:
                     try:
                         msg = json.loads(raw)
                     except Exception:
@@ -870,33 +453,14 @@ async def aster_loop():
                             side,
                             notional,
                             key,
-                            event_ts=ts,
-                            symbol=symbol,
                         )
 
         except Exception as e:
-            mark_transport_disconnected("aster")
             print(
                 f"[ASTER ERROR] {type(e).__name__}: {e}",
                 flush=True,
             )
-            print(
-                "[ASTER WS] disconnected; reconnecting in 5s",
-                flush=True,
-            )
-
-        finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-
-                try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-
-        await asyncio.sleep(5)
+            await asyncio.sleep(5)
 
 
 # ============================================================
@@ -949,12 +513,6 @@ def discover_coinex_markets():
         coinex_markets["BTC"] = btc_market or "BTCUSDT"
         coinex_markets["XAU"] = xau_market
 
-        transport_connected["BTC"]["coinex"] = True
-        if coinex_markets["XAU"]:
-            transport_connected["XAU"]["coinex"] = True
-        else:
-            transport_connected["XAU"]["coinex"] = False
-
         print(
             f"[COINEX] BTC market={coinex_markets['BTC']} | "
             f"XAU market={coinex_markets['XAU'] or 'NOT FOUND / SKIPPED'}",
@@ -994,8 +552,6 @@ async def coinex_poll_market(session, asset, market):
             f"CoinEx {asset} response: {payload}"
         )
 
-    mark_transport(asset, "coinex")
-
     for event in payload.get("data") or []:
         if str(event.get("market") or "").upper() != market:
             continue
@@ -1025,8 +581,6 @@ async def coinex_poll_market(session, asset, market):
             side,
             notional,
             key,
-            event_ts=ts,
-            symbol=market,
         )
 
 
@@ -1192,7 +746,6 @@ async def lighter_asset_loop(asset):
                     f"skipping and rechecking later",
                     flush=True,
                 )
-                transport_connected[asset]["lighter"] = False
                 await asyncio.sleep(300)
                 continue
 
@@ -1222,8 +775,6 @@ async def lighter_asset_loop(asset):
                     f"trade/{market_id}",
                     flush=True,
                 )
-                print(f"[LIGHTER {asset} WS] connected", flush=True)
-                transport_connected[asset]["lighter"] = True
 
                 hb = asyncio.create_task(
                     lighter_heartbeat(ws)
@@ -1231,8 +782,6 @@ async def lighter_asset_loop(asset):
 
                 try:
                     async for raw in ws:
-                        mark_transport(asset, "lighter")
-
                         try:
                             msg = json.loads(raw)
                         except Exception:
@@ -1305,21 +854,6 @@ async def lighter_asset_loop(asset):
                                 or ""
                             )
 
-                            event_age = event_timestamp_age_seconds(ts)
-                            if (
-                                event_age is not None
-                                and event_age > LIGHTER_MAX_EVENT_AGE_SECONDS
-                            ):
-                                print(
-                                    f"[LIGHTER OLD EVENT SKIPPED] "
-                                    f"{asset} market_id={market_id} "
-                                    f"age={event_age:.1f}s "
-                                    f"usd={usd(notional)} "
-                                    f"event_ts={ts}",
-                                    flush=True,
-                                )
-                                continue
-
                             tx_hash = str(
                                 trade.get("tx_hash")
                                 or ""
@@ -1336,8 +870,6 @@ async def lighter_asset_loop(asset):
                                 side,
                                 notional,
                                 key,
-                                event_ts=ts,
-                                symbol=f"market_id:{market_id}",
                             )
                 finally:
                     hb.cancel()
@@ -1346,11 +878,6 @@ async def lighter_asset_loop(asset):
             print(
                 f"[LIGHTER {asset} ERROR] "
                 f"{type(e).__name__}: {e}",
-                flush=True,
-            )
-            mark_transport_disconnected("lighter", asset)
-            print(
-                f"[LIGHTER {asset} WS] disconnected; reconnecting in 5s",
                 flush=True,
             )
             await asyncio.sleep(5)
@@ -1367,8 +894,7 @@ async def status_loop():
         async with lock:
             for asset in ASSETS:
                 print(
-                    f"[STATUS] {asset} "
-                    f"threshold={usd(threshold_for(asset))} "
+                    f"[STATUS] {asset} FORWARDED-SINCE-START "
                     f"LONG={usd(totals[asset]['long'])} "
                     f"SHORT={usd(totals[asset]['short'])} | "
                     f"Bitget("
@@ -1386,68 +912,23 @@ async def status_loop():
                     flush=True,
                 )
 
-                health_parts = []
-                for ex in EXCHANGES:
-                    health_parts.append(
-                        f"{ex.title()}="
-                        f"{transport_state(asset, ex)}"
-                        f"(msg_age={fmt_age(last_transport_wall[asset][ex])},"
-                        f"liq_age={fmt_age(last_liq_wall[asset][ex])},"
-                        f"liq_ts={last_liq_event_ts[asset][ex] or '-'})"
-                    )
-
-                print(
-                    f"[FEED HEALTH] {asset} | " + " | ".join(health_parts),
-                    flush=True,
-                )
-
-                stale_transports = [
-                    ex for ex in EXCHANGES
-                    if transport_state(asset, ex) == "STALE"
-                ]
-
-                disconnected = [
-                    ex for ex in EXCHANGES
-                    if transport_state(asset, ex) == "DISCONNECTED"
-                ]
-
-                if stale_transports:
-                    print(
-                        f"[TRANSPORT WARNING] {asset} no feed message/poll "
-                        f"for >= {TRANSPORT_STALE_SECONDS:.0f}s on: "
-                        + ", ".join(ex.title() for ex in stale_transports),
-                        flush=True,
-                    )
-
-                if disconnected:
-                    print(
-                        f"[TRANSPORT INFO] {asset} disconnected/unsupported: "
-                        + ", ".join(ex.title() for ex in disconnected),
-                        flush=True,
-                    )
-
-
-
 
 # ============================================================
 # MAIN
 # ============================================================
 
 async def main():
-    load_persistent_state()
-
     print(
         "DIRECT BTC + XAU LIQUIDATION WORKER STARTING",
         flush=True,
     )
 
     print(
-        f"BTC Threshold: {usd(BTC_THRESHOLD_USD)}",
+        f"Combined backend: {DIRECT_EVENT_URL}",
         flush=True,
     )
-
     print(
-        f"XAU Threshold: {usd(XAU_THRESHOLD_USD)}",
+        "Thresholds/alerts/resets are owned by app.py combined accumulator",
         flush=True,
     )
 
@@ -1462,26 +943,7 @@ async def main():
         flush=True,
     )
 
-    print(
-        f"Transport stale threshold: {TRANSPORT_STALE_SECONDS:.0f}s | "
-        f"Lighter max event age: {LIGHTER_MAX_EVENT_AGE_SECONDS:.0f}s | "
-        f"Alert cooldown: {ALERT_COOLDOWN_SECONDS:.0f}s | "
-        f"Aster heartbeat: 60s ping / 20s pong timeout | "
-        f"RAW liquidation logs: {'ON' if RAW_EVENT_LOGS else 'OFF'}",
-        flush=True,
-    )
-
-    print(
-        f"Persistence: file={STATE_FILE} | "
-        f"save_every={STATE_SAVE_SECONDS:.0f}s | "
-        f"restored_on_startup={state_restored_on_startup}",
-        flush=True,
-    )
-
-    save_persistent_state()
-
     await asyncio.gather(
-        persistence_loop(),
         bitget_loop(),
         aster_loop(),
         coinex_loop(),
