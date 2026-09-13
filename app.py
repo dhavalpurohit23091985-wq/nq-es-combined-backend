@@ -25,6 +25,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 COINALYZE_API_KEY = os.environ.get("COINALYZE_API_KEY")
 CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 DIRECT_LIQ_SECRET = os.environ.get("DIRECT_LIQ_SECRET", "").strip()
+MT5_BRIDGE_SECRET = os.environ.get("MT5_BRIDGE_SECRET", "").strip()
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
@@ -204,6 +205,84 @@ combined_last_alert = {"BTC": None, "XAU": None}
 combined_direct_seen_queue = deque()
 combined_direct_seen_set = set()
 _combined_liq_lock = threading.RLock()
+
+
+# ==================================================
+# MT5 DEMO SIGNAL BRIDGE
+# ==================================================
+# This backend only publishes signals. The MT5 EA must enforce DEMO account
+# mode before any order action. Synthetic test signals are stored separately
+# and never touch liquidation totals, thresholds, Pushover or reset logic.
+
+mt5_latest_signals = {
+    "BTC": None,
+    "XAU": None,
+}
+
+mt5_test_signals = {
+    "BTC": None,
+    "XAU": None,
+}
+
+_mt5_signal_lock = threading.RLock()
+
+
+def _mt5_make_signal(asset, winner, side, source, mode, *, long_usd=None, short_usd=None):
+    now_ns = time.time_ns()
+    return {
+        "id": f"{asset}-{now_ns}-{side}",
+        "asset": asset,
+        "winner": winner,
+        "side": side,
+        "source": source,
+        "mode": mode,
+        "ts": int(time.time()),
+        "long_usd": long_usd,
+        "short_usd": short_usd,
+    }
+
+
+def _publish_mt5_live_signal(alert_snapshot):
+    asset = str(alert_snapshot.get("asset", "")).upper().strip()
+    winner = str(alert_snapshot.get("winner", "")).upper().strip()
+
+    if asset not in ("BTC", "XAU"):
+        return None
+
+    # Confirmed mapping:
+    # liquidation LONG WINS  -> trade SELL
+    # liquidation SHORT WINS -> trade BUY
+    # BOTH -> alert only, no execution signal.
+    if winner == "LONG":
+        side = "SELL"
+    elif winner == "SHORT":
+        side = "BUY"
+    else:
+        print(
+            f"[MT5 BRIDGE] {asset} winner={winner} -> NO EXECUTION SIGNAL",
+            flush=True,
+        )
+        return None
+
+    signal = _mt5_make_signal(
+        asset=asset,
+        winner=winner,
+        side=side,
+        source="combined_liquidation",
+        mode="LIVE_COMBINED",
+        long_usd=round(float(alert_snapshot.get("long", 0.0) or 0.0), 2),
+        short_usd=round(float(alert_snapshot.get("short", 0.0) or 0.0), 2),
+    )
+    signal["threshold_usd"] = COMBINED_LIQ_THRESHOLDS[asset]
+
+    with _mt5_signal_lock:
+        mt5_latest_signals[asset] = signal
+
+    print(
+        f"[MT5 BRIDGE] LIVE {asset} {winner} -> {side} | id={signal['id']}",
+        flush=True,
+    )
+    return signal
 
 
 # ==================================================
@@ -438,6 +517,10 @@ def add_combined_liquidation_batch(
             }
 
             combined_last_alert[asset] = dict(alert_snapshot)
+
+            # Publish a read-only MT5 demo bridge signal from the same canonical
+            # combined threshold event. BOTH remains alert-only.
+            _publish_mt5_live_signal(alert_snapshot)
 
             if asset == "BTC":
                 marginpad_btc_last_alert_snapshot = {
@@ -1594,6 +1677,10 @@ def _runtime_state_payload():
             'direct_seen_queue': list(combined_direct_seen_queue),
         },
 
+        'mt5_bridge': {
+            'latest_signals': mt5_latest_signals,
+        },
+
         'nvda': {
             'session_date_ist': nvda_session_date_ist,
             'session_open': nvda_session_open,
@@ -1636,6 +1723,7 @@ def _load_runtime_state():
     global combined_liq, combined_by_source
     global combined_cycle_ref_price, combined_latest_price, combined_last_alert
     global combined_direct_seen_queue, combined_direct_seen_set
+    global mt5_latest_signals
     global nvda_session_date_ist, nvda_session_open
     global nvda_state, nvda_last_processed_candle_ts
 
@@ -1706,6 +1794,12 @@ def _load_runtime_state():
         direct_seen = list(comb.get('direct_seen_queue') or [])[-COMBINED_DIRECT_SEEN_MAX:]
         combined_direct_seen_queue = deque(direct_seen)
         combined_direct_seen_set = set(direct_seen)
+
+        mt5_saved = data.get('mt5_bridge') or {}
+        saved_signals = mt5_saved.get('latest_signals') or {}
+        for asset in ("BTC", "XAU"):
+            candidate = saved_signals.get(asset)
+            mt5_latest_signals[asset] = candidate if isinstance(candidate, dict) else None
 
         nvd = data.get('nvda') or {}
         nvda_session_date_ist = nvd.get('session_date_ist')
@@ -5335,6 +5429,86 @@ def combined_liquidation_state():
             },
             "direct_seen_count": len(combined_direct_seen_set),
         }), 200
+
+
+# ==================================================
+# MT5 DEMO SIGNAL BRIDGE ENDPOINTS
+# ==================================================
+
+def mt5_bridge_authorized():
+    supplied = request.headers.get("X-MT5-Secret", "").strip()
+    return bool(MT5_BRIDGE_SECRET) and supplied == MT5_BRIDGE_SECRET
+
+
+@app.get("/mt5-signal")
+def mt5_signal():
+    if not mt5_bridge_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    mode = str(request.args.get("mode", "live")).strip().lower()
+
+    with _mt5_signal_lock:
+        if mode == "test":
+            signals = {
+                "BTC": mt5_test_signals["BTC"],
+                "XAU": mt5_test_signals["XAU"],
+            }
+            signal_mode = "TEST_ONLY"
+        else:
+            signals = {
+                "BTC": mt5_latest_signals["BTC"],
+                "XAU": mt5_latest_signals["XAU"],
+            }
+            signal_mode = "LIVE_COMBINED"
+
+    return jsonify({
+        "ok": True,
+        "mode": signal_mode,
+        "server_ts": int(time.time()),
+        "signals": signals,
+    }), 200
+
+
+@app.post("/mt5-test-signal")
+def mt5_test_signal():
+    if not mt5_bridge_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    asset = str(data.get("asset", "")).upper().strip()
+    side = str(data.get("side", "")).upper().strip()
+
+    if asset not in ("BTC", "XAU"):
+        return jsonify({"ok": False, "error": "invalid_asset"}), 400
+
+    if side not in ("BUY", "SELL"):
+        return jsonify({"ok": False, "error": "invalid_side"}), 400
+
+    winner = "SHORT" if side == "BUY" else "LONG"
+
+    signal = _mt5_make_signal(
+        asset=asset,
+        winner=winner,
+        side=side,
+        source="synthetic_test_only",
+        mode="TEST_ONLY",
+    )
+
+    with _mt5_signal_lock:
+        mt5_test_signals[asset] = signal
+
+    print(
+        f"[MT5 BRIDGE] TEST ONLY {asset} {winner} -> {side} | id={signal['id']}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "test_only": True,
+        "combined_totals_untouched": True,
+        "pushover_untouched": True,
+        "signal": signal,
+    }), 200
 
 
 # ==================================================
