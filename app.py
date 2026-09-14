@@ -198,6 +198,15 @@ combined_by_source = {
     for asset in ("BTC", "XAU")
 }
 
+# Exchange-level audit breakdown for the current combined cycle.
+# BTC MarginPad events are recorded by their real exchange name, while
+# direct-worker events use their direct exchange name. This is display/audit
+# state only; combined threshold calculations remain unchanged.
+combined_by_exchange = {
+    "BTC": {},
+    "XAU": {},
+}
+
 combined_cycle_ref_price = {"BTC": None, "XAU": None}
 combined_latest_price = {"BTC": None, "XAU": None}
 combined_last_alert = {"BTC": None, "XAU": None}
@@ -368,6 +377,8 @@ def _combined_reset_asset(asset, reset_price=None):
         combined_by_source[asset][source]["long"] = 0.0
         combined_by_source[asset][source]["short"] = 0.0
 
+    combined_by_exchange[asset].clear()
+
     combined_cycle_ref_price[asset] = reset_price
 
     # Keep the old MarginPad read-only/debug fields aligned with the
@@ -390,6 +401,7 @@ def add_combined_liquidation_batch(
     short_usd,
     event_key=None,
     price=None,
+    exchange_breakdown=None,
 ):
     """Add one atomic batch to the shared MarginPad + Direct cycle.
 
@@ -455,6 +467,33 @@ def add_combined_liquidation_batch(
         combined_by_source[asset][source_key]["long"] += long_usd
         combined_by_source[asset][source_key]["short"] += short_usd
 
+        # Preserve the real exchange-level contribution for BTC alert auditing.
+        # MarginPad supplies a per-exchange breakdown; direct events already
+        # arrive with their exchange name. This does not alter combined totals.
+        if asset == "BTC":
+            if source == "marginpad" and isinstance(exchange_breakdown, dict):
+                for ex_name, ex_totals in exchange_breakdown.items():
+                    ex_key = str(ex_name or "unknown").strip().lower() or "unknown"
+                    if not isinstance(ex_totals, dict):
+                        continue
+                    try:
+                        ex_long = float(ex_totals.get("long", 0.0) or 0.0)
+                        ex_short = float(ex_totals.get("short", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    bucket = combined_by_exchange[asset].setdefault(
+                        ex_key, {"long": 0.0, "short": 0.0}
+                    )
+                    bucket["long"] += max(0.0, ex_long)
+                    bucket["short"] += max(0.0, ex_short)
+            elif source == "direct":
+                ex_key = exchange or source_key
+                bucket = combined_by_exchange[asset].setdefault(
+                    ex_key, {"long": 0.0, "short": 0.0}
+                )
+                bucket["long"] += long_usd
+                bucket["short"] += short_usd
+
         if source_key == "marginpad":
             if asset == "BTC":
                 marginpad_btc_long_cumulative += long_usd
@@ -495,6 +534,54 @@ def add_combined_liquidation_batch(
                         f"{label}: L ${src_long:,.0f} | S ${src_short:,.0f}"
                     )
 
+            exchange_lines = []
+            if asset == "BTC":
+                exchange_labels = {
+                    "binance": "Binance",
+                    "okx": "OKX",
+                    "bybit": "Bybit",
+                    "bitget": "Bitget",
+                    "aster": "Aster",
+                    "coinex": "CoinEx",
+                    "lighter": "Lighter",
+                    "bitfinex": "Bitfinex",
+                    "hyperliquid": "Hyperliquid",
+                    "gate": "Gate",
+                    "htx": "HTX",
+                }
+
+                if winner == "LONG":
+                    display_side = "long"
+                elif winner == "SHORT":
+                    display_side = "short"
+                else:
+                    display_side = None
+
+                ranked = []
+                for ex_name, ex_totals in combined_by_exchange[asset].items():
+                    ex_long = float(ex_totals.get("long", 0.0) or 0.0)
+                    ex_short = float(ex_totals.get("short", 0.0) or 0.0)
+                    if ex_long <= 0 and ex_short <= 0:
+                        continue
+                    rank_amount = (
+                        ex_long if display_side == "long"
+                        else ex_short if display_side == "short"
+                        else max(ex_long, ex_short)
+                    )
+                    ranked.append((rank_amount, ex_name, ex_long, ex_short))
+
+                ranked.sort(key=lambda row: row[0], reverse=True)
+                for _, ex_name, ex_long, ex_short in ranked:
+                    label = exchange_labels.get(ex_name, ex_name.title())
+                    if display_side == "long":
+                        exchange_lines.append(f"{label}: ${ex_long:,.0f}")
+                    elif display_side == "short":
+                        exchange_lines.append(f"{label}: ${ex_short:,.0f}")
+                    else:
+                        exchange_lines.append(
+                            f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}"
+                        )
+
             current_price = combined_latest_price.get(asset)
             ref_price = combined_cycle_ref_price.get(asset)
             move = None
@@ -513,6 +600,7 @@ def add_combined_liquidation_batch(
                 "price": current_price,
                 "move": move,
                 "sources": source_lines,
+                "exchanges": exchange_lines,
                 "ts": int(time.time()),
             }
 
@@ -561,15 +649,25 @@ def add_combined_liquidation_batch(
                 else f"{alert_snapshot['move']:,.2f} pts"
             )
 
-        breakdown = "\n".join(alert_snapshot["sources"]) or "No source breakdown"
-        message = (
-            f"SOURCE COMBINED | WINNER {alert_snapshot['winner']} | "
-            f"LONG ${alert_snapshot['long']:,.0f} ({alert_snapshot['long_pct']:.2f}%) | "
-            f"SHORT ${alert_snapshot['short']:,.0f} ({alert_snapshot['short_pct']:.2f}%) | "
-            f"GAP ${alert_snapshot['gap']:,.0f} | "
-            f"{asset} {price_text} | {asset} MOVE {move_text}\n"
-            f"{breakdown}"
-        )
+        if asset == "BTC" and alert_snapshot.get("exchanges"):
+            breakdown = "\n".join(alert_snapshot["exchanges"])
+            message = (
+                f"{breakdown}\n\n"
+                f"COMBINED SHORT: ${alert_snapshot['short']:,.0f}\n"
+                f"COMBINED LONG: ${alert_snapshot['long']:,.0f}\n"
+                f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+                f"BTC {price_text} | BTC MOVE {move_text}"
+            )
+        else:
+            breakdown = "\n".join(alert_snapshot["sources"]) or "No source breakdown"
+            message = (
+                f"SOURCE COMBINED | WINNER {alert_snapshot['winner']} | "
+                f"LONG ${alert_snapshot['long']:,.0f} ({alert_snapshot['long_pct']:.2f}%) | "
+                f"SHORT ${alert_snapshot['short']:,.0f} ({alert_snapshot['short_pct']:.2f}%) | "
+                f"GAP ${alert_snapshot['gap']:,.0f} | "
+                f"{asset} {price_text} | {asset} MOVE {move_text}\n"
+                f"{breakdown}"
+            )
 
         sent = send_pushover(alert_snapshot["title"], message)
         result["alert_sent"] = sent
@@ -1058,6 +1156,7 @@ def get_marginpad_fresh_btc_liquidations(
     accepted_events = 0
     newest_event_ms = None
     exchanges = set()
+    fresh_by_exchange = {}
 
     # Oldest first makes logging/debugging easier.
     normalized_events = []
@@ -1146,18 +1245,27 @@ def get_marginpad_fresh_btc_liquidations(
             event.get("side", "")
         ).strip().lower()
 
-        if side == "long_liquidated":
-            fresh_long += notional
-
-        elif side == "short_liquidated":
-            fresh_short += notional
-
-        else:
-            continue
-
         exchange = str(
             event.get("exchange", "")
         ).strip()
+        exchange_key = exchange.lower() or "unknown"
+
+        if side == "long_liquidated":
+            fresh_long += notional
+            bucket = fresh_by_exchange.setdefault(
+                exchange_key, {"long": 0.0, "short": 0.0}
+            )
+            bucket["long"] += notional
+
+        elif side == "short_liquidated":
+            fresh_short += notional
+            bucket = fresh_by_exchange.setdefault(
+                exchange_key, {"long": 0.0, "short": 0.0}
+            )
+            bucket["short"] += notional
+
+        else:
+            continue
 
         if exchange:
             exchanges.add(exchange)
@@ -1227,6 +1335,14 @@ def get_marginpad_fresh_btc_liquidations(
             sorted(
                 exchanges
             ),
+
+        "fresh_by_exchange": {
+            name: {
+                "long": round(values.get("long", 0.0), 2),
+                "short": round(values.get("short", 0.0), 2),
+            }
+            for name, values in fresh_by_exchange.items()
+        },
 
         "newest_event_ts_ms":
             newest_event_ms,
@@ -1683,6 +1799,7 @@ def _runtime_state_payload():
         'combined_liquidation': {
             'totals': combined_liq,
             'by_source': combined_by_source,
+            'by_exchange': combined_by_exchange,
             'cycle_ref_price': combined_cycle_ref_price,
             'latest_price': combined_latest_price,
             'last_alert': combined_last_alert,
@@ -1732,7 +1849,7 @@ def _load_runtime_state():
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
     global marginpad_xau_cycle_ref_price, marginpad_xau_processed_through_ms
     global marginpad_xau_seen_queue, marginpad_xau_seen_set
-    global combined_liq, combined_by_source
+    global combined_liq, combined_by_source, combined_by_exchange
     global combined_cycle_ref_price, combined_latest_price, combined_last_alert
     global combined_direct_seen_queue, combined_direct_seen_set
     global mt5_latest_signals
@@ -1783,6 +1900,7 @@ def _load_runtime_state():
         comb = data.get('combined_liquidation') or {}
         saved_totals = comb.get('totals') or {}
         saved_by_source = comb.get('by_source') or {}
+        saved_by_exchange = comb.get('by_exchange') or {}
 
         for asset in ("BTC", "XAU"):
             asset_totals = saved_totals.get(asset) or {}
@@ -1794,6 +1912,29 @@ def _load_runtime_state():
                 source_totals = asset_sources.get(source) or {}
                 combined_by_source[asset][source]["long"] = float(source_totals.get("long", 0.0) or 0.0)
                 combined_by_source[asset][source]["short"] = float(source_totals.get("short", 0.0) or 0.0)
+
+            combined_by_exchange[asset] = {}
+            asset_exchanges = saved_by_exchange.get(asset) or {}
+            for ex_name, ex_totals in asset_exchanges.items():
+                if not isinstance(ex_totals, dict):
+                    continue
+                combined_by_exchange[asset][str(ex_name).lower()] = {
+                    "long": float(ex_totals.get("long", 0.0) or 0.0),
+                    "short": float(ex_totals.get("short", 0.0) or 0.0),
+                }
+
+            # One-time migration from older runtime state that did not yet
+            # persist per-exchange MarginPad totals. Keep any in-flight cycle
+            # reconcilable instead of silently losing its pre-upgrade amount.
+            if asset == "BTC" and not asset_exchanges:
+                for direct_name in COMBINED_DIRECT_EXCHANGES:
+                    direct_totals = combined_by_source[asset][direct_name]
+                    if direct_totals["long"] > 0 or direct_totals["short"] > 0:
+                        combined_by_exchange[asset][direct_name] = dict(direct_totals)
+
+                legacy_mp = combined_by_source[asset]["marginpad"]
+                if legacy_mp["long"] > 0 or legacy_mp["short"] > 0:
+                    combined_by_exchange[asset]["marginpad_preupgrade"] = dict(legacy_mp)
 
         saved_ref = comb.get('cycle_ref_price') or {}
         saved_latest = comb.get('latest_price') or {}
@@ -4717,6 +4858,7 @@ def process_marginpad_btc(
         short_usd=fresh_short,
         event_key=f"marginpad-btc|{closed_end_ms}",
         price=btc_price,
+        exchange_breakdown=fresh.get("fresh_by_exchange") or {},
     )
 
     return {
@@ -5430,6 +5572,7 @@ def combined_liquidation_state():
                 "long_usd": round(combined_liq["BTC"]["long"], 2),
                 "short_usd": round(combined_liq["BTC"]["short"], 2),
                 "by_source": combined_by_source["BTC"],
+                "by_exchange": combined_by_exchange["BTC"],
                 "last_alert": combined_last_alert["BTC"],
             },
             "XAU": {
