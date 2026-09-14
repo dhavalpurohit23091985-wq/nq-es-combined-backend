@@ -1116,6 +1116,18 @@ def get_marginpad_fresh_btc_liquidations(
         if fingerprint in marginpad_seen_set:
             continue
 
+        # Debug only: log the full normalized MarginPad BTC event before
+        # any parsing/accumulation so upstream anomalies can be traced.
+        print(
+            "[MARGINPAD BTC RAW EVENT] "
+            + json.dumps(
+                event,
+                sort_keys=True,
+                default=str
+            ),
+            flush=True
+        )
+
         try:
             notional = float(
                 event.get("notional", 0)
