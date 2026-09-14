@@ -162,6 +162,30 @@ direct_btc_by_exchange = {
 
 
 # ==================================================
+# BTC 13-EXCHANGE OBSERVER - MARGINPAD 9 + DIRECT 4
+# ==================================================
+# Alert-only observer. It does NOT change/reset/read Coinalyze BTC state and
+# does NOT publish MT5 signals. It receives the same already-accepted fresh
+# contributions from MarginPad and the direct BTC liquidator, then maintains
+# its own independent $5M cycle across 13 unique exchanges.
+
+BTC_OBSERVER_THRESHOLD = 5_000_000.0
+BTC_OBSERVER_EXCHANGES = (
+    "binance", "bybit", "okx", "hyperliquid", "gate", "htx",
+    "dydx", "bitmex", "bitfinex",
+    "bitget", "aster", "coinex", "lighter",
+)
+btc_observer_long_cumulative = 0.0
+btc_observer_short_cumulative = 0.0
+btc_observer_cycle_ref_price = None
+btc_observer_last_alert_snapshot = None
+btc_observer_by_exchange = {
+    ex: {"long": 0.0, "short": 0.0}
+    for ex in BTC_OBSERVER_EXCHANGES
+}
+
+
+# ==================================================
 # XAU FRESH LIQUIDATION SETTINGS - MARGINPAD
 # ==================================================
 # Completely separate from both BTC MarginPad and XAU Coinalyze.
@@ -1810,6 +1834,14 @@ def _runtime_state_payload():
             'by_exchange': direct_btc_by_exchange,
         },
 
+        'btc_observer': {
+            'long_cumulative': btc_observer_long_cumulative,
+            'short_cumulative': btc_observer_short_cumulative,
+            'cycle_ref_price': btc_observer_cycle_ref_price,
+            'last_alert_snapshot': btc_observer_last_alert_snapshot,
+            'by_exchange': btc_observer_by_exchange,
+        },
+
         'coinalyze_xau': {
             'long_cumulative': xau_long_cumulative,
             'short_cumulative': xau_short_cumulative,
@@ -1876,6 +1908,9 @@ def _load_runtime_state():
     global direct_btc_long_cumulative, direct_btc_short_cumulative
     global direct_btc_cycle_ref_price, direct_btc_last_alert_snapshot
     global direct_btc_by_exchange
+    global btc_observer_long_cumulative, btc_observer_short_cumulative
+    global btc_observer_cycle_ref_price, btc_observer_last_alert_snapshot
+    global btc_observer_by_exchange
     global xau_long_cumulative, xau_short_cumulative
     global xau_cycle_ref_price, xau_last_processed_liq_ts
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
@@ -1933,6 +1968,23 @@ def _load_runtime_state():
         for ex_name, ex_totals in (dbtc.get('by_exchange') or {}).items():
             if ex_name in direct_btc_by_exchange and isinstance(ex_totals, dict):
                 direct_btc_by_exchange[ex_name] = {
+                    'long': float(ex_totals.get('long', 0.0) or 0.0),
+                    'short': float(ex_totals.get('short', 0.0) or 0.0),
+                }
+
+        observer = data.get('btc_observer') or {}
+        btc_observer_long_cumulative = float(observer.get('long_cumulative', 0.0) or 0.0)
+        btc_observer_short_cumulative = float(observer.get('short_cumulative', 0.0) or 0.0)
+        btc_observer_cycle_ref_price = observer.get('cycle_ref_price')
+        btc_observer_last_alert_snapshot = observer.get('last_alert_snapshot')
+        btc_observer_by_exchange = {
+            ex: {'long': 0.0, 'short': 0.0}
+            for ex in BTC_OBSERVER_EXCHANGES
+        }
+        for ex_name, ex_totals in (observer.get('by_exchange') or {}).items():
+            key = _btc_exchange_key(ex_name)
+            if key in btc_observer_by_exchange and isinstance(ex_totals, dict):
+                btc_observer_by_exchange[key] = {
                     'long': float(ex_totals.get('long', 0.0) or 0.0),
                     'short': float(ex_totals.get('short', 0.0) or 0.0),
                 }
@@ -4936,6 +4988,146 @@ def _btc_standalone_exchange_lines(
     return lines
 
 
+def _btc_observer_add(exchange_breakdown, price=None):
+    global btc_observer_long_cumulative, btc_observer_short_cumulative
+    global btc_observer_cycle_ref_price, btc_observer_last_alert_snapshot
+    global btc_observer_by_exchange
+
+    accepted = {}
+    for ex_name, totals in (exchange_breakdown or {}).items():
+        if not isinstance(totals, dict):
+            continue
+        key = _btc_exchange_key(ex_name)
+        if key not in BTC_OBSERVER_EXCHANGES:
+            continue
+        try:
+            ex_long = max(0.0, float(totals.get("long", 0.0) or 0.0))
+            ex_short = max(0.0, float(totals.get("short", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if ex_long <= 0 and ex_short <= 0:
+            continue
+        bucket = accepted.setdefault(key, {"long": 0.0, "short": 0.0})
+        bucket["long"] += ex_long
+        bucket["short"] += ex_short
+
+    if not accepted:
+        return None
+
+    alert_snapshot = None
+    with _combined_liq_lock:
+        current_price = None
+        try:
+            if price is not None and float(price) > 0:
+                current_price = float(price)
+        except (TypeError, ValueError):
+            pass
+        if current_price is None:
+            current_price = combined_latest_price.get("BTC")
+
+        if btc_observer_cycle_ref_price is None and current_price is not None:
+            btc_observer_cycle_ref_price = current_price
+
+        for ex_name, totals in accepted.items():
+            bucket = btc_observer_by_exchange.setdefault(
+                ex_name, {"long": 0.0, "short": 0.0}
+            )
+            bucket["long"] += totals["long"]
+            bucket["short"] += totals["short"]
+            btc_observer_long_cumulative += totals["long"]
+            btc_observer_short_cumulative += totals["short"]
+
+        cycle_long = btc_observer_long_cumulative
+        cycle_short = btc_observer_short_cumulative
+        long_hit = cycle_long >= BTC_OBSERVER_THRESHOLD
+        short_hit = cycle_short >= BTC_OBSERVER_THRESHOLD
+
+        if long_hit or short_hit:
+            if long_hit and short_hit:
+                winner = "BOTH HIT SAME CYCLE"
+                title = "BTC OBSERVER BOTH HIT +5M"
+            elif long_hit:
+                winner = "LONG"
+                title = "BTC OBSERVER LONG WINS +5M"
+            else:
+                winner = "SHORT"
+                title = "BTC OBSERVER SHORT WINS +5M"
+
+            gap = abs(cycle_long - cycle_short)
+            move = (
+                abs(current_price - btc_observer_cycle_ref_price)
+                if current_price is not None and btc_observer_cycle_ref_price is not None
+                else None
+            )
+            exchange_lines = _btc_standalone_exchange_lines(
+                btc_observer_by_exchange,
+                winner,
+                include_all=True,
+                required_exchanges=BTC_OBSERVER_EXCHANGES,
+            )
+            alert_snapshot = {
+                "asset": "BTC",
+                "winner": winner,
+                "title": title,
+                "long": cycle_long,
+                "short": cycle_short,
+                "gap": gap,
+                "price": current_price,
+                "move": move,
+                "exchanges": exchange_lines,
+                "ts": int(time.time()),
+            }
+            btc_observer_last_alert_snapshot = dict(alert_snapshot)
+
+            # Observer has its own cycle/reset only. Existing MarginPad, direct
+            # liquidator, Coinalyze and MT5 states are untouched.
+            btc_observer_long_cumulative = 0.0
+            btc_observer_short_cumulative = 0.0
+            btc_observer_by_exchange = {
+                ex: {"long": 0.0, "short": 0.0}
+                for ex in BTC_OBSERVER_EXCHANGES
+            }
+            btc_observer_cycle_ref_price = current_price
+
+    if alert_snapshot:
+        breakdown = "\n".join(alert_snapshot["exchanges"])
+        price_text = (
+            f"{alert_snapshot['price']:,.0f}"
+            if alert_snapshot["price"] is not None else "NA"
+        )
+        move_text = (
+            f"{alert_snapshot['move']:,.0f} pts"
+            if alert_snapshot["move"] is not None else "NA"
+        )
+        message = (
+            f"{breakdown}\n\n"
+            f"TOTAL SHORT: ${alert_snapshot['short']:,.0f}\n"
+            f"TOTAL LONG: ${alert_snapshot['long']:,.0f}\n"
+            f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+            f"BTC {price_text} | BTC MOVE {move_text}"
+        )
+        sent = send_pushover(alert_snapshot["title"], message)
+        print(
+            f"[BTC OBSERVER ALERT] {alert_snapshot['title']} "
+            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} "
+            f"sent={sent}",
+            flush=True,
+        )
+        alert_snapshot["alert_sent"] = sent
+
+    return alert_snapshot
+
+
+def _btc_observer_add_direct(exchange, side, amount, price=None):
+    return _btc_observer_add(
+        {exchange: {
+            "long": amount if side == "long" else 0.0,
+            "short": amount if side == "short" else 0.0,
+        }},
+        price=price,
+    )
+
+
 def process_marginpad_btc(closed_minute_ts):
     global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
     global marginpad_btc_cycle_ref_price, marginpad_btc_processed_through_ms
@@ -5083,6 +5275,10 @@ def process_marginpad_btc(closed_minute_ts):
             marginpad_btc_short_cumulative = 0.0
             marginpad_btc_by_exchange = {}
             marginpad_btc_cycle_ref_price = btc_price
+
+    # Feed only this newly accepted MarginPad batch into the independent
+    # 13-exchange observer. MarginPad's own cycle above remains unchanged.
+    _btc_observer_add(fresh_by_exchange, price=btc_price)
 
     sent = False
     if alert_snapshot:
@@ -5245,6 +5441,10 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
             "alert_sent": False,
             "reset": bool(alert_snapshot),
         }
+
+    # Event is already de-duplicated/accepted by the direct liquidator. Feed
+    # the same contribution into the independent observer only once.
+    _btc_observer_add_direct(exchange, side, amount, price=current_price)
 
     if alert_snapshot:
         breakdown = "\n".join(alert_snapshot["exchanges"]) or "No exchange breakdown"
