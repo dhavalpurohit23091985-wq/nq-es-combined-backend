@@ -5039,6 +5039,21 @@ def _btc_observer_add(exchange_breakdown, price=None):
 
         cycle_long = btc_observer_long_cumulative
         cycle_short = btc_observer_short_cumulative
+
+        # Live observer audit: print every accepted MarginPad/direct update so
+        # the 13-exchange wiring can be verified without waiting for +5M.
+        update_parts = []
+        for ex_name, totals in accepted.items():
+            label = _btc_exchange_label(ex_name)
+            update_parts.append(
+                f"{label}(+L=${totals['long']:,.0f},+S=${totals['short']:,.0f})"
+            )
+        print(
+            f"[BTC OBSERVER] {' | '.join(update_parts)} | "
+            f"TOTAL L=${cycle_long:,.0f} S=${cycle_short:,.0f}",
+            flush=True,
+        )
+
         long_hit = cycle_long >= BTC_OBSERVER_THRESHOLD
         short_hit = cycle_short >= BTC_OBSERVER_THRESHOLD
 
