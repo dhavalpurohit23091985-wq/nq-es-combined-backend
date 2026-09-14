@@ -140,6 +140,26 @@ marginpad_btc_processed_through_ms = None
 marginpad_seen_queue = deque()
 marginpad_seen_set = set()
 
+# Per-exchange audit state for the standalone MarginPad BTC cycle.
+marginpad_btc_by_exchange = {}
+
+
+# ==================================================
+# BTC DIRECT LIQUIDATOR - STANDALONE
+# ==================================================
+# The 4 direct exchanges are intentionally kept separate from MarginPad BTC.
+# They have their own cumulative cycle, threshold, alert and reset.
+
+DIRECT_BTC_LIQ_THRESHOLD = 5_000_000.0
+direct_btc_long_cumulative = 0.0
+direct_btc_short_cumulative = 0.0
+direct_btc_cycle_ref_price = None
+direct_btc_last_alert_snapshot = None
+direct_btc_by_exchange = {
+    ex: {"long": 0.0, "short": 0.0}
+    for ex in ("bitget", "aster", "coinex", "lighter")
+}
+
 
 # ==================================================
 # XAU FRESH LIQUIDATION SETTINGS - MARGINPAD
@@ -1778,7 +1798,16 @@ def _runtime_state_payload():
             'cycle_ref_price': marginpad_btc_cycle_ref_price,
             'processed_through_ms': marginpad_btc_processed_through_ms,
             'last_alert_snapshot': marginpad_btc_last_alert_snapshot,
+            'by_exchange': marginpad_btc_by_exchange,
             'seen_queue': list(marginpad_seen_queue),
+        },
+
+        'direct_btc_liquidator': {
+            'long_cumulative': direct_btc_long_cumulative,
+            'short_cumulative': direct_btc_short_cumulative,
+            'cycle_ref_price': direct_btc_cycle_ref_price,
+            'last_alert_snapshot': direct_btc_last_alert_snapshot,
+            'by_exchange': direct_btc_by_exchange,
         },
 
         'coinalyze_xau': {
@@ -1842,8 +1871,11 @@ def _load_runtime_state():
     global btc_last_alert_snapshot
     global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
     global marginpad_btc_cycle_ref_price, marginpad_btc_processed_through_ms
-    global marginpad_btc_last_alert_snapshot
+    global marginpad_btc_last_alert_snapshot, marginpad_btc_by_exchange
     global marginpad_seen_queue, marginpad_seen_set
+    global direct_btc_long_cumulative, direct_btc_short_cumulative
+    global direct_btc_cycle_ref_price, direct_btc_last_alert_snapshot
+    global direct_btc_by_exchange
     global xau_long_cumulative, xau_short_cumulative
     global xau_cycle_ref_price, xau_last_processed_liq_ts
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
@@ -1878,9 +1910,32 @@ def _load_runtime_state():
         marginpad_btc_cycle_ref_price = mbtc.get('cycle_ref_price')
         marginpad_btc_processed_through_ms = mbtc.get('processed_through_ms')
         marginpad_btc_last_alert_snapshot = mbtc.get('last_alert_snapshot')
+        marginpad_btc_by_exchange = {}
+        for ex_name, ex_totals in (mbtc.get('by_exchange') or {}).items():
+            if isinstance(ex_totals, dict):
+                marginpad_btc_by_exchange[str(ex_name).lower()] = {
+                    'long': float(ex_totals.get('long', 0.0) or 0.0),
+                    'short': float(ex_totals.get('short', 0.0) or 0.0),
+                }
         mbtc_seen = list(mbtc.get('seen_queue') or [])[-MARGINPAD_SEEN_MAX:]
         marginpad_seen_queue = deque(mbtc_seen)
         marginpad_seen_set = set(mbtc_seen)
+
+        dbtc = data.get('direct_btc_liquidator') or {}
+        direct_btc_long_cumulative = float(dbtc.get('long_cumulative', 0.0) or 0.0)
+        direct_btc_short_cumulative = float(dbtc.get('short_cumulative', 0.0) or 0.0)
+        direct_btc_cycle_ref_price = dbtc.get('cycle_ref_price')
+        direct_btc_last_alert_snapshot = dbtc.get('last_alert_snapshot')
+        direct_btc_by_exchange = {
+            ex: {'long': 0.0, 'short': 0.0}
+            for ex in COMBINED_DIRECT_EXCHANGES
+        }
+        for ex_name, ex_totals in (dbtc.get('by_exchange') or {}).items():
+            if ex_name in direct_btc_by_exchange and isinstance(ex_totals, dict):
+                direct_btc_by_exchange[ex_name] = {
+                    'long': float(ex_totals.get('long', 0.0) or 0.0),
+                    'short': float(ex_totals.get('short', 0.0) or 0.0),
+                }
 
         cxau = data.get('coinalyze_xau') or {}
         xau_long_cumulative = float(cxau.get('long_cumulative', 0.0) or 0.0)
@@ -4242,7 +4297,10 @@ def test_marginpad_btc_aggregate():
         "seen_event_cache":
             len(
                 marginpad_seen_set
-            )
+            ),
+
+        "by_exchange":
+            marginpad_btc_by_exchange
     })
 
 
@@ -4770,12 +4828,118 @@ def process_btc(
 # BTC PROCESSOR - MARGINPAD
 # ==================================================
 
-def process_marginpad_btc(
-    closed_minute_ts
-):
+# MarginPad's nine liquidation venues. Keep all nine visible in every
+# standalone MarginPad BTC alert, even when a venue contributes $0.
+MARGINPAD_BTC_DISPLAY_EXCHANGES = (
+    "binance",
+    "bybit",
+    "okx",
+    "hyperliquid",
+    "gate",
+    "htx",
+    "dydx",
+    "bitmex",
+    "bitfinex",
+)
 
-    global marginpad_btc_cycle_ref_price
-    global marginpad_btc_processed_through_ms
+
+def _btc_exchange_key(name):
+    key = str(name or "unknown").strip().lower() or "unknown"
+    aliases = {
+        # MarginPad reads Binance USD-M and Coin-M feeds but they belong to
+        # the same Binance venue in our 9-exchange alert.
+        "binance_coinm": "binance",
+        "binance-coinm": "binance",
+        "binance coin-m": "binance",
+        "binance_coin_m": "binance",
+        "binance-futures": "binance",
+        "gateio": "gate",
+        "gate.io": "gate",
+        "hyper_liquid": "hyperliquid",
+        "dy/dx": "dydx",
+    }
+    return aliases.get(key, key)
+
+
+def _btc_exchange_label(name):
+    labels = {
+        "binance": "Binance",
+        "okx": "OKX",
+        "bybit": "Bybit",
+        "bitget": "Bitget",
+        "aster": "Aster",
+        "coinex": "CoinEx",
+        "lighter": "Lighter",
+        "bitfinex": "Bitfinex",
+        "hyperliquid": "Hyperliquid",
+        "gate": "Gate",
+        "htx": "HTX",
+        "dydx": "dYdX",
+        "bitmex": "BitMEX",
+    }
+    key = _btc_exchange_key(name)
+    return labels.get(key, key.title())
+
+
+def _btc_standalone_exchange_lines(
+    by_exchange, winner, include_all=False, required_exchanges=None
+):
+    display_side = "long" if winner == "LONG" else "short" if winner == "SHORT" else None
+
+    # Normalize aliases first so e.g. Binance USD-M / Coin-M contributions
+    # appear under one Binance line instead of creating duplicate venue rows.
+    normalized = {}
+    for ex_name, totals in (by_exchange or {}).items():
+        if not isinstance(totals, dict):
+            continue
+        try:
+            ex_long = max(0.0, float(totals.get("long", 0.0) or 0.0))
+            ex_short = max(0.0, float(totals.get("short", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            continue
+
+        key = _btc_exchange_key(ex_name)
+        bucket = normalized.setdefault(key, {"long": 0.0, "short": 0.0})
+        bucket["long"] += ex_long
+        bucket["short"] += ex_short
+
+    # Seed the fixed MarginPad venue list so a quiet exchange still prints $0.
+    for ex_name in (required_exchanges or ()):
+        key = _btc_exchange_key(ex_name)
+        normalized.setdefault(key, {"long": 0.0, "short": 0.0})
+
+    ranked = []
+    for ex_name, totals in normalized.items():
+        ex_long = totals["long"]
+        ex_short = totals["short"]
+
+        if not include_all and ex_long <= 0 and ex_short <= 0:
+            continue
+
+        rank_amount = (
+            ex_long if display_side == "long"
+            else ex_short if display_side == "short"
+            else max(ex_long, ex_short)
+        )
+        ranked.append((rank_amount, ex_name, ex_long, ex_short))
+
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    lines = []
+    for _, ex_name, ex_long, ex_short in ranked:
+        label = _btc_exchange_label(ex_name)
+        if display_side == "long":
+            lines.append(f"{label}: ${ex_long:,.0f}")
+        elif display_side == "short":
+            lines.append(f"{label}: ${ex_short:,.0f}")
+        else:
+            lines.append(f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}")
+    return lines
+
+
+def process_marginpad_btc(closed_minute_ts):
+    global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
+    global marginpad_btc_cycle_ref_price, marginpad_btc_processed_through_ms
+    global marginpad_btc_last_alert_snapshot, marginpad_btc_by_exchange
 
     btc_price, price_error = get_marginpad_btc_price()
 
@@ -4785,51 +4949,47 @@ def process_marginpad_btc(
             "asset": "BTC",
             "source": "MarginPad",
             "alert_sent": False,
-            "error": price_error
+            "error": price_error,
         }
+
+    # Keep a fresh BTC price available to the standalone direct liquidator
+    # without mixing either side's liquidation totals.
+    with _combined_liq_lock:
+        combined_latest_price["BTC"] = btc_price
 
     closed_end_ms = (closed_minute_ts + 59) * 1000 + 999
 
     if marginpad_btc_processed_through_ms is None:
         marginpad_btc_processed_through_ms = closed_end_ms
         marginpad_btc_cycle_ref_price = btc_price
-
-        with _combined_liq_lock:
-            combined_latest_price["BTC"] = btc_price
-            if combined_cycle_ref_price["BTC"] is None:
-                combined_cycle_ref_price["BTC"] = btc_price
-
         return {
             "ok": True,
             "asset": "BTC",
             "source": "MarginPad",
             "initialized": True,
             "btc_price": round(btc_price, 2),
-            "combined_long_usd": round(combined_liq["BTC"]["long"], 2),
-            "combined_short_usd": round(combined_liq["BTC"]["short"], 2),
-            "cycle_reference_price": combined_cycle_ref_price["BTC"],
-            "processed_through_ms": marginpad_btc_processed_through_ms
+            "marginpad_long_usd": round(marginpad_btc_long_cumulative, 2),
+            "marginpad_short_usd": round(marginpad_btc_short_cumulative, 2),
+            "cycle_reference_price": marginpad_btc_cycle_ref_price,
+            "processed_through_ms": marginpad_btc_processed_through_ms,
         }
 
     if closed_end_ms <= marginpad_btc_processed_through_ms:
-        with _combined_liq_lock:
-            combined_latest_price["BTC"] = btc_price
-
         return {
             "ok": True,
             "asset": "BTC",
             "source": "MarginPad",
             "new_closed_minute": False,
             "btc_price": round(btc_price, 2),
-            "combined_long_usd": round(combined_liq["BTC"]["long"], 2),
-            "combined_short_usd": round(combined_liq["BTC"]["short"], 2),
-            "cycle_reference_price": combined_cycle_ref_price["BTC"],
-            "processed_through_ms": marginpad_btc_processed_through_ms
+            "marginpad_long_usd": round(marginpad_btc_long_cumulative, 2),
+            "marginpad_short_usd": round(marginpad_btc_short_cumulative, 2),
+            "cycle_reference_price": marginpad_btc_cycle_ref_price,
+            "processed_through_ms": marginpad_btc_processed_through_ms,
         }
 
     fresh, error = get_marginpad_fresh_btc_liquidations(
         marginpad_btc_processed_through_ms,
-        closed_minute_ts
+        closed_minute_ts,
     )
 
     if error:
@@ -4838,28 +4998,113 @@ def process_marginpad_btc(
             "asset": "BTC",
             "source": "MarginPad",
             "alert_sent": False,
-            "combined_long_usd": round(combined_liq["BTC"]["long"], 2),
-            "combined_short_usd": round(combined_liq["BTC"]["short"], 2),
+            "marginpad_long_usd": round(marginpad_btc_long_cumulative, 2),
+            "marginpad_short_usd": round(marginpad_btc_short_cumulative, 2),
             "processed_through_ms": marginpad_btc_processed_through_ms,
-            "error": error
+            "error": error,
         }
 
-    fresh_long = fresh["fresh_long_usd"]
-    fresh_short = fresh["fresh_short_usd"]
+    fresh_long = float(fresh.get("fresh_long_usd", 0.0) or 0.0)
+    fresh_short = float(fresh.get("fresh_short_usd", 0.0) or 0.0)
+    fresh_by_exchange = fresh.get("fresh_by_exchange") or {}
 
-    # Advance only after a successful MarginPad fetch/parse.
     marginpad_btc_processed_through_ms = closed_end_ms
 
-    combined_result = add_combined_liquidation_batch(
-        asset="BTC",
-        source="marginpad",
-        exchange="marginpad",
-        long_usd=fresh_long,
-        short_usd=fresh_short,
-        event_key=f"marginpad-btc|{closed_end_ms}",
-        price=btc_price,
-        exchange_breakdown=fresh.get("fresh_by_exchange") or {},
-    )
+    alert_snapshot = None
+    with _combined_liq_lock:
+        if marginpad_btc_cycle_ref_price is None:
+            marginpad_btc_cycle_ref_price = btc_price
+
+        marginpad_btc_long_cumulative += fresh_long
+        marginpad_btc_short_cumulative += fresh_short
+
+        for ex_name, totals in fresh_by_exchange.items():
+            if not isinstance(totals, dict):
+                continue
+            try:
+                ex_long = max(0.0, float(totals.get("long", 0.0) or 0.0))
+                ex_short = max(0.0, float(totals.get("short", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+            key = str(ex_name or "unknown").strip().lower() or "unknown"
+            bucket = marginpad_btc_by_exchange.setdefault(key, {"long": 0.0, "short": 0.0})
+            bucket["long"] += ex_long
+            bucket["short"] += ex_short
+
+        cycle_long = marginpad_btc_long_cumulative
+        cycle_short = marginpad_btc_short_cumulative
+        long_hit = cycle_long >= MARGINPAD_BTC_LIQ_THRESHOLD
+        short_hit = cycle_short >= MARGINPAD_BTC_LIQ_THRESHOLD
+
+        if long_hit or short_hit:
+            if long_hit and short_hit:
+                winner = "BOTH HIT SAME CYCLE"
+                title = "BTC MARGINPAD BOTH HIT +5M"
+            elif long_hit:
+                winner = "LONG"
+                title = "BTC MARGINPAD LONG WINS +5M"
+            else:
+                winner = "SHORT"
+                title = "BTC MARGINPAD SHORT WINS +5M"
+
+            gap = abs(cycle_long - cycle_short)
+            move = (
+                abs(btc_price - marginpad_btc_cycle_ref_price)
+                if marginpad_btc_cycle_ref_price is not None
+                else None
+            )
+            exchange_lines = _btc_standalone_exchange_lines(
+                marginpad_btc_by_exchange,
+                winner,
+                include_all=True,
+                required_exchanges=MARGINPAD_BTC_DISPLAY_EXCHANGES,
+            )
+
+            alert_snapshot = {
+                "asset": "BTC",
+                "winner": winner,
+                "title": title,
+                "long": cycle_long,
+                "short": cycle_short,
+                "gap": gap,
+                "price": btc_price,
+                "move": move,
+                "exchanges": exchange_lines,
+                "signal_source": "marginpad_liquidation",
+                "ts": int(time.time()),
+            }
+            marginpad_btc_last_alert_snapshot = dict(alert_snapshot)
+
+            # MarginPad BTC is the standalone execution source. The 4-exchange
+            # BTC liquidator below is observation/alert only and cannot publish MT5.
+            _publish_mt5_live_signal(alert_snapshot)
+
+            marginpad_btc_long_cumulative = 0.0
+            marginpad_btc_short_cumulative = 0.0
+            marginpad_btc_by_exchange = {}
+            marginpad_btc_cycle_ref_price = btc_price
+
+    sent = False
+    if alert_snapshot:
+        breakdown = "\n".join(alert_snapshot["exchanges"]) or "No exchange breakdown"
+        move_text = (
+            f"{alert_snapshot['move']:,.0f} pts"
+            if alert_snapshot["move"] is not None
+            else "NA"
+        )
+        message = (
+            f"{breakdown}\n\n"
+            f"MARGINPAD SHORT: ${alert_snapshot['short']:,.0f}\n"
+            f"MARGINPAD LONG: ${alert_snapshot['long']:,.0f}\n"
+            f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+            f"BTC {alert_snapshot['price']:,.0f} | BTC MOVE {move_text}"
+        )
+        sent = send_pushover(alert_snapshot["title"], message)
+        print(
+            f"[MARGINPAD BTC ALERT] {alert_snapshot['title']} "
+            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} sent={sent}",
+            flush=True,
+        )
 
     return {
         "ok": True,
@@ -4872,20 +5117,165 @@ def process_marginpad_btc(
         "exchanges_seen": fresh["exchanges_seen"],
         "fresh_long_usd": fresh_long,
         "fresh_short_usd": fresh_short,
-        "combined_long_before_reset": combined_result["combined_long_usd"],
-        "combined_short_before_reset": combined_result["combined_short_usd"],
-        "threshold_usd": COMBINED_LIQ_THRESHOLDS["BTC"],
-        "cycle_winner": combined_result.get("winner"),
-        "alert_sent": combined_result.get("alert_sent", False),
-        "combined_reset": combined_result.get("reset", False),
-        "current_combined_long_usd": round(combined_liq["BTC"]["long"], 2),
-        "current_combined_short_usd": round(combined_liq["BTC"]["short"], 2),
+        "threshold_usd": MARGINPAD_BTC_LIQ_THRESHOLD,
+        "cycle_winner": alert_snapshot.get("winner") if alert_snapshot else None,
+        "alert_sent": sent,
+        "reset": bool(alert_snapshot),
         "marginpad_long_in_current_cycle": round(marginpad_btc_long_cumulative, 2),
         "marginpad_short_in_current_cycle": round(marginpad_btc_short_cumulative, 2),
-        "cycle_reference_price": combined_cycle_ref_price["BTC"],
+        "by_exchange": marginpad_btc_by_exchange,
+        "cycle_reference_price": marginpad_btc_cycle_ref_price,
         "processed_through_ms": marginpad_btc_processed_through_ms,
-        "seen_event_cache": len(marginpad_seen_set)
+        "seen_event_cache": len(marginpad_seen_set),
     }
+
+
+def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=None):
+    global direct_btc_long_cumulative, direct_btc_short_cumulative
+    global direct_btc_cycle_ref_price, direct_btc_last_alert_snapshot
+    global direct_btc_by_exchange
+
+    exchange = str(exchange or "").lower().strip()
+    side = str(side or "").lower().strip()
+
+    if exchange not in COMBINED_DIRECT_EXCHANGES:
+        return {"ok": False, "error": "invalid_exchange"}
+    if side not in ("long", "short"):
+        return {"ok": False, "error": "invalid_side"}
+
+    try:
+        amount = float(amount or 0.0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_notional"}
+    if amount <= 0:
+        return {"ok": False, "error": "invalid_notional"}
+
+    alert_snapshot = None
+    with _combined_liq_lock:
+        if not _combined_remember_direct_event(str(event_key or "")):
+            return {
+                "ok": True,
+                "duplicate": True,
+                "asset": "BTC",
+                "source": "direct",
+                "long_usd": round(direct_btc_long_cumulative, 2),
+                "short_usd": round(direct_btc_short_cumulative, 2),
+                "alert_sent": False,
+            }
+
+        current_price = combined_latest_price.get("BTC")
+        if price is not None:
+            try:
+                p = float(price)
+                if p > 0:
+                    current_price = p
+                    combined_latest_price["BTC"] = p
+            except (TypeError, ValueError):
+                pass
+
+        if direct_btc_cycle_ref_price is None and current_price is not None:
+            direct_btc_cycle_ref_price = current_price
+
+        if side == "long":
+            direct_btc_long_cumulative += amount
+        else:
+            direct_btc_short_cumulative += amount
+
+        bucket = direct_btc_by_exchange.setdefault(exchange, {"long": 0.0, "short": 0.0})
+        bucket[side] += amount
+
+        cycle_long = direct_btc_long_cumulative
+        cycle_short = direct_btc_short_cumulative
+        long_hit = cycle_long >= DIRECT_BTC_LIQ_THRESHOLD
+        short_hit = cycle_short >= DIRECT_BTC_LIQ_THRESHOLD
+
+        if long_hit or short_hit:
+            if long_hit and short_hit:
+                winner = "BOTH HIT SAME CYCLE"
+                title = "BTC LIQUIDATOR BOTH HIT +5M"
+            elif long_hit:
+                winner = "LONG"
+                title = "BTC LIQUIDATOR LONG WINS +5M"
+            else:
+                winner = "SHORT"
+                title = "BTC LIQUIDATOR SHORT WINS +5M"
+
+            gap = abs(cycle_long - cycle_short)
+            move = (
+                abs(current_price - direct_btc_cycle_ref_price)
+                if current_price is not None and direct_btc_cycle_ref_price is not None
+                else None
+            )
+            exchange_lines = _btc_standalone_exchange_lines(
+                direct_btc_by_exchange, winner, include_all=True
+            )
+            alert_snapshot = {
+                "asset": "BTC",
+                "winner": winner,
+                "title": title,
+                "long": cycle_long,
+                "short": cycle_short,
+                "gap": gap,
+                "price": current_price,
+                "move": move,
+                "exchanges": exchange_lines,
+                "ts": int(time.time()),
+            }
+            direct_btc_last_alert_snapshot = dict(alert_snapshot)
+
+            # Observation only: intentionally no MT5 publication here.
+            direct_btc_long_cumulative = 0.0
+            direct_btc_short_cumulative = 0.0
+            direct_btc_by_exchange = {
+                ex: {"long": 0.0, "short": 0.0}
+                for ex in COMBINED_DIRECT_EXCHANGES
+            }
+            direct_btc_cycle_ref_price = current_price
+
+        result = {
+            "ok": True,
+            "duplicate": False,
+            "asset": "BTC",
+            "source": "direct",
+            "exchange": exchange,
+            "long_usd": round(cycle_long, 2),
+            "short_usd": round(cycle_short, 2),
+            "threshold_usd": DIRECT_BTC_LIQ_THRESHOLD,
+            "winner": alert_snapshot.get("winner") if alert_snapshot else None,
+            "alert_sent": False,
+            "reset": bool(alert_snapshot),
+        }
+
+    if alert_snapshot:
+        breakdown = "\n".join(alert_snapshot["exchanges"]) or "No exchange breakdown"
+        price_text = f"{alert_snapshot['price']:,.0f}" if alert_snapshot["price"] is not None else "NA"
+        move_text = (
+            f"{alert_snapshot['move']:,.0f} pts"
+            if alert_snapshot["move"] is not None
+            else "NA"
+        )
+        message = (
+            f"{breakdown}\n\n"
+            f"LIQUIDATOR SHORT: ${alert_snapshot['short']:,.0f}\n"
+            f"LIQUIDATOR LONG: ${alert_snapshot['long']:,.0f}\n"
+            f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+            f"BTC {price_text} | BTC MOVE {move_text}"
+        )
+        sent = send_pushover(alert_snapshot["title"], message)
+        result["alert_sent"] = sent
+        print(
+            f"[BTC LIQUIDATOR ALERT] {alert_snapshot['title']} "
+            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} sent={sent}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[BTC LIQUIDATOR] {exchange.upper()} {side.upper()} +${amount:,.0f} | "
+            f"TOTAL L=${result['long_usd']:,.0f} S=${result['short_usd']:,.0f}",
+            flush=True,
+        )
+
+    return result
 
 
 # ==================================================
@@ -5546,15 +5936,25 @@ def direct_liquidation_event():
     if amount <= 0:
         return jsonify({"ok": False, "error": "invalid_notional"}), 400
 
-    result = add_combined_liquidation_batch(
-        asset=asset,
-        source="direct",
-        exchange=exchange,
-        long_usd=amount if side == "long" else 0.0,
-        short_usd=amount if side == "short" else 0.0,
-        event_key=event_key,
-        price=data.get("price"),
-    )
+    if asset == "BTC":
+        result = add_direct_btc_liquidation_event(
+            exchange=exchange,
+            side=side,
+            amount=amount,
+            event_key=event_key,
+            price=data.get("price"),
+        )
+    else:
+        # XAU keeps the existing combined MarginPad + direct behaviour.
+        result = add_combined_liquidation_batch(
+            asset=asset,
+            source="direct",
+            exchange=exchange,
+            long_usd=amount if side == "long" else 0.0,
+            short_usd=amount if side == "short" else 0.0,
+            event_key=event_key,
+            price=data.get("price"),
+        )
 
     return jsonify(result), 200
 
@@ -5568,12 +5968,21 @@ def combined_liquidation_state():
         return jsonify({
             "ok": True,
             "BTC": {
-                "threshold_usd": COMBINED_LIQ_THRESHOLDS["BTC"],
-                "long_usd": round(combined_liq["BTC"]["long"], 2),
-                "short_usd": round(combined_liq["BTC"]["short"], 2),
-                "by_source": combined_by_source["BTC"],
-                "by_exchange": combined_by_exchange["BTC"],
-                "last_alert": combined_last_alert["BTC"],
+                "mode": "SEPARATE_MARGINPAD_AND_DIRECT",
+                "marginpad": {
+                    "threshold_usd": MARGINPAD_BTC_LIQ_THRESHOLD,
+                    "long_usd": round(marginpad_btc_long_cumulative, 2),
+                    "short_usd": round(marginpad_btc_short_cumulative, 2),
+                    "by_exchange": marginpad_btc_by_exchange,
+                    "last_alert": marginpad_btc_last_alert_snapshot,
+                },
+                "liquidator": {
+                    "threshold_usd": DIRECT_BTC_LIQ_THRESHOLD,
+                    "long_usd": round(direct_btc_long_cumulative, 2),
+                    "short_usd": round(direct_btc_short_cumulative, 2),
+                    "by_exchange": direct_btc_by_exchange,
+                    "last_alert": direct_btc_last_alert_snapshot,
+                },
             },
             "XAU": {
                 "threshold_usd": COMBINED_LIQ_THRESHOLDS["XAU"],
