@@ -699,7 +699,7 @@ def add_combined_liquidation_batch(
                 f"{breakdown}\n\n"
                 f"COMBINED SHORT: ${alert_snapshot['short']:,.0f}\n"
                 f"COMBINED LONG: ${alert_snapshot['long']:,.0f}\n"
-                f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+                f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
                 f"BTC {price_text} | BTC MOVE {move_text}"
             )
         else:
@@ -4765,13 +4765,13 @@ def process_btc(
                 f"WINNER "
                 f"{cycle_winner} | "
                 f"LONG "
-                f"${cycle_long:,.0f} "
+                f"${cycle_long:,.0f} ({_usd_m(cycle_long)}) "
                 f"({long_pct:.2f}%) | "
                 f"SHORT "
-                f"${cycle_short:,.0f} "
+                f"${cycle_short:,.0f} ({_usd_m(cycle_short)}) "
                 f"({short_pct:.2f}%) | "
                 f"GAP "
-                f"${cycle_gap:,.0f} | "
+                f"${cycle_gap:,.0f} ({_usd_m(cycle_gap)}) | "
                 f"BTC "
                 f"{btc_price:,.0f} | "
                 f"BTC MOVE "
@@ -4991,6 +4991,14 @@ def _btc_standalone_exchange_lines(
     return lines
 
 
+def _usd_m(value):
+    """Display USD in compact millions, e.g. 5012828 -> 5.01M."""
+    try:
+        return f"{float(value) / 1_000_000:.2f}M"
+    except (TypeError, ValueError):
+        return "0.00M"
+
+
 def _btc_observer_add(exchange_breakdown, price=None):
     global btc_observer_long_cumulative, btc_observer_short_cumulative
     global btc_observer_cycle_ref_price, btc_observer_last_alert_snapshot
@@ -5093,7 +5101,7 @@ def _btc_observer_add(exchange_breakdown, price=None):
 
             observer_ranked.sort(key=lambda row: row[0], reverse=True)
             exchange_lines = [
-                f"{_btc_exchange_label(ex_name)}: LONG ${ex_long:,.0f} | SHORT ${ex_short:,.0f}"
+                f"{_btc_exchange_label(ex_name)}: LONG ${ex_long:,.0f} ({_usd_m(ex_long)}) | SHORT ${ex_short:,.0f} ({_usd_m(ex_short)})"
                 for _, ex_name, ex_long, ex_short in observer_ranked
             ]
             alert_snapshot = {
@@ -5132,9 +5140,9 @@ def _btc_observer_add(exchange_breakdown, price=None):
         )
         message = (
             f"{breakdown}\n\n"
-            f"TOTAL SHORT: ${alert_snapshot['short']:,.0f}\n"
-            f"TOTAL LONG: ${alert_snapshot['long']:,.0f}\n"
-            f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+            f"TOTAL SHORT: ${alert_snapshot['short']:,.0f} ({_usd_m(alert_snapshot['short'])})\n"
+            f"TOTAL LONG: ${alert_snapshot['long']:,.0f} ({_usd_m(alert_snapshot['long'])})\n"
+            f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
             f"BTC {price_text} | BTC MOVE {move_text}"
         )
         sent = send_pushover(alert_snapshot["title"], message)
@@ -5323,7 +5331,7 @@ def process_marginpad_btc(closed_minute_ts):
             f"{breakdown}\n\n"
             f"MARGINPAD SHORT: ${alert_snapshot['short']:,.0f}\n"
             f"MARGINPAD LONG: ${alert_snapshot['long']:,.0f}\n"
-            f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+            f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
             f"BTC {alert_snapshot['price']:,.0f} | BTC MOVE {move_text}"
         )
         # Standalone MarginPad BTC Pushover intentionally disabled.
@@ -5491,7 +5499,7 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
             f"{breakdown}\n\n"
             f"LIQUIDATOR SHORT: ${alert_snapshot['short']:,.0f}\n"
             f"LIQUIDATOR LONG: ${alert_snapshot['long']:,.0f}\n"
-            f"GAP: ${alert_snapshot['gap']:,.0f}\n"
+            f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
             f"BTC {price_text} | BTC MOVE {move_text}"
         )
         # Standalone 4-exchange BTC Liquidator Pushover intentionally disabled.
@@ -5912,13 +5920,13 @@ def process_xau(
                 f"WINNER "
                 f"{cycle_winner} | "
                 f"LONG "
-                f"${cycle_long:,.0f} "
+                f"${cycle_long:,.0f} ({_usd_m(cycle_long)}) "
                 f"({long_pct:.2f}%) | "
                 f"SHORT "
-                f"${cycle_short:,.0f} "
+                f"${cycle_short:,.0f} ({_usd_m(cycle_short)}) "
                 f"({short_pct:.2f}%) | "
                 f"GAP "
-                f"${cycle_gap:,.0f} | "
+                f"${cycle_gap:,.0f} ({_usd_m(cycle_gap)}) | "
                 f"XAU "
                 f"{xau_price:,.2f} | "
                 f"XAU MOVE "
