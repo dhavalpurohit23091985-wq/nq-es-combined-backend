@@ -5310,10 +5310,12 @@ def process_marginpad_btc(closed_minute_ts):
             f"GAP: ${alert_snapshot['gap']:,.0f}\n"
             f"BTC {alert_snapshot['price']:,.0f} | BTC MOVE {move_text}"
         )
-        sent = send_pushover(alert_snapshot["title"], message)
+        # Standalone MarginPad BTC Pushover intentionally disabled.
+        # Calculation/reset + MT5 publication + Observer feed remain unchanged.
+        sent = False
         print(
-            f"[MARGINPAD BTC ALERT] {alert_snapshot['title']} "
-            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} sent={sent}",
+            f"[MARGINPAD BTC ALERT SILENT] {alert_snapshot['title']} "
+            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f}",
             flush=True,
         )
 
@@ -5476,11 +5478,13 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
             f"GAP: ${alert_snapshot['gap']:,.0f}\n"
             f"BTC {price_text} | BTC MOVE {move_text}"
         )
-        sent = send_pushover(alert_snapshot["title"], message)
-        result["alert_sent"] = sent
+        # Standalone 4-exchange BTC Liquidator Pushover intentionally disabled.
+        # Calculation/reset + Observer feed remain unchanged.
+        sent = False
+        result["alert_sent"] = False
         print(
-            f"[BTC LIQUIDATOR ALERT] {alert_snapshot['title']} "
-            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} sent={sent}",
+            f"[BTC LIQUIDATOR ALERT SILENT] {alert_snapshot['title']} "
+            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f}",
             flush=True,
         )
     else:
