@@ -4638,14 +4638,9 @@ def process_btc(
         cycle_short
     )
 
-    long_hit = (
-        cycle_long
-        >=
-        BTC_LIQ_THRESHOLD
-    )
-
-    short_hit = (
-        cycle_short
+    # GAP trigger: alert only when absolute LONG-vs-SHORT imbalance reaches $5M.
+    gap_hit = (
+        cycle_gap
         >=
         BTC_LIQ_THRESHOLD
     )
@@ -4673,38 +4668,20 @@ def process_btc(
             BTC_LOW_MOVE_POINTS
         )
 
-    if (
-        long_hit
-        or
-        short_hit
-    ):
+    if gap_hit:
 
-        if (
-            long_hit
-            and
-            short_hit
-        ):
-
-            cycle_winner = (
-                "BOTH HIT SAME MINUTE"
-            )
-
-            alert_title = (
-                "BTC COINALYZE BOTH HIT +5M"
-            )
-
-        elif long_hit:
+        if cycle_long > cycle_short:
 
             cycle_winner = "LONG"
             alert_title = (
-                "BTC COINALYZE LONG WINS +5M"
+                "BTC COINALYZE LONG WINS +5M GAP"
             )
 
         else:
 
             cycle_winner = "SHORT"
             alert_title = (
-                "BTC COINALYZE SHORT WINS +5M"
+                "BTC COINALYZE SHORT WINS +5M GAP"
             )
 
         move_text = (
@@ -5057,21 +5034,18 @@ def _btc_observer_add(exchange_breakdown, price=None):
             flush=True,
         )
 
-        long_hit = cycle_long >= BTC_OBSERVER_THRESHOLD
-        short_hit = cycle_short >= BTC_OBSERVER_THRESHOLD
+        # GAP trigger: alert only when absolute LONG-vs-SHORT imbalance reaches $5M.
+        # After the alert, the existing Observer reset-to-zero logic below is unchanged.
+        gap = abs(cycle_long - cycle_short)
+        gap_hit = gap >= BTC_OBSERVER_THRESHOLD
 
-        if long_hit or short_hit:
-            if long_hit and short_hit:
-                winner = "BOTH HIT SAME CYCLE"
-                title = "BTC OBSERVER BOTH HIT +5M"
-            elif long_hit:
+        if gap_hit:
+            if cycle_long > cycle_short:
                 winner = "LONG"
-                title = "BTC OBSERVER LONG WINS +5M"
+                title = "BTC OBSERVER LONG WINS +5M GAP"
             else:
                 winner = "SHORT"
-                title = "BTC OBSERVER SHORT WINS +5M"
-
-            gap = abs(cycle_long - cycle_short)
+                title = "BTC OBSERVER SHORT WINS +5M GAP"
             move = (
                 abs(current_price - btc_observer_cycle_ref_price)
                 if current_price is not None and btc_observer_cycle_ref_price is not None
