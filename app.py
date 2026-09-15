@@ -3239,11 +3239,14 @@ def zerodha_nifty_coi_monitor():
                 ce_pct = 0.0
                 pe_pct = 0.0
 
+            net_contracts = gap / 65.0
+
             message = (
                 f"SOURCE ZERODHA | WINNER {winner} | "
                 f"CE COI {snap['ce_coi_raw']:+,d} ({ce_pct:.2f}%) | "
                 f"PE COI {snap['pe_coi_raw']:+,d} ({pe_pct:.2f}%) | "
                 f"GAP {gap:+,d} | "
+                f"NET CONTRACTS {net_contracts:+,.0f} | "
                 f"NIFTY {snap['nifty_now']:,.2f} | "
                 f"NIFTY MOVE {move:+,.2f} pts | "
                 f"09:15 OPEN {snap['nifty_open']:,.2f} | "
