@@ -5077,12 +5077,25 @@ def _btc_observer_add(exchange_breakdown, price=None):
                 if current_price is not None and btc_observer_cycle_ref_price is not None
                 else None
             )
-            exchange_lines = _btc_standalone_exchange_lines(
-                btc_observer_by_exchange,
-                winner,
-                include_all=True,
-                required_exchanges=BTC_OBSERVER_EXCHANGES,
-            )
+            # Observer display audit: always show BOTH LONG and SHORT totals
+            # for every one of the 13 exchanges. This is display-only; the
+            # observer threshold, winner calculation, cycle and reset are unchanged.
+            observer_ranked = []
+            for ex_name in BTC_OBSERVER_EXCHANGES:
+                ex_totals = btc_observer_by_exchange.get(
+                    ex_name, {"long": 0.0, "short": 0.0}
+                )
+                ex_long = max(0.0, float(ex_totals.get("long", 0.0) or 0.0))
+                ex_short = max(0.0, float(ex_totals.get("short", 0.0) or 0.0))
+                observer_ranked.append(
+                    (max(ex_long, ex_short), ex_name, ex_long, ex_short)
+                )
+
+            observer_ranked.sort(key=lambda row: row[0], reverse=True)
+            exchange_lines = [
+                f"{_btc_exchange_label(ex_name)}: LONG ${ex_long:,.0f} | SHORT ${ex_short:,.0f}"
+                for _, ex_name, ex_long, ex_short in observer_ranked
+            ]
             alert_snapshot = {
                 "asset": "BTC",
                 "winner": winner,
