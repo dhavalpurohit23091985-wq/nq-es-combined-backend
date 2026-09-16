@@ -706,9 +706,9 @@ def add_combined_liquidation_batch(
             breakdown = "\n".join(alert_snapshot["sources"]) or "No source breakdown"
             message = (
                 f"SOURCE COMBINED | WINNER {alert_snapshot['winner']} | "
-                f"LONG ${alert_snapshot['long']:,.0f} ({alert_snapshot['long_pct']:.2f}%) | "
-                f"SHORT ${alert_snapshot['short']:,.0f} ({alert_snapshot['short_pct']:.2f}%) | "
-                f"GAP ${alert_snapshot['gap']:,.0f} | "
+                f"LONG ${alert_snapshot['long']:,.0f} ({_usd_m(alert_snapshot['long'])}) ({alert_snapshot['long_pct']:.2f}%) | "
+                f"SHORT ${alert_snapshot['short']:,.0f} ({_usd_m(alert_snapshot['short'])}) ({alert_snapshot['short_pct']:.2f}%) | "
+                f"GAP ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])}) | "
                 f"{asset} {price_text} | {asset} MOVE {move_text}\n"
                 f"{breakdown}"
             )
