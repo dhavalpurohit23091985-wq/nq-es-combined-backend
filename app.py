@@ -4464,9 +4464,9 @@ def _btc_reference_text(reference_source, closed_minute_ts):
 
     return (
         f"REF {reference_source} CURRENT CYCLE | "
-        f"LONG ${ref_long:,.0f} ({ref_long_pct:.2f}%) | "
-        f"SHORT ${ref_short:,.0f} ({ref_short_pct:.2f}%) | "
-        f"GAP ${ref_gap:,.0f}"
+        f"LONG ${ref_long:,.0f} ({_usd_m(ref_long)}) ({ref_long_pct:.2f}%) | "
+        f"SHORT ${ref_short:,.0f} ({_usd_m(ref_short)}) ({ref_short_pct:.2f}%) | "
+        f"GAP ${ref_gap:,.0f} ({_usd_m(ref_gap)})"
     )
 
 
