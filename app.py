@@ -392,6 +392,163 @@ def send_pushover(title, message):
         return False
 
 
+def _nasdaq_extract_line(message, prefix):
+    for raw_line in str(message or "").splitlines():
+        line = raw_line.strip()
+        if line.upper().startswith(prefix.upper()):
+            return line[len(prefix):].strip()
+    return None
+
+
+def _nasdaq_classify_alert(title):
+    upper = str(title or "").upper().strip()
+
+    if "NASDAQ TOP5" in upper:
+        source = "TOP5"
+    elif "NASDAQ BOTTOM5" in upper:
+        source = "BOTTOM5"
+    else:
+        return None
+
+    if " BUY " in f" {upper} ":
+        direction = "BUY"
+    elif " SELL " in f" {upper} ":
+        direction = "SELL"
+    else:
+        return None
+
+    return source, direction
+
+
+def _nasdaq_combined_process(title, message):
+    """Consume one final TOP5/BOTTOM5 alert and apply Option-A pairing.
+
+    This function is Pushover-only. It never publishes an MT5 signal and
+    never performs stock/basket percentage calculations.
+    """
+    global nasdaq_combined_pending, nasdaq_combined_recent
+
+    classified = _nasdaq_classify_alert(title)
+    if classified is None:
+        return {
+            "recognized": False,
+            "duplicate": False,
+            "combined_sent": False,
+            "result": None,
+        }
+
+    source, direction = classified
+    fingerprint = f"{str(title)}|{str(message)}"
+
+    completed_hour = _nasdaq_extract_line(message, "COMPLETED HOUR:")
+    nq_text = _nasdaq_extract_line(message, "NQ:")
+    received_ist = datetime.now(NASDAQ_COMBINED_IST).strftime("%d-%m-%Y %H:%M:%S IST")
+    event_time = completed_hour or received_ist
+
+    with _nasdaq_combined_lock:
+        if fingerprint in nasdaq_combined_recent:
+            print(
+                f"[NASDAQ COMBINED DUPLICATE] {source} {direction} | {event_time}",
+                flush=True,
+            )
+            return {
+                "recognized": True,
+                "duplicate": True,
+                "combined_sent": False,
+                "result": None,
+                "pending": nasdaq_combined_pending,
+            }
+
+        nasdaq_combined_recent.append(fingerprint)
+
+        current = {
+            "source": source,
+            "direction": direction,
+            "time": event_time,
+            "received_ist": received_ist,
+            "nq": nq_text,
+            "title": str(title),
+        }
+
+        if nasdaq_combined_pending is None:
+            nasdaq_combined_pending = current
+            print(
+                f"[NASDAQ COMBINED PENDING] {source} {direction} | {event_time}",
+                flush=True,
+            )
+            return {
+                "recognized": True,
+                "duplicate": False,
+                "combined_sent": False,
+                "result": None,
+                "pending": dict(nasdaq_combined_pending),
+            }
+
+        first = dict(nasdaq_combined_pending)
+
+        # Same direction = confirmation. Option A resets after this pair.
+        if first["direction"] == direction:
+            combined_direction = direction
+            nasdaq_combined_pending = None
+
+            nq_display = nq_text or first.get("nq") or "NA"
+
+            combined_title = f"NASDAQ COMBINED {combined_direction} | CONFIRMED"
+            combined_message = (
+                "ALERT 1:\n"
+                f"{first['source']} {first['direction']} | {first['time']}\n\n"
+                "ALERT 2:\n"
+                f"{source} {direction} | {event_time}\n\n"
+                "SEQUENCE:\n"
+                f"{first['direction']} -> {direction}\n\n"
+                "RESULT:\n"
+                f"COMBINED {combined_direction}\n\n"
+                f"NQ: {nq_display}\n\n"
+                "SEQUENCE RESET:\n"
+                "WAITING FOR NEW ALERT"
+            )
+
+            combined_sent = send_pushover(
+                combined_title,
+                combined_message,
+            )
+
+            print(
+                f"[NASDAQ COMBINED CONFIRMED] "
+                f"{first['source']} {first['direction']} -> "
+                f"{source} {direction} | "
+                f"result={combined_direction} | sent={combined_sent}",
+                flush=True,
+            )
+
+            return {
+                "recognized": True,
+                "duplicate": False,
+                "combined_sent": bool(combined_sent),
+                "result": combined_direction,
+                "pending": None,
+            }
+
+        # Opposite direction = no trade. Latest alert becomes new pending.
+        nasdaq_combined_pending = current
+
+        print(
+            f"[NASDAQ COMBINED MISMATCH] "
+            f"{first['source']} {first['direction']} -> "
+            f"{source} {direction} | "
+            f"new_pending={source} {direction}",
+            flush=True,
+        )
+
+        return {
+            "recognized": True,
+            "duplicate": False,
+            "combined_sent": False,
+            "result": None,
+            "pending": dict(nasdaq_combined_pending),
+        }
+
+
 def _combined_remember_direct_event(event_key):
     if not event_key:
         return False
@@ -1794,6 +1951,27 @@ nvda_last_processed_candle_ts = None
 
 
 # ==================================================
+# NASDAQ TOP5 + BOTTOM5 COMBINED CONFIRMATION
+# ==================================================
+# Pushover-only phase.
+# No stock-percentage math here and NO MT5 publication.
+#
+# Option A:
+#   BUY  -> BUY  = COMBINED BUY  -> reset pending
+#   SELL -> SELL = COMBINED SELL -> reset pending
+#   BUY  -> SELL = no combined alert; SELL becomes pending
+#   SELL -> BUY  = no combined alert; BUY becomes pending
+#
+# Source does not matter. TOP5/TOP5, BOTTOM5/BOTTOM5 and mixed pairs
+# are all valid if the two consecutive directions match.
+
+NASDAQ_COMBINED_IST = ZoneInfo("Asia/Kolkata")
+nasdaq_combined_pending = None
+nasdaq_combined_recent = deque(maxlen=50)
+_nasdaq_combined_lock = threading.RLock()
+
+
+# ==================================================
 # PERSISTENT RUNTIME STATE - BTC/XAU/NVDA
 # ==================================================
 # Core strategy logic is unchanged. This only preserves in-memory runtime
@@ -1877,6 +2055,11 @@ def _runtime_state_payload():
             'state': nvda_state,
             'last_processed_candle_ts': nvda_last_processed_candle_ts,
         },
+
+        'nasdaq_combined': {
+            'pending': nasdaq_combined_pending,
+            'recent': list(nasdaq_combined_recent),
+        },
     }
 
 
@@ -1922,6 +2105,7 @@ def _load_runtime_state():
     global mt5_latest_signals
     global nvda_session_date_ist, nvda_session_open
     global nvda_state, nvda_last_processed_candle_ts
+    global nasdaq_combined_pending, nasdaq_combined_recent
 
     if not os.path.exists(RUNTIME_STATE_FILE):
         print('[RUNTIME STATE] no saved state yet', flush=True)
@@ -2067,6 +2251,17 @@ def _load_runtime_state():
         nvda_state = int(nvd.get('state', 0) or 0)
         nvda_last_processed_candle_ts = nvd.get('last_processed_candle_ts')
 
+        nas_comb = data.get('nasdaq_combined') or {}
+        saved_pending = nas_comb.get('pending')
+        nasdaq_combined_pending = (
+            saved_pending
+            if isinstance(saved_pending, dict)
+            and saved_pending.get('direction') in ('BUY', 'SELL')
+            else None
+        )
+        saved_recent = list(nas_comb.get('recent') or [])[-50:]
+        nasdaq_combined_recent = deque(saved_recent, maxlen=50)
+
         print(
             '[RUNTIME STATE RESTORED] '
             f'BTC C={btc_long_cumulative:.0f}/{btc_short_cumulative:.0f} | '
@@ -2133,6 +2328,12 @@ def debug_runtime_state():
             'session_open': nvda_session_open,
             'state': nvda_state,
             'last_processed_candle_ts': nvda_last_processed_candle_ts,
+        },
+        'nasdaq_combined': {
+            'pending': nasdaq_combined_pending,
+            'recent_count': len(nasdaq_combined_recent),
+            'phase': 'PUSHOVER_ONLY',
+            'option': 'A_RESET_AFTER_CONFIRMED_PAIR',
         },
     })
 
@@ -3492,24 +3693,36 @@ def webhook():
         "message" in data
     ):
 
-        ok = send_pushover(
-            str(
-                data.get(
-                    "title",
-                    "TradingView Alert"
-                )
-            ),
-            str(
-                data.get(
-                    "message",
-                    ""
-                )
+        tv_title = str(
+            data.get(
+                "title",
+                "TradingView Alert"
             )
+        )
+        tv_message = str(
+            data.get(
+                "message",
+                ""
+            )
+        )
+
+        # Keep the original individual TradingView -> Pushover alert unchanged.
+        ok = send_pushover(
+            tv_title,
+            tv_message
+        )
+
+        # Separately consume only NASDAQ TOP5/BOTTOM5 final alerts.
+        # This is confirmation/Pushover only; MT5 is intentionally untouched.
+        nasdaq_result = _nasdaq_combined_process(
+            tv_title,
+            tv_message
         )
 
         return jsonify({
             "ok": ok,
-            "mode": "direct_pushover"
+            "mode": "direct_pushover",
+            "nasdaq_combined": nasdaq_result
         }), 200 if ok else 500
 
     symbol = str(
