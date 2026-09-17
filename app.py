@@ -202,7 +202,20 @@ _btc_rolling_lock = threading.RLock()
 # ==================================================
 # Completely separate from both BTC MarginPad and XAU Coinalyze.
 
-MARGINPAD_XAU_LIQ_THRESHOLD = 1_000_000
+MARGINPAD_XAU_LIQ_THRESHOLD = 100_000
+
+# XAU final GAP + rolling 60M state. Same architecture as BTC,
+# with a $100K GAP threshold instead of $5M.
+XAU_GAP_THRESHOLD = 100_000.0
+XAU_ROLLING_WINDOW_SECONDS = 3600
+XAU_ROLLING_GAP_THRESHOLD = 100_000.0
+xau_coinalyze_gap_state = None
+xau_observer_gap_state = None
+xau_coinalyze_rolling_events = deque()
+xau_observer_rolling_events = deque()
+xau_coinalyze_rolling_state = None
+xau_observer_rolling_state = None
+_xau_rolling_lock = threading.RLock()
 
 marginpad_xau_long_cumulative = 0.0
 marginpad_xau_short_cumulative = 0.0
@@ -224,7 +237,7 @@ marginpad_xau_seen_set = set()
 
 COMBINED_LIQ_THRESHOLDS = {
     "BTC": 5_000_000.0,
-    "XAU": 1_000_000.0,
+    "XAU": 100_000.0,
 }
 
 COMBINED_DIRECT_EXCHANGES = (
@@ -354,7 +367,7 @@ def _publish_mt5_live_signal(alert_snapshot):
 # XAU FRESH LIQUIDATION SETTINGS
 # ==================================================
 
-XAU_LIQ_THRESHOLD = 1_000_000
+XAU_LIQ_THRESHOLD = 100_000
 
 xau_long_cumulative = 0.0
 xau_short_cumulative = 0.0
@@ -646,6 +659,7 @@ def add_combined_liquidation_batch(
     global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
     global marginpad_btc_last_alert_snapshot
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
+    global xau_observer_gap_state
 
     asset = str(asset or "").upper().strip()
     source = str(source or "").lower().strip()
@@ -738,11 +752,28 @@ def add_combined_liquidation_batch(
         cycle_long = combined_liq[asset]["long"]
         cycle_short = combined_liq[asset]["short"]
         threshold = COMBINED_LIQ_THRESHOLDS[asset]
-        long_hit = cycle_long >= threshold
-        short_hit = cycle_short >= threshold
+        if asset == "XAU":
+            signed_gap = cycle_long - cycle_short
+            long_hit = signed_gap >= XAU_GAP_THRESHOLD and xau_observer_gap_state != "LONG"
+            short_hit = signed_gap <= -XAU_GAP_THRESHOLD and xau_observer_gap_state != "SHORT"
+        else:
+            # Legacy combined BTC cycle stays available for background/MT5 state,
+            # but its Pushover is disabled below. BTC user-facing GAP alert is
+            # the dedicated 13-exchange BTC Observer.
+            long_hit = cycle_long >= threshold
+            short_hit = cycle_short >= threshold
 
         if long_hit or short_hit:
-            if long_hit and short_hit:
+            if asset == "XAU":
+                if long_hit:
+                    winner = "LONG"
+                    xau_observer_gap_state = "LONG"
+                    title = "XAU OBSERVER LONG WINS | 100K GAP"
+                else:
+                    winner = "SHORT"
+                    xau_observer_gap_state = "SHORT"
+                    title = "XAU OBSERVER SHORT WINS | 100K GAP"
+            elif long_hit and short_hit:
                 winner = "BOTH HIT SAME CYCLE"
                 title = f"{asset} COMBINED BOTH HIT +{threshold/1_000_000:g}M"
             elif long_hit:
@@ -902,8 +933,13 @@ def add_combined_liquidation_batch(
                 f"{breakdown}"
             )
 
-        sent = send_pushover(alert_snapshot["title"], message)
-        result["alert_sent"] = sent
+        if asset == "XAU":
+            sent = send_pushover(alert_snapshot["title"], message)
+            result["alert_sent"] = sent
+        else:
+            sent = False
+            result["alert_sent"] = False
+            print(f"[COMBINED BTC PUSHOVER SILENT] {alert_snapshot['title']}", flush=True)
 
         print(
             f"[COMBINED ALERT] {alert_snapshot['title']} "
@@ -1558,8 +1594,6 @@ def get_marginpad_fresh_btc_liquidations(
                 2
             ),
 
-        "rolling_rows": [{"ts": ts, "long": round(v["long"], 2), "short": round(v["short"], 2)} for ts, v in sorted(fresh_rows.items())],
-
         "fresh_net_short_minus_long":
             round(
                 fresh_short
@@ -1704,6 +1738,7 @@ def get_marginpad_fresh_xau_liquidations(
     accepted_events = 0
     newest_event_ms = None
     exchanges = set()
+    rolling_events = []
     normalized_events = []
 
     for event in events:
@@ -1788,6 +1823,13 @@ def get_marginpad_fresh_xau_liquidations(
             fingerprint
         )
 
+        rolling_events.append({
+            "ts_ms": event_ts_ms,
+            "exchange": exchange.lower() or "unknown",
+            "side": "long" if side == "long_liquidated" else "short",
+            "notional": notional,
+        })
+
         accepted_events += 1
 
         if (
@@ -1814,6 +1856,7 @@ def get_marginpad_fresh_xau_liquidations(
         ),
         "exchanges_seen": sorted(exchanges),
         "newest_event_ts_ms": newest_event_ms,
+        "rolling_events": rolling_events,
         "closed_end_ms": closed_end_ms
     }, None
 
@@ -2073,6 +2116,17 @@ def _runtime_state_payload():
             'last_processed_liq_ts': xau_last_processed_liq_ts,
         },
 
+        'xau_gap_direction_states': {
+            'coinalyze': xau_coinalyze_gap_state,
+            'observer': xau_observer_gap_state,
+        },
+        'xau_rolling_60m': {
+            'coinalyze_state': xau_coinalyze_rolling_state,
+            'observer_state': xau_observer_rolling_state,
+            'coinalyze_events': list(xau_coinalyze_rolling_events),
+            'observer_events': list(xau_observer_rolling_events),
+        },
+
         'marginpad_xau': {
             'long_cumulative': marginpad_xau_long_cumulative,
             'short_cumulative': marginpad_xau_short_cumulative,
@@ -2146,6 +2200,9 @@ def _load_runtime_state():
     global btc_coinalyze_rolling_state, btc_observer_rolling_state
     global xau_long_cumulative, xau_short_cumulative
     global xau_cycle_ref_price, xau_last_processed_liq_ts
+    global xau_coinalyze_gap_state, xau_observer_gap_state
+    global xau_coinalyze_rolling_events, xau_observer_rolling_events
+    global xau_coinalyze_rolling_state, xau_observer_rolling_state
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
     global marginpad_xau_cycle_ref_price, marginpad_xau_processed_through_ms
     global marginpad_xau_seen_queue, marginpad_xau_seen_set
@@ -2246,6 +2303,24 @@ def _load_runtime_state():
         xau_short_cumulative = float(cxau.get('short_cumulative', 0.0) or 0.0)
         xau_cycle_ref_price = cxau.get('cycle_ref_price')
         xau_last_processed_liq_ts = cxau.get('last_processed_liq_ts')
+
+        xgap = data.get('xau_gap_direction_states') or {}
+        xau_coinalyze_gap_state = xgap.get('coinalyze') if xgap.get('coinalyze') in ('LONG','SHORT') else None
+        xau_observer_gap_state = xgap.get('observer') if xgap.get('observer') in ('LONG','SHORT') else None
+        xroll = data.get('xau_rolling_60m') or {}
+        xau_coinalyze_rolling_state = xroll.get('coinalyze_state') if xroll.get('coinalyze_state') in ('LONG','SHORT') else None
+        xau_observer_rolling_state = xroll.get('observer_state') if xroll.get('observer_state') in ('LONG','SHORT') else None
+        def _restore_xau_roll(rows):
+            out = deque(); cutoff = time.time() - XAU_ROLLING_WINDOW_SECONDS
+            for row in (rows or []):
+                try:
+                    ts=float(row[0]); side=str(row[1]); amount=float(row[2]); ex=str(row[3]) if len(row)>3 else ""
+                    if ts > 10_000_000_000: ts /= 1000.0
+                    if ts > cutoff and side in ('long','short') and amount > 0: out.append((ts,side,amount,ex))
+                except (TypeError,ValueError,IndexError): pass
+            return deque(sorted(out,key=lambda r:r[0]))
+        xau_coinalyze_rolling_events = _restore_xau_roll(xroll.get('coinalyze_events'))
+        xau_observer_rolling_events = _restore_xau_roll(xroll.get('observer_events'))
 
         mxau = data.get('marginpad_xau') or {}
         marginpad_xau_long_cumulative = float(mxau.get('long_cumulative', 0.0) or 0.0)
@@ -4574,6 +4649,11 @@ def get_fresh_liquidations(
                 2
             ),
 
+        "rolling_rows": [
+            {"ts": ts, "long": round(v["long"], 2), "short": round(v["short"], 2)}
+            for ts, v in sorted(fresh_rows.items())
+        ],
+
         "fresh_net_short_minus_long":
             round(
                 fresh_short
@@ -5285,6 +5365,92 @@ def _usd_m(value):
         return f"{float(value) / 1_000_000:.2f}M"
     except (TypeError, ValueError):
         return "0.00M"
+
+
+def _xau_rolling_trim(events, now_ts):
+    cutoff = float(now_ts) - XAU_ROLLING_WINDOW_SECONDS
+    while events and float(events[0][0]) <= cutoff:
+        events.popleft()
+
+
+def _xau_rolling_totals(events):
+    long_total = sum(float(r[2]) for r in events if r[1] == "long")
+    short_total = sum(float(r[2]) for r in events if r[1] == "short")
+    return long_total, short_total
+
+
+def _xau_rolling_evaluate(source, price=None, now_ts=None):
+    global xau_coinalyze_rolling_state, xau_observer_rolling_state
+    source = str(source or "").lower().strip()
+    if source not in ("coinalyze", "observer"):
+        return None
+    now_ts = float(now_ts) if now_ts is not None else time.time()
+    with _xau_rolling_lock:
+        events = xau_coinalyze_rolling_events if source == "coinalyze" else xau_observer_rolling_events
+        state = xau_coinalyze_rolling_state if source == "coinalyze" else xau_observer_rolling_state
+        _xau_rolling_trim(events, now_ts)
+        long_total, short_total = _xau_rolling_totals(events)
+        signed_gap = long_total - short_total
+        new_state = state
+        if signed_gap >= XAU_ROLLING_GAP_THRESHOLD and state != "LONG":
+            new_state = "LONG"
+        elif signed_gap <= -XAU_ROLLING_GAP_THRESHOLD and state != "SHORT":
+            new_state = "SHORT"
+        if new_state == state:
+            return None
+        if source == "coinalyze":
+            xau_coinalyze_rolling_state = new_state
+            title = f"XAU COINALYZE ROLLING 60M {new_state} | 100K GAP"
+        else:
+            xau_observer_rolling_state = new_state
+            title = f"XAU OBSERVER ROLLING 60M {new_state} | 100K GAP"
+        gap = abs(signed_gap)
+        try: price_text = f"{float(price):,.2f}" if price is not None else "NA"
+        except (TypeError, ValueError): price_text = "NA"
+        message = (f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+                   f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
+                   f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+                   f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nXAU: {price_text}")
+        sent = send_pushover(title, message)
+        print(f"[XAU ROLLING 60M] {source.upper()} {new_state} L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}", flush=True)
+        return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
+
+
+def _xau_rolling_add(source, side, amount, event_ts=None, exchange=None, price=None):
+    source = str(source or "").lower().strip()
+    side = str(side or "").lower().strip()
+    if source not in ("coinalyze", "observer") or side not in ("long", "short"):
+        return None
+    try:
+        amount = float(amount or 0.0)
+        ts = float(event_ts) if event_ts is not None else time.time()
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0:
+        return None
+    if ts > 10_000_000_000:
+        ts /= 1000.0
+    with _xau_rolling_lock:
+        events = xau_coinalyze_rolling_events if source == "coinalyze" else xau_observer_rolling_events
+        events.append((ts, side, amount, str(exchange or "")))
+        if len(events) > 1 and events[-2][0] > ts:
+            ordered = sorted(events, key=lambda r: r[0]); events.clear(); events.extend(ordered)
+    return _xau_rolling_evaluate(source, price=price, now_ts=max(time.time(), ts))
+
+
+def _xau_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=None):
+    try:
+        long_amount=max(0.0,float(long_amount or 0.0)); short_amount=max(0.0,float(short_amount or 0.0)); ts=float(event_ts)
+    except (TypeError,ValueError):
+        return None
+    if ts > 10_000_000_000: ts /= 1000.0
+    with _xau_rolling_lock:
+        if long_amount > 0: xau_coinalyze_rolling_events.append((ts,"long",long_amount,"coinalyze"))
+        if short_amount > 0: xau_coinalyze_rolling_events.append((ts,"short",short_amount,"coinalyze"))
+        if len(xau_coinalyze_rolling_events) > 1:
+            ordered=sorted(xau_coinalyze_rolling_events,key=lambda r:r[0]); xau_coinalyze_rolling_events.clear(); xau_coinalyze_rolling_events.extend(ordered)
+    return _xau_rolling_evaluate("coinalyze", price=price, now_ts=max(time.time(),ts))
 
 
 def _btc_rolling_trim(events, now_ts):
@@ -6004,6 +6170,13 @@ def process_marginpad_xau(
     # Advance only after a successful MarginPad fetch/parse.
     marginpad_xau_processed_through_ms = closed_end_ms
 
+    for revent in fresh.get("rolling_events", []):
+        _xau_rolling_add(
+            "observer", revent.get("side"), revent.get("notional"),
+            revent.get("ts_ms"), exchange=revent.get("exchange"), price=xau_price
+        )
+    _xau_rolling_evaluate("observer", price=xau_price)
+
     combined_result = add_combined_liquidation_batch(
         asset="XAU",
         source="marginpad",
@@ -6057,6 +6230,7 @@ def process_xau(
     global xau_short_cumulative
     global xau_cycle_ref_price
     global xau_last_processed_liq_ts
+    global xau_coinalyze_gap_state
 
     xau_price, price_error = (
         get_xau_price()
@@ -6189,6 +6363,12 @@ def process_xau(
         fresh["fresh_short_usd"]
     )
 
+    for rr in fresh.get("rolling_rows", []):
+        _xau_rolling_add_coinalyze_row(
+            rr.get("long", 0.0), rr.get("short", 0.0), rr.get("ts"), price=xau_price
+        )
+    _xau_rolling_evaluate("coinalyze", price=xau_price)
+
     xau_long_cumulative += (
         fresh_long
     )
@@ -6215,17 +6395,9 @@ def process_xau(
         cycle_short
     )
 
-    long_hit = (
-        cycle_long
-        >=
-        XAU_LIQ_THRESHOLD
-    )
-
-    short_hit = (
-        cycle_short
-        >=
-        XAU_LIQ_THRESHOLD
-    )
+    signed_gap = cycle_long - cycle_short
+    long_hit = signed_gap >= XAU_GAP_THRESHOLD and xau_coinalyze_gap_state != "LONG"
+    short_hit = signed_gap <= -XAU_GAP_THRESHOLD and xau_coinalyze_gap_state != "SHORT"
 
     alert_sent = False
     cycle_winner = None
@@ -6248,35 +6420,14 @@ def process_xau(
         short_hit
     ):
 
-        if (
-            long_hit
-            and
-            short_hit
-        ):
-
-            cycle_winner = (
-                "BOTH HIT SAME MINUTE"
-            )
-
-            alert_title = (
-                "XAU COINALYZE BOTH HIT +1M"
-            )
-
-        elif long_hit:
-
+        if long_hit:
             cycle_winner = "LONG"
-
-            alert_title = (
-                "XAU COINALYZE LONG WINS +1M"
-            )
-
+            xau_coinalyze_gap_state = "LONG"
+            alert_title = "XAU COINALYZE LONG WINS | 100K GAP"
         else:
-
             cycle_winner = "SHORT"
-
-            alert_title = (
-                "XAU COINALYZE SHORT WINS +1M"
-            )
+            xau_coinalyze_gap_state = "SHORT"
+            alert_title = "XAU COINALYZE SHORT WINS | 100K GAP"
 
         move_text = (
             f"{xau_price_move:,.2f} pts"
@@ -6584,7 +6735,7 @@ def direct_liquidation_event():
             event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
         )
     else:
-        # XAU keeps the existing combined MarginPad + direct behaviour.
+        event_ts = (data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp"))
         result = add_combined_liquidation_batch(
             asset=asset,
             source="direct",
@@ -6594,6 +6745,10 @@ def direct_liquidation_event():
             event_key=event_key,
             price=data.get("price"),
         )
+        if not result.get("duplicate"):
+            _xau_rolling_add(
+                "observer", side, amount, event_ts, exchange=exchange, price=data.get("price")
+            )
 
     return jsonify(result), 200
 
