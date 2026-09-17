@@ -184,6 +184,18 @@ btc_observer_by_exchange = {
     for ex in BTC_OBSERVER_EXCHANGES
 }
 
+# BTC GAP + ROLLING 60M STATE
+BTC_GAP_THRESHOLD = 5_000_000.0
+BTC_ROLLING_WINDOW_SECONDS = 3600
+BTC_ROLLING_GAP_THRESHOLD = 5_000_000.0
+btc_coinalyze_gap_state = None
+btc_observer_gap_state = None
+btc_coinalyze_rolling_events = deque()
+btc_observer_rolling_events = deque()
+btc_coinalyze_rolling_state = None
+btc_observer_rolling_state = None
+_btc_rolling_lock = threading.RLock()
+
 
 # ==================================================
 # XAU FRESH LIQUIDATION SETTINGS - MARGINPAD
@@ -1378,6 +1390,7 @@ def get_marginpad_fresh_btc_liquidations(
     newest_event_ms = None
     exchanges = set()
     fresh_by_exchange = {}
+    rolling_events = []
 
     # Oldest first makes logging/debugging easier.
     normalized_events = []
@@ -1507,6 +1520,7 @@ def get_marginpad_fresh_btc_liquidations(
         remember_marginpad_event(
             fingerprint
         )
+        rolling_events.append({"ts_ms": event_ts_ms, "exchange": exchange_key, "side": "long" if side == "long_liquidated" else "short", "notional": notional})
 
         accepted_events += 1
 
@@ -1544,6 +1558,8 @@ def get_marginpad_fresh_btc_liquidations(
                 2
             ),
 
+        "rolling_rows": [{"ts": ts, "long": round(v["long"], 2), "short": round(v["short"], 2)} for ts, v in sorted(fresh_rows.items())],
+
         "fresh_net_short_minus_long":
             round(
                 fresh_short
@@ -1567,6 +1583,8 @@ def get_marginpad_fresh_btc_liquidations(
 
         "newest_event_ts_ms":
             newest_event_ms,
+
+        "rolling_events": rolling_events,
 
         "closed_end_ms":
             closed_end_ms
@@ -2040,6 +2058,14 @@ def _runtime_state_payload():
             'by_exchange': btc_observer_by_exchange,
         },
 
+        'btc_gap_direction_states': {'coinalyze': btc_coinalyze_gap_state, 'observer': btc_observer_gap_state},
+        'btc_rolling_60m': {
+            'coinalyze_state': btc_coinalyze_rolling_state,
+            'observer_state': btc_observer_rolling_state,
+            'coinalyze_events': list(btc_coinalyze_rolling_events),
+            'observer_events': list(btc_observer_rolling_events),
+        },
+
         'coinalyze_xau': {
             'long_cumulative': xau_long_cumulative,
             'short_cumulative': xau_short_cumulative,
@@ -2104,6 +2130,7 @@ def _load_runtime_state():
     global btc_long_cumulative, btc_short_cumulative
     global btc_cycle_ref_price, btc_last_processed_liq_ts
     global btc_last_alert_snapshot
+    global btc_coinalyze_gap_state
     global marginpad_btc_long_cumulative, marginpad_btc_short_cumulative
     global marginpad_btc_cycle_ref_price, marginpad_btc_processed_through_ms
     global marginpad_btc_last_alert_snapshot, marginpad_btc_by_exchange
@@ -2114,6 +2141,9 @@ def _load_runtime_state():
     global btc_observer_long_cumulative, btc_observer_short_cumulative
     global btc_observer_cycle_ref_price, btc_observer_last_alert_snapshot
     global btc_observer_by_exchange
+    global btc_coinalyze_gap_state, btc_observer_gap_state
+    global btc_coinalyze_rolling_events, btc_observer_rolling_events
+    global btc_coinalyze_rolling_state, btc_observer_rolling_state
     global xau_long_cumulative, xau_short_cumulative
     global xau_cycle_ref_price, xau_last_processed_liq_ts
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
@@ -2192,6 +2222,24 @@ def _load_runtime_state():
                     'long': float(ex_totals.get('long', 0.0) or 0.0),
                     'short': float(ex_totals.get('short', 0.0) or 0.0),
                 }
+
+        gap_states = data.get('btc_gap_direction_states') or {}
+        btc_coinalyze_gap_state = gap_states.get('coinalyze') if gap_states.get('coinalyze') in ('LONG','SHORT') else None
+        btc_observer_gap_state = gap_states.get('observer') if gap_states.get('observer') in ('LONG','SHORT') else None
+        rolling = data.get('btc_rolling_60m') or {}
+        btc_coinalyze_rolling_state = rolling.get('coinalyze_state') if rolling.get('coinalyze_state') in ('LONG','SHORT') else None
+        btc_observer_rolling_state = rolling.get('observer_state') if rolling.get('observer_state') in ('LONG','SHORT') else None
+        def _restore_roll(rows):
+            out = deque(); cutoff = time.time() - BTC_ROLLING_WINDOW_SECONDS
+            for row in (rows or []):
+                try:
+                    ts=float(row[0]); side=str(row[1]); amount=float(row[2]); ex=str(row[3]) if len(row)>3 else ""
+                    if ts > 10_000_000_000: ts /= 1000.0
+                    if ts > cutoff and side in ('long','short') and amount > 0: out.append((ts,side,amount,ex))
+                except (TypeError,ValueError,IndexError): pass
+            return deque(sorted(out,key=lambda r:r[0]))
+        btc_coinalyze_rolling_events = _restore_roll(rolling.get('coinalyze_events'))
+        btc_observer_rolling_events = _restore_roll(rolling.get('observer_events'))
 
         cxau = data.get('coinalyze_xau') or {}
         xau_long_cumulative = float(cxau.get('long_cumulative', 0.0) or 0.0)
@@ -4312,6 +4360,7 @@ def get_fresh_liquidations(
 
     fresh_long = 0.0
     fresh_short = 0.0
+    fresh_rows = {}
 
     successful_batches = 0
     failed_batches = []
@@ -4468,6 +4517,9 @@ def get_fresh_liquidations(
                     fresh_short += (
                         short_value
                     )
+                    rb = fresh_rows.setdefault(row_ts, {"long": 0.0, "short": 0.0})
+                    rb["long"] += long_value
+                    rb["short"] += short_value
 
                 except (
                     TypeError,
@@ -4870,6 +4922,11 @@ def process_btc(
         fresh["fresh_short_usd"]
     )
 
+    for rr in fresh.get("rolling_rows", []):
+        _btc_rolling_add_coinalyze_row(
+            rr.get("long", 0.0), rr.get("short", 0.0), rr.get("ts"), price=btc_price
+        )
+
     btc_long_cumulative += (
         fresh_long
     )
@@ -4896,17 +4953,9 @@ def process_btc(
         cycle_short
     )
 
-    long_hit = (
-        cycle_long
-        >=
-        BTC_LIQ_THRESHOLD
-    )
-
-    short_hit = (
-        cycle_short
-        >=
-        BTC_LIQ_THRESHOLD
-    )
+    signed_gap = cycle_long - cycle_short
+    long_hit = signed_gap >= BTC_GAP_THRESHOLD and btc_coinalyze_gap_state != "LONG"
+    short_hit = signed_gap <= -BTC_GAP_THRESHOLD and btc_coinalyze_gap_state != "SHORT"
 
     alert_sent = False
     cycle_winner = None
@@ -4937,33 +4986,14 @@ def process_btc(
         short_hit
     ):
 
-        if (
-            long_hit
-            and
-            short_hit
-        ):
-
-            cycle_winner = (
-                "BOTH HIT SAME MINUTE"
-            )
-
-            alert_title = (
-                "BTC COINALYZE BOTH HIT +5M"
-            )
-
-        elif long_hit:
-
+        if long_hit:
             cycle_winner = "LONG"
-            alert_title = (
-                "BTC COINALYZE LONG WINS +5M"
-            )
-
+            btc_coinalyze_gap_state = "LONG"
+            alert_title = "BTC COINALYZE LONG WINS | +5M GAP"
         else:
-
             cycle_winner = "SHORT"
-            alert_title = (
-                "BTC COINALYZE SHORT WINS +5M"
-            )
+            btc_coinalyze_gap_state = "SHORT"
+            alert_title = "BTC COINALYZE SHORT WINS | +5M GAP"
 
         move_text = (
             f"{btc_price_move:,.0f} pts"
@@ -5257,10 +5287,114 @@ def _usd_m(value):
         return "0.00M"
 
 
+def _btc_rolling_trim(events, now_ts):
+    cutoff = float(now_ts) - BTC_ROLLING_WINDOW_SECONDS
+    while events and float(events[0][0]) <= cutoff:
+        events.popleft()
+
+def _btc_rolling_totals(events):
+    long_total = sum(float(r[2]) for r in events if r[1] == "long")
+    short_total = sum(float(r[2]) for r in events if r[1] == "short")
+    return long_total, short_total
+
+def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=None):
+    global btc_coinalyze_rolling_state, btc_observer_rolling_state
+    source = str(source or "").lower().strip()
+    side = str(side or "").lower().strip()
+    if source not in ("coinalyze", "observer") or side not in ("long", "short"):
+        return None
+    try:
+        amount = float(amount or 0.0)
+        ts = float(event_ts) if event_ts is not None else time.time()
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0:
+        return None
+    if ts > 10_000_000_000:
+        ts /= 1000.0
+    now_ts = max(time.time(), ts)
+    with _btc_rolling_lock:
+        events = btc_coinalyze_rolling_events if source == "coinalyze" else btc_observer_rolling_events
+        state = btc_coinalyze_rolling_state if source == "coinalyze" else btc_observer_rolling_state
+        events.append((ts, side, amount, str(exchange or "")))
+        if len(events) > 1 and events[-2][0] > ts:
+            ordered = sorted(events, key=lambda r: r[0]); events.clear(); events.extend(ordered)
+        _btc_rolling_trim(events, now_ts)
+        long_total, short_total = _btc_rolling_totals(events)
+        signed_gap = long_total - short_total
+        new_state = state
+        if signed_gap >= BTC_ROLLING_GAP_THRESHOLD and state != "LONG":
+            new_state = "LONG"
+        elif signed_gap <= -BTC_ROLLING_GAP_THRESHOLD and state != "SHORT":
+            new_state = "SHORT"
+        if new_state == state:
+            return None
+        if source == "coinalyze":
+            btc_coinalyze_rolling_state = new_state
+            title = f"BTC COINALYZE ROLLING 60M {new_state} | +5M GAP"
+        else:
+            btc_observer_rolling_state = new_state
+            title = f"BTC OBSERVER 13EX ROLLING 60M {new_state} | +5M GAP"
+        gap = abs(signed_gap)
+        try: price_text = f"{float(price):,.0f}" if price is not None else "NA"
+        except (TypeError, ValueError): price_text = "NA"
+        message = (f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+                   f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
+                   f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+                   f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nBTC: {price_text}")
+        sent = send_pushover(title, message)
+        print(f"[BTC ROLLING 60M] {source.upper()} {new_state} L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}", flush=True)
+        return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
+
+def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=None):
+    global btc_coinalyze_rolling_state
+    try:
+        long_amount = max(0.0, float(long_amount or 0.0))
+        short_amount = max(0.0, float(short_amount or 0.0))
+        ts = float(event_ts)
+    except (TypeError, ValueError):
+        return None
+    if ts > 10_000_000_000:
+        ts /= 1000.0
+    if long_amount <= 0 and short_amount <= 0:
+        return None
+    with _btc_rolling_lock:
+        if long_amount > 0:
+            btc_coinalyze_rolling_events.append((ts, "long", long_amount, "coinalyze"))
+        if short_amount > 0:
+            btc_coinalyze_rolling_events.append((ts, "short", short_amount, "coinalyze"))
+        _btc_rolling_trim(btc_coinalyze_rolling_events, max(time.time(), ts))
+        long_total, short_total = _btc_rolling_totals(btc_coinalyze_rolling_events)
+        signed_gap = long_total - short_total
+        state = btc_coinalyze_rolling_state
+        new_state = state
+        if signed_gap >= BTC_ROLLING_GAP_THRESHOLD and state != "LONG":
+            new_state = "LONG"
+        elif signed_gap <= -BTC_ROLLING_GAP_THRESHOLD and state != "SHORT":
+            new_state = "SHORT"
+        if new_state == state:
+            return None
+        btc_coinalyze_rolling_state = new_state
+        gap = abs(signed_gap)
+        try: price_text = f"{float(price):,.0f}" if price is not None else "NA"
+        except (TypeError, ValueError): price_text = "NA"
+        title = f"BTC COINALYZE ROLLING 60M {new_state} | +5M GAP"
+        message = (f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+                   f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
+                   f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+                   f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nBTC: {price_text}")
+        sent = send_pushover(title, message)
+        print(f"[BTC ROLLING 60M] COINALYZE {new_state} L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}", flush=True)
+        return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
+
+
 def _btc_observer_add(exchange_breakdown, price=None):
     global btc_observer_long_cumulative, btc_observer_short_cumulative
     global btc_observer_cycle_ref_price, btc_observer_last_alert_snapshot
     global btc_observer_by_exchange
+    global btc_observer_gap_state
 
     accepted = {}
     for ex_name, totals in (exchange_breakdown or {}).items():
@@ -5323,21 +5457,21 @@ def _btc_observer_add(exchange_breakdown, price=None):
             flush=True,
         )
 
-        long_hit = cycle_long >= BTC_OBSERVER_THRESHOLD
-        short_hit = cycle_short >= BTC_OBSERVER_THRESHOLD
+        signed_gap = cycle_long - cycle_short
+        long_hit = signed_gap >= BTC_GAP_THRESHOLD and btc_observer_gap_state != "LONG"
+        short_hit = signed_gap <= -BTC_GAP_THRESHOLD and btc_observer_gap_state != "SHORT"
 
         if long_hit or short_hit:
-            if long_hit and short_hit:
-                winner = "BOTH HIT SAME CYCLE"
-                title = "BTC OBSERVER BOTH HIT +5M"
-            elif long_hit:
+            if long_hit:
                 winner = "LONG"
-                title = "BTC OBSERVER LONG WINS +5M"
+                btc_observer_gap_state = "LONG"
+                title = "BTC OBSERVER LONG WINS | +5M GAP"
             else:
                 winner = "SHORT"
-                title = "BTC OBSERVER SHORT WINS +5M"
+                btc_observer_gap_state = "SHORT"
+                title = "BTC OBSERVER SHORT WINS | +5M GAP"
 
-            gap = abs(cycle_long - cycle_short)
+            gap = abs(signed_gap)
             move = (
                 abs(current_price - btc_observer_cycle_ref_price)
                 if current_price is not None and btc_observer_cycle_ref_price is not None
@@ -5576,6 +5710,8 @@ def process_marginpad_btc(closed_minute_ts):
     # Feed only this newly accepted MarginPad batch into the independent
     # 13-exchange observer. MarginPad's own cycle above remains unchanged.
     _btc_observer_add(fresh_by_exchange, price=btc_price)
+    for revent in fresh.get("rolling_events", []):
+        _btc_rolling_add("observer", revent.get("side"), revent.get("notional"), revent.get("ts_ms"), exchange=revent.get("exchange"), price=btc_price)
 
     sent = False
     if alert_snapshot:
@@ -5625,7 +5761,7 @@ def process_marginpad_btc(closed_minute_ts):
     }
 
 
-def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=None):
+def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=None, event_ts=None):
     global direct_btc_long_cumulative, direct_btc_short_cumulative
     global direct_btc_cycle_ref_price, direct_btc_last_alert_snapshot
     global direct_btc_by_exchange
@@ -5744,6 +5880,7 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
     # Event is already de-duplicated/accepted by the direct liquidator. Feed
     # the same contribution into the independent observer only once.
     _btc_observer_add_direct(exchange, side, amount, price=current_price)
+    _btc_rolling_add("observer", side, amount, event_ts, exchange=exchange, price=current_price)
 
     if alert_snapshot:
         breakdown = "\n".join(alert_snapshot["exchanges"]) or "No exchange breakdown"
@@ -6444,6 +6581,7 @@ def direct_liquidation_event():
             amount=amount,
             event_key=event_key,
             price=data.get("price"),
+            event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
         )
     else:
         # XAU keeps the existing combined MarginPad + direct behaviour.
