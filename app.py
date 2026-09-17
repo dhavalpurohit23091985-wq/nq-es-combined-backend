@@ -217,6 +217,39 @@ xau_coinalyze_rolling_state = None
 xau_observer_rolling_state = None
 _xau_rolling_lock = threading.RLock()
 
+
+# ==================================================
+# ALL CRYPTO LIQUIDATION - MARGINPAD MARKET-WIDE FEED
+# ==================================================
+# Independent test setup. Existing BTC/XAU logic is untouched.
+# Source: MarginPad GET /api/v1/feed (all tracked liquidation symbols).
+# Only symbols classified as crypto are accepted. XAU/metals/indices are excluded.
+#
+# Setup A: actual LONG-SHORT GAP +/-$5M, RESET after valid reverse-only alert.
+# Setup B: exact trailing 60m GAP +/-$5M, NO RESET, reverse-only.
+
+ALL_CRYPTO_GAP_THRESHOLD = 5_000_000.0
+ALL_CRYPTO_ROLLING_WINDOW_SECONDS = 3600
+ALL_CRYPTO_ROLLING_GAP_THRESHOLD = 5_000_000.0
+ALL_CRYPTO_POLL_SECONDS = 5.0
+ALL_CRYPTO_SEEN_MAX = 50_000
+
+all_crypto_long_cumulative = 0.0
+all_crypto_short_cumulative = 0.0
+all_crypto_gap_state = None
+all_crypto_rolling_events = deque()
+all_crypto_rolling_state = None
+all_crypto_seen_queue = deque()
+all_crypto_seen_set = set()
+all_crypto_by_symbol = {}
+all_crypto_last_poll_ts = None
+all_crypto_last_error = None
+all_crypto_crypto_symbols = set()
+all_crypto_crypto_symbols_refreshed_ts = 0.0
+all_crypto_first_poll_seeded = False
+_all_crypto_lock = threading.RLock()
+_all_crypto_poller_started = False
+
 marginpad_xau_long_cumulative = 0.0
 marginpad_xau_short_cumulative = 0.0
 
@@ -2109,6 +2142,20 @@ def _runtime_state_payload():
             'observer_events': list(btc_observer_rolling_events),
         },
 
+        'all_crypto_marginpad': {
+            'long_cumulative': all_crypto_long_cumulative,
+            'short_cumulative': all_crypto_short_cumulative,
+            'gap_state': all_crypto_gap_state,
+            'rolling_state': all_crypto_rolling_state,
+            'rolling_events': list(all_crypto_rolling_events),
+            'seen_queue': list(all_crypto_seen_queue),
+            'by_symbol': all_crypto_by_symbol,
+            'last_poll_ts': all_crypto_last_poll_ts,
+            'crypto_symbols': sorted(all_crypto_crypto_symbols),
+            'crypto_symbols_refreshed_ts': all_crypto_crypto_symbols_refreshed_ts,
+            'first_poll_seeded': all_crypto_first_poll_seeded,
+        },
+
         'coinalyze_xau': {
             'long_cumulative': xau_long_cumulative,
             'short_cumulative': xau_short_cumulative,
@@ -2198,6 +2245,11 @@ def _load_runtime_state():
     global btc_coinalyze_gap_state, btc_observer_gap_state
     global btc_coinalyze_rolling_events, btc_observer_rolling_events
     global btc_coinalyze_rolling_state, btc_observer_rolling_state
+    global all_crypto_long_cumulative, all_crypto_short_cumulative
+    global all_crypto_gap_state, all_crypto_rolling_events, all_crypto_rolling_state
+    global all_crypto_seen_queue, all_crypto_seen_set, all_crypto_by_symbol
+    global all_crypto_last_poll_ts, all_crypto_crypto_symbols
+    global all_crypto_crypto_symbols_refreshed_ts, all_crypto_first_poll_seeded
     global xau_long_cumulative, xau_short_cumulative
     global xau_cycle_ref_price, xau_last_processed_liq_ts
     global xau_coinalyze_gap_state, xau_observer_gap_state
@@ -2297,6 +2349,37 @@ def _load_runtime_state():
             return deque(sorted(out,key=lambda r:r[0]))
         btc_coinalyze_rolling_events = _restore_roll(rolling.get('coinalyze_events'))
         btc_observer_rolling_events = _restore_roll(rolling.get('observer_events'))
+
+        allc = data.get('all_crypto_marginpad') or {}
+        all_crypto_long_cumulative = float(allc.get('long_cumulative', 0.0) or 0.0)
+        all_crypto_short_cumulative = float(allc.get('short_cumulative', 0.0) or 0.0)
+        all_crypto_gap_state = allc.get('gap_state') if allc.get('gap_state') in ('LONG','SHORT') else None
+        all_crypto_rolling_state = allc.get('rolling_state') if allc.get('rolling_state') in ('LONG','SHORT') else None
+        _all_cutoff = time.time() - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
+        _all_rows = deque()
+        for row in (allc.get('rolling_events') or []):
+            try:
+                ts=float(row[0]); side=str(row[1]); amount=float(row[2]); symbol=str(row[3]) if len(row)>3 else ""
+                if ts > 10_000_000_000: ts /= 1000.0
+                if ts > _all_cutoff and side in ('long','short') and amount > 0:
+                    _all_rows.append((ts,side,amount,symbol))
+            except (TypeError,ValueError,IndexError):
+                pass
+        all_crypto_rolling_events = deque(sorted(_all_rows,key=lambda r:r[0]))
+        _all_seen = list(allc.get('seen_queue') or [])[-ALL_CRYPTO_SEEN_MAX:]
+        all_crypto_seen_queue = deque(_all_seen)
+        all_crypto_seen_set = set(_all_seen)
+        all_crypto_by_symbol = {}
+        for sym, totals in (allc.get('by_symbol') or {}).items():
+            if isinstance(totals, dict):
+                all_crypto_by_symbol[str(sym).upper()] = {
+                    'long': float(totals.get('long', 0.0) or 0.0),
+                    'short': float(totals.get('short', 0.0) or 0.0),
+                }
+        all_crypto_last_poll_ts = allc.get('last_poll_ts')
+        all_crypto_crypto_symbols = set(str(x).upper() for x in (allc.get('crypto_symbols') or []) if x)
+        all_crypto_crypto_symbols_refreshed_ts = float(allc.get('crypto_symbols_refreshed_ts', 0.0) or 0.0)
+        all_crypto_first_poll_seeded = bool(allc.get('first_poll_seeded', False))
 
         cxau = data.get('coinalyze_xau') or {}
         xau_long_cumulative = float(cxau.get('long_cumulative', 0.0) or 0.0)
@@ -2477,6 +2560,18 @@ def debug_runtime_state():
             'ref_price': marginpad_btc_cycle_ref_price,
             'processed_through_ms': marginpad_btc_processed_through_ms,
             'seen_count': len(marginpad_seen_set),
+        },
+        'all_crypto_marginpad': {
+            'long': all_crypto_long_cumulative,
+            'short': all_crypto_short_cumulative,
+            'gap': all_crypto_long_cumulative - all_crypto_short_cumulative,
+            'gap_state': all_crypto_gap_state,
+            'rolling_state': all_crypto_rolling_state,
+            'rolling_event_count': len(all_crypto_rolling_events),
+            'seen_count': len(all_crypto_seen_set),
+            'symbol_count': len(all_crypto_crypto_symbols),
+            'last_poll_ts': all_crypto_last_poll_ts,
+            'last_error': all_crypto_last_error,
         },
         'coinalyze_xau': {
             'long': xau_long_cumulative,
@@ -5372,6 +5467,286 @@ def _usd_m(value):
         return "0"
 
 
+def _all_crypto_event_fingerprint(event):
+    return "|".join([
+        str(event.get("ts", "")),
+        str(event.get("exchange", "")),
+        str(event.get("symbol", "")),
+        str(event.get("side", "")),
+        str(event.get("price", "")),
+        str(event.get("qty", "")),
+        str(event.get("notional", "")),
+    ])
+
+
+def _all_crypto_remember(fingerprint):
+    if fingerprint in all_crypto_seen_set:
+        return False
+    if len(all_crypto_seen_queue) >= ALL_CRYPTO_SEEN_MAX:
+        old = all_crypto_seen_queue.popleft()
+        all_crypto_seen_set.discard(old)
+    all_crypto_seen_queue.append(fingerprint)
+    all_crypto_seen_set.add(fingerprint)
+    return True
+
+
+def _all_crypto_refresh_symbol_universe(force=False):
+    """Refresh crypto symbols from MarginPad markets; safe fallback keeps core majors."""
+    global all_crypto_crypto_symbols, all_crypto_crypto_symbols_refreshed_ts
+    now = time.time()
+    if not force and all_crypto_crypto_symbols and now - all_crypto_crypto_symbols_refreshed_ts < 3600:
+        return True
+    fallback = {"BTC","ETH","SOL","XRP","DOGE","BNB","ADA","LINK","AVAX","LTC"}
+    try:
+        response = requests.get(
+            f"{MARGINPAD_BASE_URL}/api/bot/v1/markets",
+            params={"class": "crypto"},
+            timeout=12,
+        )
+        if response.ok:
+            payload = response.json()
+            rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+            symbols = set()
+            if isinstance(rows, dict):
+                rows = rows.get("markets") or rows.get("items") or rows.get("symbols") or []
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        sym = str(row.get("symbol", "")).upper().strip()
+                    else:
+                        sym = str(row).upper().strip()
+                    if sym:
+                        # Normalize common pair forms to base symbol used by liquidation feed.
+                        for suffix in ("USDT", "USD", "PERP"):
+                            if sym.endswith(suffix) and len(sym) > len(suffix):
+                                sym = sym[:-len(suffix)].rstrip("-_/:")
+                                break
+                        if sym:
+                            symbols.add(sym)
+            if symbols:
+                all_crypto_crypto_symbols = symbols
+                all_crypto_crypto_symbols_refreshed_ts = now
+                print(f"[ALL CRYPTO SYMBOLS] refreshed={len(symbols)}", flush=True)
+                return True
+    except Exception as exc:
+        print(f"[ALL CRYPTO SYMBOLS ERROR] {exc}", flush=True)
+    if not all_crypto_crypto_symbols:
+        all_crypto_crypto_symbols = fallback
+    all_crypto_crypto_symbols_refreshed_ts = now
+    return False
+
+
+def _all_crypto_rolling_trim(now_ts):
+    cutoff = float(now_ts) - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
+    while all_crypto_rolling_events and float(all_crypto_rolling_events[0][0]) <= cutoff:
+        all_crypto_rolling_events.popleft()
+
+
+def _all_crypto_rolling_totals():
+    long_total = sum(float(r[2]) for r in all_crypto_rolling_events if r[1] == "long")
+    short_total = sum(float(r[2]) for r in all_crypto_rolling_events if r[1] == "short")
+    return long_total, short_total
+
+
+def _all_crypto_send_rolling_if_flip(now_ts=None):
+    global all_crypto_rolling_state
+    now_ts = float(now_ts) if now_ts is not None else time.time()
+    _all_crypto_rolling_trim(now_ts)
+    long_total, short_total = _all_crypto_rolling_totals()
+    signed_gap = long_total - short_total
+    state = all_crypto_rolling_state
+    new_state = state
+    if signed_gap >= ALL_CRYPTO_ROLLING_GAP_THRESHOLD and state != "LONG":
+        new_state = "LONG"
+    elif signed_gap <= -ALL_CRYPTO_ROLLING_GAP_THRESHOLD and state != "SHORT":
+        new_state = "SHORT"
+    if new_state == state:
+        return False
+    all_crypto_rolling_state = new_state
+    gap = abs(signed_gap)
+    title = f"ALL CRYPTO ROLLING 60M {new_state} | 5M GAP"
+    message = (
+        "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+        f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
+        f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+        f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+        f"STRONGER: {new_state}\n"
+        f"STATE: {state or 'NONE'} -> {new_state}"
+    )
+    sent = send_pushover(title, message)
+    print(f"[ALL CRYPTO ROLLING ALERT] {title} sent={sent}", flush=True)
+    return bool(sent)
+
+
+def _all_crypto_send_reset_if_flip():
+    global all_crypto_long_cumulative, all_crypto_short_cumulative
+    global all_crypto_gap_state, all_crypto_by_symbol
+    signed_gap = all_crypto_long_cumulative - all_crypto_short_cumulative
+    state = all_crypto_gap_state
+    new_state = state
+    if signed_gap >= ALL_CRYPTO_GAP_THRESHOLD and state != "LONG":
+        new_state = "LONG"
+    elif signed_gap <= -ALL_CRYPTO_GAP_THRESHOLD and state != "SHORT":
+        new_state = "SHORT"
+    if new_state == state:
+        return False
+    gap = abs(signed_gap)
+    ranked = []
+    display_side = "long" if new_state == "LONG" else "short"
+    for symbol, totals in all_crypto_by_symbol.items():
+        amount = float(totals.get(display_side, 0.0) or 0.0)
+        if amount > 0:
+            ranked.append((amount, symbol))
+    ranked.sort(reverse=True)
+    top_lines = [f"{sym}: ${amount:,.0f} ({_usd_m(amount)})" for amount, sym in ranked[:8]]
+    title = f"ALL CRYPTO {new_state} WINS | 5M GAP"
+    message = (
+        "MARKET-WIDE CRYPTO | RESET AFTER VALID FLIP\n"
+        f"LONG: ${all_crypto_long_cumulative:,.0f} ({_usd_m(all_crypto_long_cumulative)})\n"
+        f"SHORT: ${all_crypto_short_cumulative:,.0f} ({_usd_m(all_crypto_short_cumulative)})\n"
+        f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+        f"STRONGER: {new_state}\n"
+        f"STATE: {state or 'NONE'} -> {new_state}"
+    )
+    if top_lines:
+        message += "\n\nTOP CONTRIBUTORS:\n" + "\n".join(top_lines)
+    sent = send_pushover(title, message)
+    print(f"[ALL CRYPTO GAP ALERT] {title} sent={sent}", flush=True)
+    all_crypto_gap_state = new_state
+    # RESET totals only after a valid reverse-only signal. Direction state persists.
+    all_crypto_long_cumulative = 0.0
+    all_crypto_short_cumulative = 0.0
+    all_crypto_by_symbol = {}
+    return bool(sent)
+
+
+def process_marginpad_all_crypto_feed(seed_only=False):
+    """Poll MarginPad /api/v1/feed and update the independent ALL CRYPTO test states."""
+    global all_crypto_long_cumulative, all_crypto_short_cumulative
+    global all_crypto_rolling_events
+    global all_crypto_last_poll_ts, all_crypto_last_error, all_crypto_first_poll_seeded
+    _all_crypto_refresh_symbol_universe()
+    try:
+        payload, error = marginpad_get(
+            "/api/v1/feed",
+            timeout=12,
+            stage="marginpad-all-crypto-feed",
+        )
+        if error:
+            all_crypto_last_error = str(error)
+            return {"ok": False, "error": error}
+        events = extract_marginpad_events(payload)
+        if not events and isinstance(payload, dict) and isinstance(payload.get("events"), list):
+            events = payload.get("events")
+        if not isinstance(events, list):
+            return {"ok": False, "error": "events payload is not a list"}
+
+        normalized = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            ts_ms = normalize_marginpad_ts_ms(event.get("ts"))
+            if ts_ms is None:
+                continue
+            normalized.append((ts_ms, event))
+        normalized.sort(key=lambda x: x[0])
+
+        accepted = 0
+        seeded = 0
+        with _all_crypto_lock:
+            for ts_ms, event in normalized:
+                fp = _all_crypto_event_fingerprint(event)
+                if fp in all_crypto_seen_set:
+                    continue
+                symbol = str(event.get("symbol", "")).upper().strip()
+                # Hard reject known non-crypto instruments; then require crypto universe membership.
+                if symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+                    _all_crypto_remember(fp)
+                    continue
+                # /api/v1/feed is MarginPad's market-wide crypto liquidation feed.
+                # Do not gate on the optional /markets cache: that could silently
+                # drop newly tracked coins if the symbol-universe refresh fails.
+                try:
+                    notional = abs(float(event.get("notional", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    _all_crypto_remember(fp)
+                    continue
+                side_raw = str(event.get("side", "")).lower().strip()
+                if notional <= 0 or side_raw not in ("long_liquidated", "short_liquidated"):
+                    _all_crypto_remember(fp)
+                    continue
+                _all_crypto_remember(fp)
+                if seed_only or not all_crypto_first_poll_seeded:
+                    seeded += 1
+                    continue
+                side = "long" if side_raw == "long_liquidated" else "short"
+                ts_sec = ts_ms / 1000.0
+                if side == "long":
+                    all_crypto_long_cumulative += notional
+                else:
+                    all_crypto_short_cumulative += notional
+                bucket = all_crypto_by_symbol.setdefault(symbol or "UNKNOWN", {"long": 0.0, "short": 0.0})
+                bucket[side] += notional
+                all_crypto_rolling_events.append((ts_sec, side, notional, symbol))
+                accepted += 1
+                print(
+                    f"[ALL CRYPTO ACCEPTED] ts_ms={ts_ms} symbol={symbol or '-'} "
+                    f"exchange={event.get('exchange','')} side={side_raw} notional=${notional:,.2f}",
+                    flush=True,
+                )
+
+            if accepted and len(all_crypto_rolling_events) > 1:
+                all_crypto_rolling_events = deque(sorted(all_crypto_rolling_events, key=lambda r: r[0]))
+            if not all_crypto_first_poll_seeded:
+                all_crypto_first_poll_seeded = True
+                print(f"[ALL CRYPTO SEEDED] existing_events={seeded} | live counting starts next poll", flush=True)
+            now_ts = time.time()
+            _all_crypto_rolling_trim(now_ts)
+            reset_alert = _all_crypto_send_reset_if_flip()
+            rolling_alert = _all_crypto_send_rolling_if_flip(now_ts)
+            all_crypto_last_poll_ts = now_ts
+            all_crypto_last_error = None
+
+        _save_runtime_state()
+        return {
+            "ok": True,
+            "events_returned": len(events),
+            "events_accepted": accepted,
+            "seeded": seeded,
+            "long": round(all_crypto_long_cumulative, 2),
+            "short": round(all_crypto_short_cumulative, 2),
+            "gap": round(all_crypto_long_cumulative - all_crypto_short_cumulative, 2),
+            "gap_state": all_crypto_gap_state,
+            "rolling_state": all_crypto_rolling_state,
+            "reset_alert_sent": reset_alert,
+            "rolling_alert_sent": rolling_alert,
+        }
+    except Exception as exc:
+        all_crypto_last_error = str(exc)
+        print(f"[ALL CRYPTO POLL ERROR] {exc}", flush=True)
+        return {"ok": False, "error": str(exc)}
+
+
+def _all_crypto_poller_loop():
+    print(f"[ALL CRYPTO POLLER] started interval={ALL_CRYPTO_POLL_SECONDS:.0f}s", flush=True)
+    while True:
+        started = time.monotonic()
+        process_marginpad_all_crypto_feed()
+        elapsed = time.monotonic() - started
+        time.sleep(max(1.0, ALL_CRYPTO_POLL_SECONDS - elapsed))
+
+
+def _start_all_crypto_poller_once():
+    global _all_crypto_poller_started
+    enabled = str(os.environ.get("ALL_CRYPTO_POLLER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if not enabled or _all_crypto_poller_started:
+        return False
+    _all_crypto_poller_started = True
+    thread = threading.Thread(target=_all_crypto_poller_loop, name="all-crypto-marginpad-poller", daemon=True)
+    thread.start()
+    return True
+
+
 def _xau_rolling_trim(events, now_ts):
     cutoff = float(now_ts) - XAU_ROLLING_WINDOW_SECONDS
     while events and float(events[0][0]) <= cutoff:
@@ -7071,6 +7446,50 @@ def xau_minute_alert():
             "alert_sent": False,
             "error": str(e)
         }), 200
+
+
+# ==================================================
+# ALL CRYPTO TEST ENDPOINT - MARGINPAD /api/v1/feed
+# ==================================================
+
+@app.get("/all-crypto-status")
+def all_crypto_status():
+    with _all_crypto_lock:
+        _all_crypto_rolling_trim(time.time())
+        rolling_long, rolling_short = _all_crypto_rolling_totals()
+        return jsonify({
+            "ok": True,
+            "threshold_usd": ALL_CRYPTO_GAP_THRESHOLD,
+            "reset_cycle": {
+                "long": round(all_crypto_long_cumulative, 2),
+                "short": round(all_crypto_short_cumulative, 2),
+                "gap": round(all_crypto_long_cumulative - all_crypto_short_cumulative, 2),
+                "state": all_crypto_gap_state,
+            },
+            "rolling_60m": {
+                "long": round(rolling_long, 2),
+                "short": round(rolling_short, 2),
+                "gap": round(rolling_long - rolling_short, 2),
+                "state": all_crypto_rolling_state,
+                "events": len(all_crypto_rolling_events),
+            },
+            "crypto_symbols": len(all_crypto_crypto_symbols),
+            "seen_events": len(all_crypto_seen_set),
+            "last_poll_ts": all_crypto_last_poll_ts,
+            "last_error": all_crypto_last_error,
+        }), 200
+
+
+@app.get("/all-crypto-poll-now")
+def all_crypto_poll_now():
+    if not cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    return jsonify(process_marginpad_all_crypto_feed()), 200
+
+
+# Start the independent 5-second market-wide liquidation collector.
+# Existing Render config is documented as one worker in this app's persistence section.
+_start_all_crypto_poller_once()
 
 
 # ==================================================
