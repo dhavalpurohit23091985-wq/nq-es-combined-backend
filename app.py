@@ -5360,11 +5360,16 @@ def _btc_standalone_exchange_lines(
 
 
 def _usd_m(value):
-    """Display USD in compact millions, e.g. 5012828 -> 5.01M."""
+    """Display USD compactly: <1K normal, 1K-<1M in K, >=1M in M."""
     try:
-        return f"{float(value) / 1_000_000:.2f}M"
+        amount = abs(float(value))
+        if amount >= 1_000_000:
+            return f"{amount / 1_000_000:.2f}M"
+        if amount >= 1_000:
+            return f"{amount / 1_000:.2f}K"
+        return f"{amount:,.0f}"
     except (TypeError, ValueError):
-        return "0.00M"
+        return "0"
 
 
 def _xau_rolling_trim(events, now_ts):
