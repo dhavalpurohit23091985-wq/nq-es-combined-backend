@@ -403,9 +403,18 @@ def _nasdaq_extract_line(message, prefix):
 def _nasdaq_classify_alert(title):
     upper = str(title or "").upper().strip()
 
-    if "NASDAQ TOP5" in upper:
+    # Keep HOURLY and DAILY as two independent setups.
+    if "NASDAQ DAILY TOP5" in upper:
+        setup = "DAILY"
+        source = "TOP5"
+    elif "NASDAQ DAILY BOTTOM5" in upper:
+        setup = "DAILY"
+        source = "BOTTOM5"
+    elif "NASDAQ TOP5" in upper:
+        setup = "HOURLY"
         source = "TOP5"
     elif "NASDAQ BOTTOM5" in upper:
+        setup = "HOURLY"
         source = "BOTTOM5"
     else:
         return None
@@ -417,14 +426,20 @@ def _nasdaq_classify_alert(title):
     else:
         return None
 
-    return source, direction
+    return setup, source, direction
 
 
 def _nasdaq_combined_process(title, message):
-    """Consume one final TOP5/BOTTOM5 alert and apply Option-A pairing.
+    """Consume one final TOP5/BOTTOM5 alert with separate HOURLY/DAILY pending states.
 
-    This function is Pushover-only. It never publishes an MT5 signal and
-    never performs stock/basket percentage calculations.
+    Pairing logic is unchanged inside each setup:
+      BUY -> BUY   = COMBINED BUY, then reset that setup's pending state
+      SELL -> SELL = COMBINED SELL, then reset that setup's pending state
+      Opposite     = no combined alert; latest becomes pending for that setup
+
+    HOURLY signals can only pair with HOURLY.
+    DAILY signals can only pair with DAILY.
+    Pushover-only; no MT5 publication and no basket percentage calculations.
     """
     global nasdaq_combined_pending, nasdaq_combined_recent
 
@@ -437,8 +452,8 @@ def _nasdaq_combined_process(title, message):
             "result": None,
         }
 
-    source, direction = classified
-    fingerprint = f"{str(title)}|{str(message)}"
+    setup, source, direction = classified
+    fingerprint = f"{setup}|{str(title)}|{str(message)}"
 
     completed_hour = _nasdaq_extract_line(message, "COMPLETED HOUR:")
     nq_text = _nasdaq_extract_line(message, "NQ:")
@@ -448,20 +463,22 @@ def _nasdaq_combined_process(title, message):
     with _nasdaq_combined_lock:
         if fingerprint in nasdaq_combined_recent:
             print(
-                f"[NASDAQ COMBINED DUPLICATE] {source} {direction} | {event_time}",
+                f"[NASDAQ COMBINED DUPLICATE] {setup} {source} {direction} | {event_time}",
                 flush=True,
             )
             return {
                 "recognized": True,
+                "setup": setup,
                 "duplicate": True,
                 "combined_sent": False,
                 "result": None,
-                "pending": nasdaq_combined_pending,
+                "pending": nasdaq_combined_pending.get(setup),
             }
 
         nasdaq_combined_recent.append(fingerprint)
 
         current = {
+            "setup": setup,
             "source": source,
             "direction": direction,
             "time": event_time,
@@ -470,31 +487,35 @@ def _nasdaq_combined_process(title, message):
             "title": str(title),
         }
 
-        if nasdaq_combined_pending is None:
-            nasdaq_combined_pending = current
+        pending = nasdaq_combined_pending.get(setup)
+
+        if pending is None:
+            nasdaq_combined_pending[setup] = current
             print(
-                f"[NASDAQ COMBINED PENDING] {source} {direction} | {event_time}",
+                f"[NASDAQ COMBINED PENDING] {setup} {source} {direction} | {event_time}",
                 flush=True,
             )
             return {
                 "recognized": True,
+                "setup": setup,
                 "duplicate": False,
                 "combined_sent": False,
                 "result": None,
-                "pending": dict(nasdaq_combined_pending),
+                "pending": dict(current),
             }
 
-        first = dict(nasdaq_combined_pending)
+        first = dict(pending)
 
-        # Same direction = confirmation. Option A resets after this pair.
+        # Same direction = confirmation. Reset ONLY this setup.
         if first["direction"] == direction:
             combined_direction = direction
-            nasdaq_combined_pending = None
+            nasdaq_combined_pending[setup] = None
 
             nq_display = nq_text or first.get("nq") or "NA"
 
-            combined_title = f"NASDAQ COMBINED {combined_direction} | CONFIRMED"
+            combined_title = f"NASDAQ {setup} COMBINED {combined_direction} | CONFIRMED"
             combined_message = (
+                f"SETUP: {setup}\n\n"
                 "ALERT 1:\n"
                 f"{first['source']} {first['direction']} | {first['time']}\n\n"
                 "ALERT 2:\n"
@@ -505,16 +526,13 @@ def _nasdaq_combined_process(title, message):
                 f"COMBINED {combined_direction}\n\n"
                 f"NQ: {nq_display}\n\n"
                 "SEQUENCE RESET:\n"
-                "WAITING FOR NEW ALERT"
+                f"{setup} WAITING FOR NEW ALERT"
             )
 
-            combined_sent = send_pushover(
-                combined_title,
-                combined_message,
-            )
+            combined_sent = send_pushover(combined_title, combined_message)
 
             print(
-                f"[NASDAQ COMBINED CONFIRMED] "
+                f"[NASDAQ COMBINED CONFIRMED] {setup} "
                 f"{first['source']} {first['direction']} -> "
                 f"{source} {direction} | "
                 f"result={combined_direction} | sent={combined_sent}",
@@ -523,17 +541,18 @@ def _nasdaq_combined_process(title, message):
 
             return {
                 "recognized": True,
+                "setup": setup,
                 "duplicate": False,
                 "combined_sent": bool(combined_sent),
                 "result": combined_direction,
                 "pending": None,
             }
 
-        # Opposite direction = no trade. Latest alert becomes new pending.
-        nasdaq_combined_pending = current
+        # Opposite direction = no trade. Replace pending ONLY for this setup.
+        nasdaq_combined_pending[setup] = current
 
         print(
-            f"[NASDAQ COMBINED MISMATCH] "
+            f"[NASDAQ COMBINED MISMATCH] {setup} "
             f"{first['source']} {first['direction']} -> "
             f"{source} {direction} | "
             f"new_pending={source} {direction}",
@@ -542,10 +561,11 @@ def _nasdaq_combined_process(title, message):
 
         return {
             "recognized": True,
+            "setup": setup,
             "duplicate": False,
             "combined_sent": False,
             "result": None,
-            "pending": dict(nasdaq_combined_pending),
+            "pending": dict(current),
         }
 
 
@@ -1966,7 +1986,7 @@ nvda_last_processed_candle_ts = None
 # are all valid if the two consecutive directions match.
 
 NASDAQ_COMBINED_IST = ZoneInfo("Asia/Kolkata")
-nasdaq_combined_pending = None
+nasdaq_combined_pending = {"HOURLY": None, "DAILY": None}
 nasdaq_combined_recent = deque(maxlen=50)
 _nasdaq_combined_lock = threading.RLock()
 
@@ -2253,12 +2273,37 @@ def _load_runtime_state():
 
         nas_comb = data.get('nasdaq_combined') or {}
         saved_pending = nas_comb.get('pending')
-        nasdaq_combined_pending = (
-            saved_pending
-            if isinstance(saved_pending, dict)
-            and saved_pending.get('direction') in ('BUY', 'SELL')
-            else None
-        )
+
+        # New format: {"HOURLY": <pending-or-None>, "DAILY": <pending-or-None>}.
+        # Backward compatibility: the old backend stored one pending dict;
+        # Daily titles were not recognized then, so migrate that old pending to HOURLY.
+        if isinstance(saved_pending, dict) and (
+            "HOURLY" in saved_pending or "DAILY" in saved_pending
+        ):
+            hourly_pending = saved_pending.get("HOURLY")
+            daily_pending = saved_pending.get("DAILY")
+        elif isinstance(saved_pending, dict) and saved_pending.get('direction') in ('BUY', 'SELL'):
+            hourly_pending = saved_pending
+            daily_pending = None
+        else:
+            hourly_pending = None
+            daily_pending = None
+
+        nasdaq_combined_pending = {
+            "HOURLY": (
+                hourly_pending
+                if isinstance(hourly_pending, dict)
+                and hourly_pending.get('direction') in ('BUY', 'SELL')
+                else None
+            ),
+            "DAILY": (
+                daily_pending
+                if isinstance(daily_pending, dict)
+                and daily_pending.get('direction') in ('BUY', 'SELL')
+                else None
+            ),
+        }
+
         saved_recent = list(nas_comb.get('recent') or [])[-50:]
         nasdaq_combined_recent = deque(saved_recent, maxlen=50)
 
