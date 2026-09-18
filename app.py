@@ -237,6 +237,9 @@ ALL_CRYPTO_SEEN_MAX = 50_000
 all_crypto_long_cumulative = 0.0
 all_crypto_short_cumulative = 0.0
 all_crypto_gap_state = None
+# Start timestamp of the current cumulative RESET cycle.
+# Starts on the first accepted liquidation after reset and persists across restarts.
+all_crypto_cycle_start_ts = None
 all_crypto_rolling_events = deque()
 all_crypto_rolling_state = None
 all_crypto_seen_queue = deque()
@@ -2146,6 +2149,7 @@ def _runtime_state_payload():
             'long_cumulative': all_crypto_long_cumulative,
             'short_cumulative': all_crypto_short_cumulative,
             'gap_state': all_crypto_gap_state,
+            'cycle_start_ts': all_crypto_cycle_start_ts,
             'rolling_state': all_crypto_rolling_state,
             'rolling_events': list(all_crypto_rolling_events),
             'seen_queue': list(all_crypto_seen_queue),
@@ -2247,6 +2251,7 @@ def _load_runtime_state():
     global btc_coinalyze_rolling_state, btc_observer_rolling_state
     global all_crypto_long_cumulative, all_crypto_short_cumulative
     global all_crypto_gap_state, all_crypto_rolling_events, all_crypto_rolling_state
+    global all_crypto_cycle_start_ts
     global all_crypto_seen_queue, all_crypto_seen_set, all_crypto_by_symbol
     global all_crypto_last_poll_ts, all_crypto_crypto_symbols
     global all_crypto_crypto_symbols_refreshed_ts, all_crypto_first_poll_seeded
@@ -2354,6 +2359,14 @@ def _load_runtime_state():
         all_crypto_long_cumulative = float(allc.get('long_cumulative', 0.0) or 0.0)
         all_crypto_short_cumulative = float(allc.get('short_cumulative', 0.0) or 0.0)
         all_crypto_gap_state = allc.get('gap_state') if allc.get('gap_state') in ('LONG','SHORT') else None
+        _saved_all_crypto_cycle_start = allc.get('cycle_start_ts')
+        try:
+            all_crypto_cycle_start_ts = float(_saved_all_crypto_cycle_start) if _saved_all_crypto_cycle_start is not None else None
+        except (TypeError, ValueError):
+            all_crypto_cycle_start_ts = None
+        # Backward compatibility for a cycle already in progress before this field existed.
+        if all_crypto_cycle_start_ts is None and (all_crypto_long_cumulative > 0 or all_crypto_short_cumulative > 0):
+            all_crypto_cycle_start_ts = time.time()
         all_crypto_rolling_state = allc.get('rolling_state') if allc.get('rolling_state') in ('LONG','SHORT') else None
         _all_cutoff = time.time() - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
         _all_rows = deque()
@@ -2566,6 +2579,8 @@ def debug_runtime_state():
             'short': all_crypto_short_cumulative,
             'gap': all_crypto_long_cumulative - all_crypto_short_cumulative,
             'gap_state': all_crypto_gap_state,
+            'cycle_start_ts': all_crypto_cycle_start_ts,
+            'cycle_age': _format_accumulation_duration(all_crypto_cycle_start_ts),
             'rolling_state': all_crypto_rolling_state,
             'rolling_event_count': len(all_crypto_rolling_events),
             'seen_count': len(all_crypto_seen_set),
@@ -5548,6 +5563,23 @@ def _all_crypto_rolling_totals():
     return long_total, short_total
 
 
+def _format_accumulation_duration(start_ts, end_ts=None):
+    if start_ts is None:
+        return "NA"
+    try:
+        start_ts = float(start_ts)
+        end_ts = float(end_ts) if end_ts is not None else time.time()
+        total_seconds = max(0, int(end_ts - start_ts))
+    except (TypeError, ValueError):
+        return "NA"
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days > 0:
+        return f"{days}D {hours}H {minutes}M {seconds}S"
+    return f"{hours}H {minutes}M {seconds}S"
+
+
 def _all_crypto_send_rolling_if_flip(now_ts=None):
     global all_crypto_rolling_state
     now_ts = float(now_ts) if now_ts is not None else time.time()
@@ -5581,6 +5613,7 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
 def _all_crypto_send_reset_if_flip():
     global all_crypto_long_cumulative, all_crypto_short_cumulative
     global all_crypto_gap_state, all_crypto_by_symbol
+    global all_crypto_cycle_start_ts
     signed_gap = all_crypto_long_cumulative - all_crypto_short_cumulative
     state = all_crypto_gap_state
     new_state = state
@@ -5590,6 +5623,8 @@ def _all_crypto_send_reset_if_flip():
         new_state = "SHORT"
     if new_state == state:
         return False
+    signal_ts = time.time()
+    accumulation_time = _format_accumulation_duration(all_crypto_cycle_start_ts, signal_ts)
     gap = abs(signed_gap)
     ranked = []
     display_side = "long" if new_state == "LONG" else "short"
@@ -5605,18 +5640,20 @@ def _all_crypto_send_reset_if_flip():
         f"LONG: ${all_crypto_long_cumulative:,.0f} ({_usd_m(all_crypto_long_cumulative)})\n"
         f"SHORT: ${all_crypto_short_cumulative:,.0f} ({_usd_m(all_crypto_short_cumulative)})\n"
         f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+        f"ACCUMULATION TIME: {accumulation_time}\n"
         f"STRONGER: {new_state}\n"
         f"STATE: {state or 'NONE'} -> {new_state}"
     )
     if top_lines:
         message += "\n\nTOP CONTRIBUTORS:\n" + "\n".join(top_lines)
     sent = send_pushover(title, message)
-    print(f"[ALL CRYPTO GAP ALERT] {title} sent={sent}", flush=True)
+    print(f"[ALL CRYPTO GAP ALERT] {title} accumulation={accumulation_time} sent={sent}", flush=True)
     all_crypto_gap_state = new_state
     # RESET totals only after a valid reverse-only signal. Direction state persists.
     all_crypto_long_cumulative = 0.0
     all_crypto_short_cumulative = 0.0
     all_crypto_by_symbol = {}
+    all_crypto_cycle_start_ts = None
     return bool(sent)
 
 
@@ -5624,6 +5661,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
     """Poll MarginPad /api/v1/feed and update the independent ALL CRYPTO test states."""
     global all_crypto_long_cumulative, all_crypto_short_cumulative
     global all_crypto_rolling_events
+    global all_crypto_cycle_start_ts
     global all_crypto_last_poll_ts, all_crypto_last_error, all_crypto_first_poll_seeded
     _all_crypto_refresh_symbol_universe()
     try:
@@ -5681,6 +5719,8 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                     continue
                 side = "long" if side_raw == "long_liquidated" else "short"
                 ts_sec = ts_ms / 1000.0
+                if all_crypto_cycle_start_ts is None:
+                    all_crypto_cycle_start_ts = ts_sec
                 if side == "long":
                     all_crypto_long_cumulative += notional
                 else:
