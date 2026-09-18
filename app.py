@@ -429,6 +429,9 @@ XAU_LIQ_THRESHOLD = 100_000
 
 xau_long_cumulative = 0.0
 xau_short_cumulative = 0.0
+# Exchange-level audit for the current XAU Coinalyze cumulative GAP cycle.
+# Display/audit only: does not change totals, threshold, direction state or reset logic.
+xau_coinalyze_by_exchange = {}
 
 xau_cycle_ref_price = None
 xau_last_processed_liq_ts = None
@@ -2246,6 +2249,7 @@ def _runtime_state_payload():
         'coinalyze_xau': {
             'long_cumulative': xau_long_cumulative,
             'short_cumulative': xau_short_cumulative,
+            'by_exchange': xau_coinalyze_by_exchange,
             'cycle_ref_price': xau_cycle_ref_price,
             'last_processed_liq_ts': xau_last_processed_liq_ts,
         },
@@ -2350,7 +2354,7 @@ def _load_runtime_state():
     global all_crypto_seen_queue, all_crypto_seen_set, all_crypto_by_symbol
     global all_crypto_last_poll_ts, all_crypto_crypto_symbols
     global all_crypto_crypto_symbols_refreshed_ts, all_crypto_first_poll_seeded
-    global xau_long_cumulative, xau_short_cumulative
+    global xau_long_cumulative, xau_short_cumulative, xau_coinalyze_by_exchange
     global xau_cycle_ref_price, xau_last_processed_liq_ts
     global xau_coinalyze_gap_state, xau_observer_gap_state
     global xau_coinalyze_rolling_events, xau_observer_rolling_events
@@ -2492,6 +2496,13 @@ def _load_runtime_state():
         cxau = data.get('coinalyze_xau') or {}
         xau_long_cumulative = float(cxau.get('long_cumulative', 0.0) or 0.0)
         xau_short_cumulative = float(cxau.get('short_cumulative', 0.0) or 0.0)
+        xau_coinalyze_by_exchange = {}
+        for ex_name, ex_totals in (cxau.get('by_exchange') or {}).items():
+            if isinstance(ex_totals, dict):
+                xau_coinalyze_by_exchange[str(ex_name)] = {
+                    'long': float(ex_totals.get('long', 0.0) or 0.0),
+                    'short': float(ex_totals.get('short', 0.0) or 0.0),
+                }
         xau_cycle_ref_price = cxau.get('cycle_ref_price')
         xau_last_processed_liq_ts = cxau.get('last_processed_liq_ts')
 
@@ -7145,6 +7156,7 @@ def process_xau(
 
     global xau_long_cumulative
     global xau_short_cumulative
+    global xau_coinalyze_by_exchange
     global xau_cycle_ref_price
     global xau_last_processed_liq_ts
     global xau_coinalyze_gap_state
@@ -7177,6 +7189,7 @@ def process_xau(
 
         xau_long_cumulative = 0.0
         xau_short_cumulative = 0.0
+        xau_coinalyze_by_exchange = {}
 
         return {
             "ok": True,
@@ -7287,6 +7300,16 @@ def process_xau(
         )
     _xau_rolling_evaluate("coinalyze", price=xau_price)
 
+    # Build the exchange audit from the exact same fresh Coinalyze rows that
+    # feed this cumulative GAP cycle. This is audit/display state only.
+    for rr in fresh.get("rolling_rows", []):
+        ex_name = str(rr.get("exchange", "") or "Unknown").strip() or "Unknown"
+        bucket = xau_coinalyze_by_exchange.setdefault(
+            ex_name, {"long": 0.0, "short": 0.0}
+        )
+        bucket["long"] += float(rr.get("long", 0.0) or 0.0)
+        bucket["short"] += float(rr.get("short", 0.0) or 0.0)
+
     xau_long_cumulative += (
         fresh_long
     )
@@ -7378,6 +7401,32 @@ def process_xau(
             100
         ) if cycle_total > 0 else 0
 
+        exchange_lines = []
+        audit_long = 0.0
+        audit_short = 0.0
+        ranked_exchanges = []
+        for ex_name, ex_totals in xau_coinalyze_by_exchange.items():
+            ex_long = float(ex_totals.get("long", 0.0) or 0.0)
+            ex_short = float(ex_totals.get("short", 0.0) or 0.0)
+            audit_long += ex_long
+            audit_short += ex_short
+            if ex_long > 0 or ex_short > 0:
+                ranked_exchanges.append((max(ex_long, ex_short), ex_name, ex_long, ex_short))
+
+        ranked_exchanges.sort(key=lambda row: row[0], reverse=True)
+        for _, ex_name, ex_long, ex_short in ranked_exchanges:
+            exchange_lines.append(
+                f"{ex_name}: L ${ex_long:,.0f} | S ${ex_short:,.0f}"
+            )
+
+        audit_status = (
+            "MATCH"
+            if abs(audit_long - cycle_long) < 0.01
+            and abs(audit_short - cycle_short) < 0.01
+            else "MISMATCH"
+        )
+        audit_text = "\n".join(exchange_lines) or "No exchange contribution"
+
         alert_sent = send_pushover(
             alert_title,
             (
@@ -7394,12 +7443,20 @@ def process_xau(
                 f"XAU "
                 f"{xau_price:,.2f} | "
                 f"XAU MOVE "
-                f"{move_text}"
+                f"{move_text}\n\n"
+                f"COINALYZE EXCHANGE AUDIT:\n"
+                f"{audit_text}\n\n"
+                f"EXCHANGE SUM LONG: ${audit_long:,.0f}\n"
+                f"EXCHANGE SUM SHORT: ${audit_short:,.0f}\n"
+                f"TOTAL LONG: ${cycle_long:,.0f}\n"
+                f"TOTAL SHORT: ${cycle_short:,.0f}\n"
+                f"AUDIT: {audit_status}"
             )
         )
 
         xau_long_cumulative = 0.0
         xau_short_cumulative = 0.0
+        xau_coinalyze_by_exchange = {}
 
         xau_cycle_ref_price = (
             xau_price
