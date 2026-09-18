@@ -6173,7 +6173,7 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
     return result
 
 def _all_crypto_hourly_snapshot(now_ts=None):
-    """Build a read-only exact trailing-60m symbol leaderboard."""
+    """Build a read-only exact last-60m symbol leaderboard for the hourly update."""
     now_ts = float(now_ts) if now_ts is not None else time.time()
     with _all_crypto_lock:
         _all_crypto_rolling_trim(now_ts)
@@ -6194,53 +6194,81 @@ def _all_crypto_hourly_snapshot(now_ts=None):
     ranked = []
     total_long = 0.0
     total_short = 0.0
+
     for symbol, totals in by_symbol.items():
         long_usd = float(totals.get("long", 0.0) or 0.0)
         short_usd = float(totals.get("short", 0.0) or 0.0)
-        total = long_usd + short_usd
+        gap = abs(long_usd - short_usd)
         total_long += long_usd
         total_short += short_usd
-        if total > 0:
-            ranked.append((total, symbol, long_usd, short_usd))
+        if long_usd > 0 or short_usd > 0:
+            ranked.append((gap, symbol, long_usd, short_usd))
+
+    # Hourly Top 12 = biggest LONG/SHORT GAP first.
     ranked.sort(key=lambda row: row[0], reverse=True)
     return ranked, total_long, total_short
 
 
 def _all_crypto_send_hourly_report(boundary_ts=None):
-    """Send the normal discovery update every IST clock-hour; no threshold/reset."""
+    """Send the fixed hourly 13EX update; no threshold, signal, or reset."""
     boundary_ts = float(boundary_ts) if boundary_ts is not None else time.time()
     ranked, total_long, total_short = _all_crypto_hourly_snapshot(boundary_ts)
-    market_total = total_long + total_short
+
+    total_gap = abs(total_long - total_short)
+    total_winner = (
+        "LONG WINS" if total_long > total_short
+        else "SHORT WINS" if total_short > total_long
+        else "TIE"
+    )
+
     ist_dt = datetime.fromtimestamp(boundary_ts, tz=NASDAQ_COMBINED_IST)
-    title = "ALL CRYPTO 13EX | HOURLY 60M UPDATE"
+    title = "ALL CRYPTO 13EX | HOURLY UPDATE"
 
     lines = [
-        f"IST: {ist_dt.strftime('%d-%m-%Y %H:%M')}",
-        "EXACT TRAILING 60 MINUTES | NO THRESHOLD | NO RESET",
-        f"MARKET TOTAL: ${market_total:,.0f} ({_usd_m(market_total)})",
-        f"LONG: ${total_long:,.0f} | SHORT: ${total_short:,.0f}",
-        f"ACTIVE COINS: {len(ranked)}",
+        f"{ist_dt.strftime('%d-%m-%Y | %H:%M')} IST",
+        "",
     ]
 
     if ranked:
-        lines.append("")
-        lines.append("TOP LIQUIDATION COINS:")
-        for idx, (total, symbol, long_usd, short_usd) in enumerate(ranked[:ALL_CRYPTO_HOURLY_TOP_N], 1):
-            stronger = "L" if long_usd > short_usd else "S" if short_usd > long_usd else "="
-            lines.append(
-                f"{idx}. {symbol} ${total:,.0f} | L ${long_usd:,.0f} | S ${short_usd:,.0f} | {stronger}"
+        for idx, (gap, symbol, long_usd, short_usd) in enumerate(
+            ranked[:ALL_CRYPTO_HOURLY_TOP_N], 1
+        ):
+            winner = (
+                "LONG WINS" if long_usd > short_usd
+                else "SHORT WINS" if short_usd > long_usd
+                else "TIE"
             )
+            lines.extend([
+                f"{idx}. {symbol}",
+                f"LONG:  ${long_usd:,.0f}",
+                f"SHORT: ${short_usd:,.0f}",
+                f"GAP:   ${gap:,.0f}",
+                winner,
+                "",
+            ])
     else:
-        lines.extend(["", "No accepted crypto liquidations in trailing 60m."])
+        lines.extend([
+            "No accepted crypto liquidations in the last 60 minutes.",
+            "",
+        ])
 
-    # Pushover messages have a finite message size; keep the discovery report compact.
+    # ALL CRYPTO TOTAL uses every accepted crypto coin in the hour,
+    # not only the displayed Top 12.
+    lines.extend([
+        "ALL CRYPTO TOTAL",
+        f"LONG:  ${total_long:,.0f}",
+        f"SHORT: ${total_short:,.0f}",
+        f"GAP:   ${total_gap:,.0f}",
+        total_winner,
+    ])
+
     message = "\n".join(lines)
-    if len(message) > 1000:
-        message = message[:997] + "..."
     sent = send_pushover(title, message)
+
     print(
         f"[ALL CRYPTO HOURLY] boundary={ist_dt.isoformat()} active={len(ranked)} "
-        f"total=${market_total:,.0f} sent={sent}",
+        f"L=${total_long:,.0f} S=${total_short:,.0f} "
+        f"GAP=${total_gap:,.0f} winner={total_winner} sent={sent}",
         flush=True,
     )
     return bool(sent)
