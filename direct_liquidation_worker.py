@@ -234,7 +234,7 @@ async def add_all_crypto_liquidation(symbol, exchange, side, notional_usd, event
         symbol=base,
         ts_ms=ts_ms,
         price=price,
-        verified_crypto=(exchange in {"bitget", "aster", "coinex"}),
+        verified_crypto=(exchange in {"bitget", "aster", "coinex", "lighter"}),
     )
 
 
