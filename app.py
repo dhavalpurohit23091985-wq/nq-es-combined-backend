@@ -274,6 +274,10 @@ all_crypto_crypto_symbols_refreshed_ts = 0.0
 all_crypto_first_poll_seeded = False
 _all_crypto_lock = threading.RLock()
 _all_crypto_poller_started = False
+# Hourly discovery report: exact trailing 60m, sent on each IST clock-hour.
+# Independent from GAP/rolling trigger state; never resets liquidation data.
+ALL_CRYPTO_HOURLY_TOP_N = 12
+_all_crypto_hourly_reporter_started = False
 
 marginpad_xau_long_cumulative = 0.0
 marginpad_xau_short_cumulative = 0.0
@@ -5865,6 +5869,9 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
     now_ts = float(now_ts) if now_ts is not None else time.time()
     _all_crypto_rolling_trim(now_ts)
     long_total, short_total = _all_crypto_rolling_totals()
+    rolling_total = long_total + short_total
+    long_pct = (long_total / rolling_total * 100.0) if rolling_total > 0 else 0.0
+    short_pct = (short_total / rolling_total * 100.0) if rolling_total > 0 else 0.0
     signed_gap = long_total - short_total
     state = all_crypto_rolling_state
     new_state = state
@@ -6164,6 +6171,110 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
         flush=True,
     )
     return result
+
+def _all_crypto_hourly_snapshot(now_ts=None):
+    """Build a read-only exact trailing-60m symbol leaderboard."""
+    now_ts = float(now_ts) if now_ts is not None else time.time()
+    with _all_crypto_lock:
+        _all_crypto_rolling_trim(now_ts)
+        by_symbol = {}
+        for row in all_crypto_rolling_events:
+            try:
+                _, side, amount, symbol = row
+                side = str(side).lower().strip()
+                amount = float(amount)
+                symbol = str(symbol or "UNKNOWN").upper().strip() or "UNKNOWN"
+            except (TypeError, ValueError, IndexError):
+                continue
+            if side not in ("long", "short") or amount <= 0:
+                continue
+            bucket = by_symbol.setdefault(symbol, {"long": 0.0, "short": 0.0})
+            bucket[side] += amount
+
+    ranked = []
+    total_long = 0.0
+    total_short = 0.0
+    for symbol, totals in by_symbol.items():
+        long_usd = float(totals.get("long", 0.0) or 0.0)
+        short_usd = float(totals.get("short", 0.0) or 0.0)
+        total = long_usd + short_usd
+        total_long += long_usd
+        total_short += short_usd
+        if total > 0:
+            ranked.append((total, symbol, long_usd, short_usd))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    return ranked, total_long, total_short
+
+
+def _all_crypto_send_hourly_report(boundary_ts=None):
+    """Send the normal discovery update every IST clock-hour; no threshold/reset."""
+    boundary_ts = float(boundary_ts) if boundary_ts is not None else time.time()
+    ranked, total_long, total_short = _all_crypto_hourly_snapshot(boundary_ts)
+    market_total = total_long + total_short
+    ist_dt = datetime.fromtimestamp(boundary_ts, tz=NASDAQ_COMBINED_IST)
+    title = "ALL CRYPTO 13EX | HOURLY 60M UPDATE"
+
+    lines = [
+        f"IST: {ist_dt.strftime('%d-%m-%Y %H:%M')}",
+        "EXACT TRAILING 60 MINUTES | NO THRESHOLD | NO RESET",
+        f"MARKET TOTAL: ${market_total:,.0f} ({_usd_m(market_total)})",
+        f"LONG: ${total_long:,.0f} | SHORT: ${total_short:,.0f}",
+        f"ACTIVE COINS: {len(ranked)}",
+    ]
+
+    if ranked:
+        lines.append("")
+        lines.append("TOP LIQUIDATION COINS:")
+        for idx, (total, symbol, long_usd, short_usd) in enumerate(ranked[:ALL_CRYPTO_HOURLY_TOP_N], 1):
+            stronger = "L" if long_usd > short_usd else "S" if short_usd > long_usd else "="
+            lines.append(
+                f"{idx}. {symbol} ${total:,.0f} | L ${long_usd:,.0f} | S ${short_usd:,.0f} | {stronger}"
+            )
+    else:
+        lines.extend(["", "No accepted crypto liquidations in trailing 60m."])
+
+    # Pushover messages have a finite message size; keep the discovery report compact.
+    message = "\n".join(lines)
+    if len(message) > 1000:
+        message = message[:997] + "..."
+    sent = send_pushover(title, message)
+    print(
+        f"[ALL CRYPTO HOURLY] boundary={ist_dt.isoformat()} active={len(ranked)} "
+        f"total=${market_total:,.0f} sent={sent}",
+        flush=True,
+    )
+    return bool(sent)
+
+
+def _all_crypto_hourly_reporter_loop():
+    print("[ALL CRYPTO HOURLY] reporter started | IST clock-hour", flush=True)
+    while True:
+        now = datetime.now(NASDAQ_COMBINED_IST)
+        next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+        sleep_seconds = max(0.25, (next_hour - now).total_seconds())
+        time.sleep(sleep_seconds)
+        # Boundary timestamp is used as the exact trailing-60m endpoint.
+        boundary = datetime.now(NASDAQ_COMBINED_IST).replace(minute=0, second=0, microsecond=0)
+        try:
+            _all_crypto_send_hourly_report(boundary.timestamp())
+        except Exception as exc:
+            print(f"[ALL CRYPTO HOURLY ERROR] {exc}", flush=True)
+
+
+def _start_all_crypto_hourly_reporter_once():
+    global _all_crypto_hourly_reporter_started
+    enabled = str(os.environ.get("ALL_CRYPTO_HOURLY_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if not enabled or _all_crypto_hourly_reporter_started:
+        return False
+    _all_crypto_hourly_reporter_started = True
+    thread = threading.Thread(
+        target=_all_crypto_hourly_reporter_loop,
+        name="all-crypto-hourly-reporter",
+        daemon=True,
+    )
+    thread.start()
+    return True
+
 
 def _all_crypto_poller_loop():
     print(f"[ALL CRYPTO POLLER] started interval={ALL_CRYPTO_POLL_SECONDS:.0f}s", flush=True)
@@ -8103,6 +8214,7 @@ def all_crypto_poll_now():
 # Start the independent 5-second market-wide liquidation collector.
 # Existing Render config is documented as one worker in this app's persistence section.
 _start_all_crypto_poller_once()
+_start_all_crypto_hourly_reporter_once()
 
 
 # ==================================================
