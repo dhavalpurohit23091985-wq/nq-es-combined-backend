@@ -112,8 +112,22 @@ def is_all_crypto_symbol(symbol):
     base = crypto_base_symbol(symbol)
     if not base:
         return False
-    # Physical/synthetic metals and index-like symbols are not part of ALL Crypto.
-    if base in {"XAU", "GOLD", "XAG", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+
+    # Worker-side first filter only. app.py applies the authoritative MarginPad
+    # crypto-universe whitelist before any Direct-4 amount reaches ALL Crypto.
+    # Keep obvious traditional markets from generating unnecessary HTTP traffic.
+    noncrypto = {
+        # Metals / energy / indices
+        "XAU", "GOLD", "XAG", "SILVER", "NQ", "ES", "SPX", "SP500",
+        "DOW", "DJI", "NDX", "NASDAQ", "WTI", "BRENT", "CL", "NG",
+        # Fiat currencies and common FX pair bases after quote stripping
+        "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD",
+        "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY",
+        # Known tokenized/traditional-equity symbols seen on multi-asset venues
+        "CRCL",
+    }
+    if base in noncrypto:
         return False
     return True
 
