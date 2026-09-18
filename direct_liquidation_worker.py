@@ -74,6 +74,7 @@ coinex_markets = {
     "BTC": "BTCUSDT",
     "XAU": None,
 }
+coinex_all_markets = []
 
 
 # ============================================================
@@ -97,7 +98,27 @@ def remember_event(key):
     return True
 
 
-def forward_direct_event(asset, exchange, side, notional_usd, event_key):
+def crypto_base_symbol(symbol):
+    """Normalize a futures pair to a base crypto symbol for ALL Crypto."""
+    s = str(symbol or "").upper().strip().replace("-", "").replace("_", "").replace("/", "")
+    for suffix in ("USDT", "USDC", "USD", "PERP"):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            s = s[:-len(suffix)]
+            break
+    return s.strip()
+
+
+def is_all_crypto_symbol(symbol):
+    base = crypto_base_symbol(symbol)
+    if not base:
+        return False
+    # Physical/synthetic metals and index-like symbols are not part of ALL Crypto.
+    if base in {"XAU", "GOLD", "XAG", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+        return False
+    return True
+
+
+def forward_direct_event(asset, exchange, side, notional_usd, event_key, *, symbol=None, ts_ms=None, price=None):
     if not DIRECT_LIQ_SECRET:
         print(
             "[FORWARD ERROR] DIRECT_LIQ_SECRET is missing",
@@ -112,6 +133,12 @@ def forward_direct_event(asset, exchange, side, notional_usd, event_key):
         "notional_usd": float(notional_usd),
         "event_key": str(event_key),
     }
+    if symbol is not None:
+        payload["symbol"] = str(symbol)
+    if ts_ms is not None:
+        payload["ts_ms"] = ts_ms
+    if price is not None:
+        payload["price"] = price
     headers = {
         "X-Direct-Liq-Secret": DIRECT_LIQ_SECRET,
         "Content-Type": "application/json",
@@ -165,6 +192,33 @@ def forward_direct_event(asset, exchange, side, notional_usd, event_key):
             time.sleep(min(2 ** (attempt - 1), 5))
 
     return False
+
+
+async def add_all_crypto_liquidation(symbol, exchange, side, notional_usd, event_key, *, ts_ms=None, price=None):
+    """Forward one crypto liquidation to app.py's independent ALL Crypto 13EX state."""
+    if exchange not in EXCHANGES or side not in ("long", "short"):
+        return
+    if not is_all_crypto_symbol(symbol):
+        return
+    try:
+        notional_usd = float(notional_usd)
+    except Exception:
+        return
+    if notional_usd <= 0:
+        return
+    base = crypto_base_symbol(symbol)
+    all_key = f"all|{event_key}"
+    await asyncio.to_thread(
+        forward_direct_event,
+        "ALL",
+        exchange,
+        side,
+        notional_usd,
+        all_key,
+        symbol=base,
+        ts_ms=ts_ms,
+        price=price,
+    )
 
 
 async def add_liquidation(asset, exchange, side, notional_usd, event_key):
@@ -278,7 +332,7 @@ async def bitget_loop():
                 await ws.send(json.dumps(subscribe))
                 print(
                     "[BITGET] subscribed liquidation/usdt-futures "
-                    "(BTC + XAU filter)",
+                    "(ALL crypto + BTC/XAU canonical paths)",
                     flush=True,
                 )
 
@@ -297,9 +351,6 @@ async def bitget_loop():
                         for event in msg.get("data") or []:
                             symbol = str(event.get("symbol") or "").upper()
                             asset = classify_symbol(symbol)
-
-                            if not asset:
-                                continue
 
                             raw_side = str(event.get("side") or "").lower()
 
@@ -330,13 +381,17 @@ async def bitget_loop():
                                 f"{side}|{price}|{amount}"
                             )
 
-                            await add_liquidation(
-                                asset,
-                                "bitget",
-                                side,
-                                amount,
-                                key,
+                            await add_all_crypto_liquidation(
+                                symbol, "bitget", side, amount, key, ts_ms=ts, price=price
                             )
+                            if asset:
+                                await add_liquidation(
+                                    asset,
+                                    "bitget",
+                                    side,
+                                    amount,
+                                    key,
+                                )
                 finally:
                     hb.cancel()
 
@@ -385,7 +440,7 @@ async def aster_loop():
             ) as ws:
                 print(
                     "[ASTER] subscribed !forceOrder@arr "
-                    "(BTC + XAU/GOLD filter)",
+                    "(ALL crypto + BTC/XAU canonical paths)",
                     flush=True,
                 )
 
@@ -400,9 +455,6 @@ async def aster_loop():
 
                         symbol = str(order.get("s") or "").upper()
                         asset = classify_symbol(symbol)
-
-                        if not asset:
-                            continue
 
                         forced_side = str(order.get("S") or "").upper()
 
@@ -447,13 +499,17 @@ async def aster_loop():
                             f"{forced_side}|{price}|{filled_qty}"
                         )
 
-                        await add_liquidation(
-                            asset,
-                            "aster",
-                            side,
-                            notional,
-                            key,
+                        await add_all_crypto_liquidation(
+                            symbol, "aster", side, notional, key, ts_ms=ts, price=price
                         )
+                        if asset:
+                            await add_liquidation(
+                                asset,
+                                "aster",
+                                side,
+                                notional,
+                                key,
+                            )
 
         except Exception as e:
             print(
@@ -468,6 +524,7 @@ async def aster_loop():
 # ============================================================
 
 def discover_coinex_markets():
+    global coinex_all_markets
     """
     BTCUSDT is used for BTC.
 
@@ -487,6 +544,7 @@ def discover_coinex_markets():
 
         btc_market = None
         xau_market = None
+        all_markets = []
 
         for item in payload.get("data") or []:
             if not isinstance(item, dict):
@@ -500,6 +558,9 @@ def discover_coinex_markets():
             if available is False:
                 continue
 
+            if quote == "USDT" and market:
+                all_markets.append((base or crypto_base_symbol(market), market))
+
             if market == "BTCUSDT":
                 btc_market = market
 
@@ -512,10 +573,11 @@ def discover_coinex_markets():
 
         coinex_markets["BTC"] = btc_market or "BTCUSDT"
         coinex_markets["XAU"] = xau_market
+        coinex_all_markets = all_markets
 
         print(
             f"[COINEX] BTC market={coinex_markets['BTC']} | "
-            f"XAU market={coinex_markets['XAU'] or 'NOT FOUND / SKIPPED'}",
+            f"XAU market={coinex_markets['XAU'] or 'NOT FOUND / SKIPPED'} | ALL crypto markets={len(coinex_all_markets)}",
             flush=True,
         )
 
@@ -575,13 +637,18 @@ async def coinex_poll_market(session, asset, market):
             f"{price}|{amount}|{bkr}"
         )
 
-        await add_liquidation(
-            asset,
-            "coinex",
-            side,
-            notional,
-            key,
+        await add_all_crypto_liquidation(
+            market, "coinex", side, notional, key, ts_ms=ts, price=price
         )
+        canonical_asset = classify_symbol(market)
+        if canonical_asset:
+            await add_liquidation(
+                canonical_asset,
+                "coinex",
+                side,
+                notional,
+                key,
+            )
 
 
 async def coinex_loop():
@@ -593,22 +660,14 @@ async def coinex_loop():
 
     while True:
         try:
-            btc_market = coinex_markets.get("BTC")
-
-            if btc_market:
+            # CoinEx requires a market on liquidation-history, so scan every
+            # available USDT futures market. The endpoint is public and the
+            # event-key dedupe prevents overlap from the rolling lookback.
+            for base, market in list(coinex_all_markets):
                 await coinex_poll_market(
                     session,
-                    "BTC",
-                    btc_market,
-                )
-
-            xau_market = coinex_markets.get("XAU")
-
-            if xau_market:
-                await coinex_poll_market(
-                    session,
-                    "XAU",
-                    xau_market,
+                    base or crypto_base_symbol(market),
+                    market,
                 )
 
         except Exception as e:
@@ -619,7 +678,7 @@ async def coinex_loop():
 
         refresh_counter += 1
 
-        # Re-check XAU market periodically in case exchange adds it later.
+        # Refresh the full CoinEx futures universe periodically.
         if refresh_counter >= 720:
             refresh_counter = 0
             await asyncio.to_thread(discover_coinex_markets)
@@ -883,6 +942,96 @@ async def lighter_asset_loop(asset):
             await asyncio.sleep(5)
 
 
+async def lighter_get_all_crypto_markets():
+    def fetch():
+        r = requests.get(LIGHTER_ORDERBOOKS_URL, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        result = {}
+        for item in _lighter_books(payload):
+            if not isinstance(item, dict):
+                continue
+            market_type = str(item.get("market_type") or "").lower().strip()
+            if market_type and "spot" in market_type:
+                continue
+            symbol = str(item.get("symbol") or "").upper().strip()
+            if not is_all_crypto_symbol(symbol):
+                continue
+            market_id = item.get("market_id")
+            if market_id is None:
+                market_id = item.get("market_index")
+            if market_id is None:
+                continue
+            result[int(market_id)] = crypto_base_symbol(symbol)
+        return result
+    return await asyncio.to_thread(fetch)
+
+
+async def lighter_all_crypto_loop():
+    while True:
+        try:
+            market_map = await lighter_get_all_crypto_markets()
+            if not market_map:
+                print("[LIGHTER ALL] no crypto markets found; rechecking", flush=True)
+                await asyncio.sleep(300)
+                continue
+            print(f"[LIGHTER ALL] crypto markets={len(market_map)}", flush=True)
+            async with websockets.connect(
+                LIGHTER_WS,
+                open_timeout=20,
+                close_timeout=10,
+                ping_interval=None,
+                max_size=8_000_000,
+            ) as ws:
+                for market_id in market_map:
+                    await ws.send(json.dumps({"type": "subscribe", "channel": f"trade/{market_id}"}))
+                    await asyncio.sleep(0.02)
+                hb = asyncio.create_task(lighter_heartbeat(ws))
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        if msg.get("type") == "pong":
+                            continue
+                        for trade in (msg.get("liquidation_trades") or []):
+                            if not isinstance(trade, dict):
+                                continue
+                            try:
+                                market_id = int(trade.get("market_id"))
+                            except Exception:
+                                continue
+                            symbol = market_map.get(market_id)
+                            if not symbol:
+                                continue
+                            try:
+                                notional = float(trade.get("usd_amount") or 0)
+                            except Exception:
+                                continue
+                            if notional <= 0:
+                                continue
+                            try:
+                                before = float(trade.get("taker_position_size_before") or 0)
+                            except Exception:
+                                before = 0.0
+                            side = "long" if before > 0 else "short" if before < 0 else None
+                            if not side:
+                                continue
+                            trade_id = str(trade.get("trade_id_str") or trade.get("trade_id") or "")
+                            ts = str(trade.get("timestamp") or "")
+                            tx_hash = str(trade.get("tx_hash") or "")
+                            key = f"lighter|ALL|{market_id}|{trade_id}|{ts}|{tx_hash}"
+                            await add_all_crypto_liquidation(
+                                symbol, "lighter", side, notional, key, ts_ms=ts
+                            )
+                finally:
+                    hb.cancel()
+        except Exception as e:
+            print(f"[LIGHTER ALL ERROR] {type(e).__name__}: {e}", flush=True)
+            await asyncio.sleep(5)
+
+
 # ============================================================
 # STATUS
 # ============================================================
@@ -919,7 +1068,7 @@ async def status_loop():
 
 async def main():
     print(
-        "DIRECT BTC + XAU LIQUIDATION WORKER STARTING",
+        "DIRECT BTC + XAU + ALL CRYPTO LIQUIDATION WORKER STARTING",
         flush=True,
     )
 
@@ -938,8 +1087,11 @@ async def main():
     )
 
     print(
-        "XAU Sources: exchange-by-exchange auto-detect; "
-        "unsupported markets skipped",
+        "XAU Sources: exchange-by-exchange auto-detect; unsupported markets skipped",
+        flush=True,
+    )
+    print(
+        "ALL Crypto Direct Sources: Bitget + Aster + CoinEx + Lighter",
         flush=True,
     )
 
@@ -949,6 +1101,7 @@ async def main():
         coinex_loop(),
         lighter_asset_loop("BTC"),
         lighter_asset_loop("XAU"),
+        lighter_all_crypto_loop(),
         status_loop(),
     )
 
