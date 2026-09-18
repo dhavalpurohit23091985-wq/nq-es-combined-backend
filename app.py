@@ -5839,6 +5839,27 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
         return {"ok": False, "error": "invalid_all_crypto_exchange"}
     if not symbol or symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
         return {"ok": False, "error": "invalid_all_crypto_symbol"}
+
+    # CRYPTO-ONLY SAFETY GATE:
+    # The MarginPad crypto market universe is the canonical whitelist for ALL Crypto.
+    # This prevents Direct-4 venues (especially multi-asset Lighter markets) from
+    # leaking FX/equity/commodity symbols such as GBP, USDCAD or CRCL into the
+    # $5M ALL Crypto GAP accumulators. Refresh is cached for one hour.
+    _all_crypto_refresh_symbol_universe()
+    if symbol not in all_crypto_crypto_symbols:
+        print(
+            f"[ALL CRYPTO DIRECT REJECTED NONCRYPTO] exchange={exchange} symbol={symbol}",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "accepted": False,
+            "filtered_noncrypto": True,
+            "source": "direct",
+            "exchange": exchange,
+            "symbol": symbol,
+        }
+
     if side not in ("long", "short"):
         return {"ok": False, "error": "invalid_all_crypto_side"}
     if not event_key:
