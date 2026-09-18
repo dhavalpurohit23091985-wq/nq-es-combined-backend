@@ -5879,8 +5879,8 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
     title = f"ALL CRYPTO 13EX ROLLING 60M {new_state} | 5M GAP"
     message = (
         "13EX: MARGINPAD 9 + DIRECT 4 | EXACT TRAILING 60 MINUTES | NO RESET\n"
-        f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
-        f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+        f"LONG: ${long_total:,.0f} ({_usd_m(long_total)}) ({long_pct:.2f}%)\n"
+        f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)}) ({short_pct:.2f}%)\n"
         f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
         f"STRONGER: {new_state}\n"
         f"STATE: {state or 'NONE'} -> {new_state}"
@@ -6223,6 +6223,9 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
             xau_observer_rolling_state = new_state
             title = f"XAU OBSERVER 13EX ROLLING 60M {new_state} | 100K GAP"
         gap = abs(signed_gap)
+        rolling_total = long_total + short_total
+        long_pct = (long_total / rolling_total * 100.0) if rolling_total > 0 else 0.0
+        short_pct = (short_total / rolling_total * 100.0) if rolling_total > 0 else 0.0
         try:
             price_text = f"{float(price):,.2f}" if price is not None else "NA"
         except (TypeError, ValueError):
@@ -6268,8 +6271,8 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
             ]
             message = (
                 "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
-                f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
-                f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+                f"LONG: ${long_total:,.0f} ({_usd_m(long_total)}) ({long_pct:.2f}%)\n"
+                f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)}) ({short_pct:.2f}%)\n"
                 f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
                 f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
                 f"XAU: {price_text}\n\n13EX AUDIT:\n"
