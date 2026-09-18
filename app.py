@@ -2098,6 +2098,23 @@ RUNTIME_STATE_FILE = os.path.join('/var/data', 'backend_runtime_state.json')
 _runtime_state_lock = threading.Lock()
 
 
+# Must be defined before _load_runtime_state() is called during module startup.
+def _btc_exchange_key(name):
+    key = str(name or "unknown").strip().lower() or "unknown"
+    aliases = {
+        "binance_coinm": "binance",
+        "binance-coinm": "binance",
+        "binance coin-m": "binance",
+        "binance_coin_m": "binance",
+        "binance-futures": "binance",
+        "gateio": "gate",
+        "gate.io": "gate",
+        "hyper_liquid": "hyperliquid",
+        "dy/dx": "dydx",
+    }
+    return aliases.get(key, key)
+
+
 def _runtime_state_payload():
     return {
         'version': 1,
@@ -2218,13 +2235,25 @@ def _save_runtime_state():
     try:
         os.makedirs(os.path.dirname(RUNTIME_STATE_FILE), exist_ok=True)
         payload = _runtime_state_payload()
-        tmp_path = RUNTIME_STATE_FILE + '.tmp'
+        # Unique temp file prevents concurrent Gunicorn/process saves from
+        # racing on the same .tmp pathname during deploy/restart overlap.
+        tmp_path = (
+            RUNTIME_STATE_FILE
+            + f'.{os.getpid()}.{threading.get_ident()}.tmp'
+        )
         with _runtime_state_lock:
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, separators=(',', ':'), sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, RUNTIME_STATE_FILE)
+            try:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, separators=(',', ':'), sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, RUNTIME_STATE_FILE)
+            finally:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
         return True
     except Exception as exc:
         print(f'[RUNTIME STATE SAVE ERROR] {exc}', flush=True)
@@ -5376,22 +5405,6 @@ MARGINPAD_BTC_DISPLAY_EXCHANGES = (
 )
 
 
-def _btc_exchange_key(name):
-    key = str(name or "unknown").strip().lower() or "unknown"
-    aliases = {
-        # MarginPad reads Binance USD-M and Coin-M feeds but they belong to
-        # the same Binance venue in our 9-exchange alert.
-        "binance_coinm": "binance",
-        "binance-coinm": "binance",
-        "binance coin-m": "binance",
-        "binance_coin_m": "binance",
-        "binance-futures": "binance",
-        "gateio": "gate",
-        "gate.io": "gate",
-        "hyper_liquid": "hyperliquid",
-        "dy/dx": "dydx",
-    }
-    return aliases.get(key, key)
 
 
 def _btc_exchange_label(name):
