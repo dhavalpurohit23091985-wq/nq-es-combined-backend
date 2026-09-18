@@ -4026,6 +4026,94 @@ def home():
 
 
 # ==================================================
+# NASDAQ QQQ-WEIGHTED PUSHOVER AUDIT COMPACTOR
+# ==================================================
+# TradingView can send a longer audit than Pushover's 1024-character
+# message limit. For the QQQ-weighted LAST-4 alert only, keep every stock's
+# OPEN/LIVE/RAW/WEIGHT/CONTRIBUTION values but compact the labels so the
+# complete 10-stock audit fits in one Pushover message. All strategy logic
+# remains in Pine and is untouched here.
+
+def _compact_qqq_weighted_audit_for_pushover(title, message):
+    title_u = str(title or "").upper()
+    text = str(message or "")
+
+    if "NASDAQ 10-STOCK" not in title_u or "QQQ WEIGHTED" not in title_u:
+        return text
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    stock_names = {"NVDA", "AAPL", "MSFT", "MU", "AMZN", "AMD", "GOOGL", "META", "GOOG", "TSLA"}
+    output = []
+
+    # Keep the most useful trigger-level metadata.
+    wanted_prefixes = (
+        "TRIGGER #",
+        "TRIGGER BASE:",
+        "WEIGHTED BASKET NET:",
+        "STATE:",
+    )
+    for line in lines:
+        if line.upper().startswith(wanted_prefixes):
+            output.append(line)
+
+    output.append("AUDIT: O=OPEN | T=TRIGGER | R=RAW | W=WEIGHT | C=CONTR")
+
+    # Pine sends lines like:
+    # NVDA | OPEN 220.88 | LIVE 219 | RAW -0.853% | W 8.41% | CONTR -0.072%
+    # Compact labels only; values are preserved exactly as received.
+    for line in lines:
+        parts = [p.strip() for p in line.split("|")]
+        if not parts or parts[0].upper() not in stock_names:
+            continue
+
+        symbol = parts[0].upper()
+        vals = {}
+        for p in parts[1:]:
+            up = p.upper()
+            if up.startswith("OPEN "):
+                vals["O"] = p[5:].strip()
+            elif up.startswith("LIVE "):
+                vals["T"] = p[5:].strip()
+            elif up.startswith("TRIGGER "):
+                vals["T"] = p[8:].strip()
+            elif up.startswith("RAW "):
+                vals["R"] = p[4:].strip()
+            elif up.startswith("W "):
+                vals["W"] = p[2:].strip()
+            elif up.startswith("CONTR "):
+                vals["C"] = p[6:].strip()
+
+        # Only emit a stock row when OPEN and trigger/live are both present.
+        if "O" in vals and "T" in vals:
+            row = f"{symbol} | O {vals['O']} | T {vals['T']}"
+            if "R" in vals:
+                row += f" | R {vals['R']}"
+            if "W" in vals:
+                row += f" | W {vals['W']}"
+            if "C" in vals:
+                row += f" | C {vals['C']}"
+            output.append(row)
+
+    # Keep final basket/NQ values when present.
+    for line in lines:
+        u = line.upper()
+        if u.startswith("WEIGHTED NET =") or u.startswith("NQ AT TRIGGER:"):
+            if line not in output:
+                output.append(line)
+
+    compact = "\n".join(output)
+
+    # Defensive fallback: never send a QQQ weighted message above Pushover's
+    # documented 1024 UTF-8-character message limit. The compact format is
+    # designed to fit; if an unusual future price format grows too large,
+    # retain the beginning without altering any trading state.
+    if len(compact) > 1024:
+        compact = compact[:1024]
+
+    return compact or text
+
+
+# ==================================================
 # TRADINGVIEW WEBHOOK
 # ==================================================
 
@@ -4078,10 +4166,17 @@ def webhook():
             )
         )
 
-        # Keep the original individual TradingView -> Pushover alert unchanged.
-        ok = send_pushover(
+        # Keep normal TradingView alerts unchanged. For the QQQ-weighted
+        # LAST-4 audit only, compact labels so OPEN + TRIGGER + RAW + WEIGHT
+        # + CONTRIBUTION for all 10 stocks fit inside Pushover's 1024-char limit.
+        pushover_message = _compact_qqq_weighted_audit_for_pushover(
             tv_title,
             tv_message
+        )
+
+        ok = send_pushover(
+            tv_title,
+            pushover_message
         )
 
         # Separately consume only NASDAQ TOP5/BOTTOM5 final alerts.
