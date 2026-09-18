@@ -435,6 +435,7 @@ xau_last_processed_liq_ts = None
 
 xau_symbol_cache = None
 xau_price_symbol_cache = None
+coinalyze_symbol_exchange_cache = {}
 
 
 # ==================================================
@@ -4526,6 +4527,7 @@ def get_perpetual_symbols(asset):
     global btc_symbol_cache
     global xau_symbol_cache
     global xau_price_symbol_cache
+    global coinalyze_symbol_exchange_cache
 
     asset = asset.upper()
 
@@ -4586,6 +4588,11 @@ def get_perpetual_symbols(asset):
                 symbols.append(
                     symbol
                 )
+                # Read-only audit mapping: Coinalyze contract -> exchange.
+                # This does not change which symbols/totals are processed.
+                exchange_name = str(market.get("exchange", "") or "").strip()
+                if exchange_name:
+                    coinalyze_symbol_exchange_cache[str(symbol)] = exchange_name
 
             if (
                 asset == "XAU"
@@ -4907,6 +4914,15 @@ def get_fresh_liquidations(
 
         for symbol_data in data:
 
+            coinalyze_symbol = str(symbol_data.get("symbol", "") or "").strip()
+            coinalyze_exchange = str(
+                coinalyze_symbol_exchange_cache.get(coinalyze_symbol, "") or ""
+            ).strip()
+            if not coinalyze_exchange:
+                # Defensive fallback: keep the contract visible instead of
+                # silently losing its contribution from the exchange audit.
+                coinalyze_exchange = coinalyze_symbol or "Unknown"
+
             history = (
                 symbol_data.get(
                     "history",
@@ -4963,7 +4979,10 @@ def get_fresh_liquidations(
                     fresh_short += (
                         short_value
                     )
-                    rb = fresh_rows.setdefault(row_ts, {"long": 0.0, "short": 0.0})
+                    # Preserve exchange identity for rolling-window audit.
+                    # Totals above remain exactly unchanged.
+                    rb_key = (row_ts, coinalyze_exchange)
+                    rb = fresh_rows.setdefault(rb_key, {"long": 0.0, "short": 0.0})
                     rb["long"] += long_value
                     rb["short"] += short_value
 
@@ -5021,8 +5040,13 @@ def get_fresh_liquidations(
             ),
 
         "rolling_rows": [
-            {"ts": ts, "long": round(v["long"], 2), "short": round(v["short"], 2)}
-            for ts, v in sorted(fresh_rows.items())
+            {
+                "ts": ts,
+                "exchange": exchange,
+                "long": round(v["long"], 2),
+                "short": round(v["short"], 2),
+            }
+            for (ts, exchange), v in sorted(fresh_rows.items())
         ],
 
         "fresh_net_short_minus_long":
@@ -6246,12 +6270,54 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
                 + f"\nAUDIT: {audit_status}"
             )
         else:
+            # Coinalyze audit uses the real exchange attached to each contract
+            # in /future-markets. It intentionally does NOT pretend Coinalyze
+            # has the Observer's fixed 13-exchange universe.
+            by_exchange = {}
+            for row in events:
+                if len(row) < 4:
+                    continue
+                _, event_side, amount, event_exchange = row[:4]
+                ex_name = str(event_exchange or "Unknown").strip() or "Unknown"
+                bucket = by_exchange.setdefault(ex_name, {"long": 0.0, "short": 0.0})
+                try:
+                    amt = max(0.0, float(amount or 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if event_side in ("long", "short"):
+                    bucket[event_side] += amt
+
+            audit_long = sum(v["long"] for v in by_exchange.values())
+            audit_short = sum(v["short"] for v in by_exchange.values())
+            audit_status = (
+                "MATCH"
+                if abs(audit_long - long_total) < 0.01
+                and abs(audit_short - short_total) < 0.01
+                else "MISMATCH"
+            )
+            exchange_lines = [
+                f"{ex}: L ${vals['long']:,.0f} | S ${vals['short']:,.0f}"
+                for ex, vals in sorted(
+                    by_exchange.items(),
+                    key=lambda item: item[1]["long"] + item[1]["short"],
+                    reverse=True,
+                )
+            ]
+            exchange_block = "\n".join(exchange_lines) or "No exchange contributions in window"
+
             message = (
                 "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
                 f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
                 f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
                 f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
-                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nXAU: {price_text}"
+                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
+                f"XAU: {price_text}\n\nCOINALYZE EXCHANGE AUDIT:\n"
+                + exchange_block
+                + f"\n\nEXCHANGE SUM LONG: ${audit_long:,.0f}"
+                + f"\nEXCHANGE SUM SHORT: ${audit_short:,.0f}"
+                + f"\nTOTAL LONG: ${long_total:,.0f}"
+                + f"\nTOTAL SHORT: ${short_total:,.0f}"
+                + f"\nAUDIT: {audit_status}"
             )
 
         sent = send_pushover(title, message)
@@ -6288,15 +6354,16 @@ def _xau_rolling_add(source, side, amount, event_ts=None, exchange=None, price=N
     return _xau_rolling_evaluate(source, price=price, now_ts=max(time.time(), ts))
 
 
-def _xau_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=None):
+def _xau_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, exchange=None, price=None):
     try:
         long_amount=max(0.0,float(long_amount or 0.0)); short_amount=max(0.0,float(short_amount or 0.0)); ts=float(event_ts)
     except (TypeError,ValueError):
         return None
     if ts > 10_000_000_000: ts /= 1000.0
     with _xau_rolling_lock:
-        if long_amount > 0: xau_coinalyze_rolling_events.append((ts,"long",long_amount,"coinalyze"))
-        if short_amount > 0: xau_coinalyze_rolling_events.append((ts,"short",short_amount,"coinalyze"))
+        exchange_name = str(exchange or "Unknown").strip() or "Unknown"
+        if long_amount > 0: xau_coinalyze_rolling_events.append((ts,"long",long_amount,exchange_name))
+        if short_amount > 0: xau_coinalyze_rolling_events.append((ts,"short",short_amount,exchange_name))
         if len(xau_coinalyze_rolling_events) > 1:
             ordered=sorted(xau_coinalyze_rolling_events,key=lambda r:r[0]); xau_coinalyze_rolling_events.clear(); xau_coinalyze_rolling_events.extend(ordered)
     return _xau_rolling_evaluate("coinalyze", price=price, now_ts=max(time.time(),ts))
@@ -7215,7 +7282,8 @@ def process_xau(
 
     for rr in fresh.get("rolling_rows", []):
         _xau_rolling_add_coinalyze_row(
-            rr.get("long", 0.0), rr.get("short", 0.0), rr.get("ts"), price=xau_price
+            rr.get("long", 0.0), rr.get("short", 0.0), rr.get("ts"),
+            exchange=rr.get("exchange"), price=xau_price
         )
     _xau_rolling_evaluate("coinalyze", price=xau_price)
 
