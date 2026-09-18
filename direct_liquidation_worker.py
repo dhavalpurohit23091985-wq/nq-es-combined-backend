@@ -132,7 +132,7 @@ def is_all_crypto_symbol(symbol):
     return True
 
 
-def forward_direct_event(asset, exchange, side, notional_usd, event_key, *, symbol=None, ts_ms=None, price=None):
+def forward_direct_event(asset, exchange, side, notional_usd, event_key, *, symbol=None, ts_ms=None, price=None, verified_crypto=None):
     if not DIRECT_LIQ_SECRET:
         print(
             "[FORWARD ERROR] DIRECT_LIQ_SECRET is missing",
@@ -153,6 +153,8 @@ def forward_direct_event(asset, exchange, side, notional_usd, event_key, *, symb
         payload["ts_ms"] = ts_ms
     if price is not None:
         payload["price"] = price
+    if verified_crypto is not None:
+        payload["verified_crypto"] = bool(verified_crypto)
     headers = {
         "X-Direct-Liq-Secret": DIRECT_LIQ_SECRET,
         "Content-Type": "application/json",
@@ -232,6 +234,7 @@ async def add_all_crypto_liquidation(symbol, exchange, side, notional_usd, event
         symbol=base,
         ts_ms=ts_ms,
         price=price,
+        verified_crypto=(exchange in {"bitget", "aster", "coinex"}),
     )
 
 
