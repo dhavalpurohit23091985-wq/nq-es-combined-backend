@@ -681,11 +681,22 @@ async def coinex_loop():
             # available USDT futures market. The endpoint is public and the
             # event-key dedupe prevents overlap from the rolling lookback.
             for base, market in list(coinex_all_markets):
-                await coinex_poll_market(
-                    session,
-                    base or crypto_base_symbol(market),
-                    market,
-                )
+                # One unsupported/invalid CoinEx market must NOT abort the
+                # complete ALL-Crypto scan. Skip only that market and keep
+                # polling the rest of the discovered futures universe.
+                try:
+                    await coinex_poll_market(
+                        session,
+                        base or crypto_base_symbol(market),
+                        market,
+                    )
+                except Exception as market_error:
+                    print(
+                        f"[COINEX MARKET SKIP] market={market} "
+                        f"{type(market_error).__name__}: {market_error}",
+                        flush=True,
+                    )
+                    continue
 
         except Exception as e:
             print(
