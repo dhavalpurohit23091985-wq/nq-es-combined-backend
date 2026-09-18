@@ -2560,6 +2560,63 @@ def _load_runtime_state():
                 if legacy_mp["long"] > 0 or legacy_mp["short"] > 0:
                     combined_by_exchange[asset]["marginpad_preupgrade"] = dict(legacy_mp)
 
+            # XAU restore safety: the 13EX exchange audit is the canonical source
+            # for the XAU Observer cycle. Older runtime-state files could contain
+            # combined XAU totals without the matching per-exchange audit buckets.
+            # On restore, rebuild XAU totals/source buckets from the persisted 13EX
+            # audit so an unaudited legacy amount can never create TOTAL vs 13EX
+            # SUM mismatches after a deploy/restart. Live accumulation is unchanged.
+            if asset == "XAU":
+                old_long = combined_liq[asset]["long"]
+                old_short = combined_liq[asset]["short"]
+
+                audited_long = 0.0
+                audited_short = 0.0
+                marginpad_long = 0.0
+                marginpad_short = 0.0
+
+                for ex_name in XAU_OBSERVER_EXCHANGES:
+                    ex_totals = combined_by_exchange[asset].get(
+                        ex_name, {"long": 0.0, "short": 0.0}
+                    )
+                    ex_long = float(ex_totals.get("long", 0.0) or 0.0)
+                    ex_short = float(ex_totals.get("short", 0.0) or 0.0)
+                    audited_long += ex_long
+                    audited_short += ex_short
+                    if ex_name in XAU_MARGINPAD_EXCHANGES:
+                        marginpad_long += ex_long
+                        marginpad_short += ex_short
+
+                # Rebuild the source audit from the same exchange-level truth.
+                combined_by_source[asset]["marginpad"]["long"] = marginpad_long
+                combined_by_source[asset]["marginpad"]["short"] = marginpad_short
+                for direct_name in COMBINED_DIRECT_EXCHANGES:
+                    direct_totals = combined_by_exchange[asset].get(
+                        direct_name, {"long": 0.0, "short": 0.0}
+                    )
+                    combined_by_source[asset][direct_name]["long"] = float(
+                        direct_totals.get("long", 0.0) or 0.0
+                    )
+                    combined_by_source[asset][direct_name]["short"] = float(
+                        direct_totals.get("short", 0.0) or 0.0
+                    )
+
+                combined_liq[asset]["long"] = audited_long
+                combined_liq[asset]["short"] = audited_short
+                marginpad_xau_long_cumulative = marginpad_long
+                marginpad_xau_short_cumulative = marginpad_short
+
+                if (
+                    abs(old_long - audited_long) >= 0.01
+                    or abs(old_short - audited_short) >= 0.01
+                ):
+                    print(
+                        "[XAU RESTORE AUDIT RECONCILED] "
+                        f"saved L=${old_long:,.2f} S=${old_short:,.2f} -> "
+                        f"13EX L=${audited_long:,.2f} S=${audited_short:,.2f}",
+                        flush=True,
+                    )
+
         saved_ref = comb.get('cycle_ref_price') or {}
         saved_latest = comb.get('latest_price') or {}
         saved_last_alert = comb.get('last_alert') or {}
@@ -2694,6 +2751,21 @@ def debug_runtime_state():
             'ref_price': marginpad_xau_cycle_ref_price,
             'processed_through_ms': marginpad_xau_processed_through_ms,
             'seen_count': len(marginpad_xau_seen_set),
+        },
+        'combined_xau': {
+            'long': combined_liq['XAU']['long'],
+            'short': combined_liq['XAU']['short'],
+            'gap': combined_liq['XAU']['long'] - combined_liq['XAU']['short'],
+            'by_source': combined_by_source['XAU'],
+            'by_exchange': combined_by_exchange['XAU'],
+            'audit_13ex_long': sum(
+                float((combined_by_exchange['XAU'].get(ex) or {}).get('long', 0.0) or 0.0)
+                for ex in XAU_OBSERVER_EXCHANGES
+            ),
+            'audit_13ex_short': sum(
+                float((combined_by_exchange['XAU'].get(ex) or {}).get('short', 0.0) or 0.0)
+                for ex in XAU_OBSERVER_EXCHANGES
+            ),
         },
         'nvda': {
             'session_date_ist': nvda_session_date_ist,
