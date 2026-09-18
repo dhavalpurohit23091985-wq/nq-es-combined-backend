@@ -772,13 +772,14 @@ def add_combined_liquidation_batch(
         combined_by_source[asset][source_key]["long"] += long_usd
         combined_by_source[asset][source_key]["short"] += short_usd
 
-        # Preserve the real exchange-level contribution for BTC alert auditing.
-        # MarginPad supplies a per-exchange breakdown; direct events already
-        # arrive with their exchange name. This does not alter combined totals.
-        if asset == "BTC":
+        # Preserve real exchange-level contributions for BTC + XAU auditing.
+        # Audit state only: combined totals / thresholds / reset logic are unchanged.
+        if asset in ("BTC", "XAU"):
             if source == "marginpad" and isinstance(exchange_breakdown, dict):
                 for ex_name, ex_totals in exchange_breakdown.items():
-                    ex_key = str(ex_name or "unknown").strip().lower() or "unknown"
+                    ex_key = _btc_exchange_key(ex_name)
+                    if asset == "XAU" and ex_key not in XAU_MARGINPAD_EXCHANGES:
+                        continue
                     if not isinstance(ex_totals, dict):
                         continue
                     try:
@@ -792,12 +793,13 @@ def add_combined_liquidation_batch(
                     bucket["long"] += max(0.0, ex_long)
                     bucket["short"] += max(0.0, ex_short)
             elif source == "direct":
-                ex_key = exchange or source_key
-                bucket = combined_by_exchange[asset].setdefault(
-                    ex_key, {"long": 0.0, "short": 0.0}
-                )
-                bucket["long"] += long_usd
-                bucket["short"] += short_usd
+                ex_key = _btc_exchange_key(exchange or source_key)
+                if asset != "XAU" or ex_key in XAU_OBSERVER_EXCHANGES:
+                    bucket = combined_by_exchange[asset].setdefault(
+                        ex_key, {"long": 0.0, "short": 0.0}
+                    )
+                    bucket["long"] += long_usd
+                    bucket["short"] += short_usd
 
         if source_key == "marginpad":
             if asset == "BTC":
@@ -857,41 +859,29 @@ def add_combined_liquidation_batch(
                     )
 
             exchange_lines = []
-            if asset == "BTC":
-                exchange_labels = {
-                    "binance": "Binance",
-                    "okx": "OKX",
-                    "bybit": "Bybit",
-                    "bitget": "Bitget",
-                    "aster": "Aster",
-                    "coinex": "CoinEx",
-                    "lighter": "Lighter",
-                    "bitfinex": "Bitfinex",
-                    "hyperliquid": "Hyperliquid",
-                    "gate": "Gate",
-                    "htx": "HTX",
-                }
+            exchange_labels = {
+                "binance": "Binance", "bybit": "Bybit", "okx": "OKX",
+                "hyperliquid": "Hyperliquid", "gate": "Gate", "htx": "HTX",
+                "dydx": "dYdX", "bitmex": "BitMEX", "bitfinex": "Bitfinex",
+                "bitget": "Bitget", "aster": "Aster", "coinex": "CoinEx",
+                "lighter": "Lighter",
+            }
 
+            if asset == "BTC":
                 if winner == "LONG":
                     display_side = "long"
                 elif winner == "SHORT":
                     display_side = "short"
                 else:
                     display_side = None
-
                 ranked = []
                 for ex_name, ex_totals in combined_by_exchange[asset].items():
                     ex_long = float(ex_totals.get("long", 0.0) or 0.0)
                     ex_short = float(ex_totals.get("short", 0.0) or 0.0)
                     if ex_long <= 0 and ex_short <= 0:
                         continue
-                    rank_amount = (
-                        ex_long if display_side == "long"
-                        else ex_short if display_side == "short"
-                        else max(ex_long, ex_short)
-                    )
+                    rank_amount = (ex_long if display_side == "long" else ex_short if display_side == "short" else max(ex_long, ex_short))
                     ranked.append((rank_amount, ex_name, ex_long, ex_short))
-
                 ranked.sort(key=lambda row: row[0], reverse=True)
                 for _, ex_name, ex_long, ex_short in ranked:
                     label = exchange_labels.get(ex_name, ex_name.title())
@@ -900,9 +890,35 @@ def add_combined_liquidation_batch(
                     elif display_side == "short":
                         exchange_lines.append(f"{label}: ${ex_short:,.0f}")
                     else:
-                        exchange_lines.append(
-                            f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}"
-                        )
+                        exchange_lines.append(f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}")
+
+            elif asset == "XAU":
+                audit_long = 0.0
+                audit_short = 0.0
+                for ex_name in XAU_OBSERVER_EXCHANGES:
+                    ex_totals = combined_by_exchange["XAU"].get(
+                        ex_name, {"long": 0.0, "short": 0.0}
+                    )
+                    ex_long = float(ex_totals.get("long", 0.0) or 0.0)
+                    ex_short = float(ex_totals.get("short", 0.0) or 0.0)
+                    audit_long += ex_long
+                    audit_short += ex_short
+                    label = exchange_labels.get(ex_name, ex_name.title())
+                    exchange_lines.append(
+                        f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}"
+                    )
+                exchange_lines.append("")
+                exchange_lines.append(f"13EX SUM LONG: ${audit_long:,.0f}")
+                exchange_lines.append(f"13EX SUM SHORT: ${audit_short:,.0f}")
+                exchange_lines.append(f"TOTAL LONG: ${cycle_long:,.0f}")
+                exchange_lines.append(f"TOTAL SHORT: ${cycle_short:,.0f}")
+                audit_status = (
+                    "MATCH"
+                    if abs(audit_long - cycle_long) < 0.01
+                    and abs(audit_short - cycle_short) < 0.01
+                    else "MISMATCH"
+                )
+                exchange_lines.append(f"AUDIT: {audit_status}")
 
             current_price = combined_latest_price.get(asset)
             ref_price = combined_cycle_ref_price.get(asset)
@@ -971,14 +987,14 @@ def add_combined_liquidation_batch(
                 else f"{alert_snapshot['move']:,.2f} pts"
             )
 
-        if asset == "BTC" and alert_snapshot.get("exchanges"):
+        if asset in ("BTC", "XAU") and alert_snapshot.get("exchanges"):
             breakdown = "\n".join(alert_snapshot["exchanges"])
             message = (
                 f"{breakdown}\n\n"
                 f"COMBINED SHORT: ${alert_snapshot['short']:,.0f}\n"
                 f"COMBINED LONG: ${alert_snapshot['long']:,.0f}\n"
                 f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
-                f"BTC {price_text} | BTC MOVE {move_text}"
+                f"{asset} {price_text} | {asset} MOVE {move_text}"
             )
         else:
             breakdown = "\n".join(alert_snapshot["sources"]) or "No source breakdown"
@@ -1796,6 +1812,11 @@ def get_marginpad_fresh_xau_liquidations(
     accepted_events = 0
     newest_event_ms = None
     exchanges = set()
+    # XAU 13EX audit buckets for the approved MarginPad 9.
+    fresh_by_exchange = {
+        ex: {"long": 0.0, "short": 0.0}
+        for ex in XAU_MARGINPAD_EXCHANGES
+    }
     rolling_events = []
     normalized_events = []
 
@@ -1885,8 +1906,10 @@ def get_marginpad_fresh_xau_liquidations(
 
         if side == "long_liquidated":
             fresh_long += notional
+            fresh_by_exchange[exchange_key]["long"] += notional
         else:
             fresh_short += notional
+            fresh_by_exchange[exchange_key]["short"] += notional
 
         exchanges.add(exchange_key)
 
@@ -1926,6 +1949,13 @@ def get_marginpad_fresh_xau_liquidations(
             2
         ),
         "exchanges_seen": sorted(exchanges),
+        "fresh_by_exchange": {
+            ex: {
+                "long": round(fresh_by_exchange[ex]["long"], 2),
+                "short": round(fresh_by_exchange[ex]["short"], 2),
+            }
+            for ex in XAU_MARGINPAD_EXCHANGES
+        },
         "newest_event_ts_ms": newest_event_ms,
         "rolling_events": rolling_events,
         "closed_end_ms": closed_end_ms
@@ -5991,16 +6021,82 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
             xau_observer_rolling_state = new_state
             title = f"XAU OBSERVER 13EX ROLLING 60M {new_state} | 100K GAP"
         gap = abs(signed_gap)
-        try: price_text = f"{float(price):,.2f}" if price is not None else "NA"
-        except (TypeError, ValueError): price_text = "NA"
-        message = (f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
-                   f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
-                   f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
-                   f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
-                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nXAU: {price_text}")
+        try:
+            price_text = f"{float(price):,.2f}" if price is not None else "NA"
+        except (TypeError, ValueError):
+            price_text = "NA"
+
+        if source == "observer":
+            labels = {
+                "binance": "Binance", "bybit": "Bybit", "okx": "OKX",
+                "hyperliquid": "Hyperliquid", "gate": "Gate", "htx": "HTX",
+                "dydx": "dYdX", "bitmex": "BitMEX", "bitfinex": "Bitfinex",
+                "bitget": "Bitget", "aster": "Aster", "coinex": "CoinEx",
+                "lighter": "Lighter",
+            }
+            by_exchange = {
+                ex: {"long": 0.0, "short": 0.0}
+                for ex in XAU_OBSERVER_EXCHANGES
+            }
+            for row in events:
+                if len(row) < 4:
+                    continue
+                _, event_side, amount, event_exchange = row[:4]
+                ex_key = _btc_exchange_key(event_exchange)
+                if ex_key not in by_exchange:
+                    continue
+                try:
+                    amt = max(0.0, float(amount or 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if event_side in ("long", "short"):
+                    by_exchange[ex_key][event_side] += amt
+
+            audit_long = sum(v["long"] for v in by_exchange.values())
+            audit_short = sum(v["short"] for v in by_exchange.values())
+            audit_status = (
+                "MATCH"
+                if abs(audit_long - long_total) < 0.01
+                and abs(audit_short - short_total) < 0.01
+                else "MISMATCH"
+            )
+            exchange_lines = [
+                f"{labels.get(ex, ex.title())}: L ${by_exchange[ex]['long']:,.0f} | S ${by_exchange[ex]['short']:,.0f}"
+                for ex in XAU_OBSERVER_EXCHANGES
+            ]
+            message = (
+                "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+                f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
+                f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+                f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
+                f"XAU: {price_text}\n\n13EX AUDIT:\n"
+                + "\n".join(exchange_lines)
+                + f"\n\n13EX SUM LONG: ${audit_long:,.0f}"
+                + f"\n13EX SUM SHORT: ${audit_short:,.0f}"
+                + f"\nTOTAL LONG: ${long_total:,.0f}"
+                + f"\nTOTAL SHORT: ${short_total:,.0f}"
+                + f"\nAUDIT: {audit_status}"
+            )
+        else:
+            message = (
+                "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+                f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
+                f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
+                f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nXAU: {price_text}"
+            )
+
         sent = send_pushover(title, message)
-        print(f"[XAU ROLLING 60M] {source.upper()} {new_state} L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}", flush=True)
-        return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
+        print(
+            f"[XAU ROLLING 60M] {source.upper()} {new_state} "
+            f"L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}",
+            flush=True,
+        )
+        return {
+            "direction": new_state, "long": long_total, "short": short_total,
+            "gap": gap, "alert_sent": bool(sent)
+        }
 
 
 def _xau_rolling_add(source, side, amount, event_ts=None, exchange=None, price=None):
@@ -6771,6 +6867,7 @@ def process_marginpad_xau(
         short_usd=fresh_short,
         event_key=f"marginpad-xau|{closed_end_ms}",
         price=xau_price,
+        exchange_breakdown=fresh.get("fresh_by_exchange", {}),
     )
 
     return {
