@@ -230,10 +230,10 @@ XAU_OBSERVER_EXCHANGES = (
 
 
 # ==================================================
-# ALL CRYPTO LIQUIDATION - MARGINPAD MARKET-WIDE FEED
+# ALL CRYPTO LIQUIDATION - 13EX (MARGINPAD 9 + DIRECT 4)
 # ==================================================
 # Independent test setup. Existing BTC/XAU logic is untouched.
-# Source: MarginPad GET /api/v1/feed (all tracked liquidation symbols).
+# Sources: MarginPad GET /api/v1/feed filtered to 9 exchanges + Direct 4 worker.
 # Only symbols classified as crypto are accepted. XAU/metals/indices are excluded.
 #
 # Setup A: actual LONG-SHORT GAP +/-$5M, RESET after valid reverse-only alert.
@@ -244,6 +244,17 @@ ALL_CRYPTO_ROLLING_WINDOW_SECONDS = 3600
 ALL_CRYPTO_ROLLING_GAP_THRESHOLD = 5_000_000.0
 ALL_CRYPTO_POLL_SECONDS = 5.0
 ALL_CRYPTO_SEEN_MAX = 50_000
+
+# Fixed ALL Crypto 13EX universe: MarginPad 9 + Direct 4.
+ALL_CRYPTO_MARGINPAD_EXCHANGES = (
+    "binance", "bybit", "okx", "hyperliquid", "gate", "htx",
+    "dydx", "bitmex", "bitfinex",
+)
+ALL_CRYPTO_DIRECT_EXCHANGES = ("bitget", "aster", "coinex", "lighter")
+ALL_CRYPTO_OBSERVER_EXCHANGES = (
+    *ALL_CRYPTO_MARGINPAD_EXCHANGES,
+    *ALL_CRYPTO_DIRECT_EXCHANGES,
+)
 
 all_crypto_long_cumulative = 0.0
 all_crypto_short_cumulative = 0.0
@@ -5633,9 +5644,9 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
         return False
     all_crypto_rolling_state = new_state
     gap = abs(signed_gap)
-    title = f"ALL CRYPTO ROLLING 60M {new_state} | 5M GAP"
+    title = f"ALL CRYPTO 13EX ROLLING 60M {new_state} | 5M GAP"
     message = (
-        "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
+        "13EX: MARGINPAD 9 + DIRECT 4 | EXACT TRAILING 60 MINUTES | NO RESET\n"
         f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
         f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
         f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
@@ -5671,9 +5682,9 @@ def _all_crypto_send_reset_if_flip():
             ranked.append((amount, symbol))
     ranked.sort(reverse=True)
     top_lines = [f"{sym}: ${amount:,.0f} ({_usd_m(amount)})" for amount, sym in ranked[:8]]
-    title = f"ALL CRYPTO {new_state} WINS | 5M GAP"
+    title = f"ALL CRYPTO 13EX {new_state} WINS | 5M GAP"
     message = (
-        "MARKET-WIDE CRYPTO | RESET AFTER VALID FLIP\n"
+        "MARKET-WIDE CRYPTO 13EX | MARGINPAD 9 + DIRECT 4 | RESET AFTER VALID FLIP\n"
         f"LONG: ${all_crypto_long_cumulative:,.0f} ({_usd_m(all_crypto_long_cumulative)})\n"
         f"SHORT: ${all_crypto_short_cumulative:,.0f} ({_usd_m(all_crypto_short_cumulative)})\n"
         f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
@@ -5733,6 +5744,14 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                 fp = _all_crypto_event_fingerprint(event)
                 if fp in all_crypto_seen_set:
                     continue
+                exchange_key = _btc_exchange_key(event.get("exchange", ""))
+                if exchange_key not in ALL_CRYPTO_MARGINPAD_EXCHANGES:
+                    _all_crypto_remember(fp)
+                    print(
+                        f"[ALL CRYPTO MARGINPAD EXCHANGE REJECT] exchange={event.get('exchange','')} normalized={exchange_key}",
+                        flush=True,
+                    )
+                    continue
                 symbol = str(event.get("symbol", "")).upper().strip()
                 # Hard reject known non-crypto instruments; then require crypto universe membership.
                 if symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
@@ -5767,7 +5786,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                 all_crypto_rolling_events.append((ts_sec, side, notional, symbol))
                 accepted += 1
                 print(
-                    f"[ALL CRYPTO ACCEPTED] ts_ms={ts_ms} symbol={symbol or '-'} "
+                    f"[ALL CRYPTO MARGINPAD ACCEPTED] ts_ms={ts_ms} symbol={symbol or '-'} "
                     f"exchange={event.get('exchange','')} side={side_raw} notional=${notional:,.2f}",
                     flush=True,
                 )
@@ -5803,6 +5822,85 @@ def process_marginpad_all_crypto_feed(seed_only=False):
         print(f"[ALL CRYPTO POLL ERROR] {exc}", flush=True)
         return {"ok": False, "error": str(exc)}
 
+
+
+def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event_ts=None):
+    """Add one Direct-4 crypto liquidation to the ALL Crypto 13EX state only."""
+    global all_crypto_long_cumulative, all_crypto_short_cumulative
+    global all_crypto_rolling_events, all_crypto_cycle_start_ts
+    global all_crypto_last_poll_ts, all_crypto_last_error
+
+    exchange = str(exchange or "").lower().strip()
+    symbol = str(symbol or "").upper().strip()
+    side = str(side or "").lower().strip()
+    event_key = str(event_key or "").strip()
+
+    if exchange not in ALL_CRYPTO_DIRECT_EXCHANGES:
+        return {"ok": False, "error": "invalid_all_crypto_exchange"}
+    if not symbol or symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+        return {"ok": False, "error": "invalid_all_crypto_symbol"}
+    if side not in ("long", "short"):
+        return {"ok": False, "error": "invalid_all_crypto_side"}
+    if not event_key:
+        return {"ok": False, "error": "missing_event_key"}
+    try:
+        amount = abs(float(amount or 0.0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_notional"}
+    if amount <= 0:
+        return {"ok": False, "error": "invalid_notional"}
+
+    ts_ms = normalize_marginpad_ts_ms(event_ts) if event_ts is not None else None
+    ts_sec = (ts_ms / 1000.0) if ts_ms is not None else time.time()
+    fp = f"direct|{exchange}|{event_key}"
+
+    with _all_crypto_lock:
+        if fp in all_crypto_seen_set:
+            return {"ok": True, "duplicate": True, "source": "direct", "exchange": exchange, "symbol": symbol}
+        _all_crypto_remember(fp)
+
+        if all_crypto_cycle_start_ts is None:
+            all_crypto_cycle_start_ts = ts_sec
+        if side == "long":
+            all_crypto_long_cumulative += amount
+        else:
+            all_crypto_short_cumulative += amount
+
+        bucket = all_crypto_by_symbol.setdefault(symbol, {"long": 0.0, "short": 0.0})
+        bucket[side] += amount
+        all_crypto_rolling_events.append((ts_sec, side, amount, symbol))
+        if len(all_crypto_rolling_events) > 1 and ts_sec < float(all_crypto_rolling_events[-2][0]):
+            all_crypto_rolling_events = deque(sorted(all_crypto_rolling_events, key=lambda r: r[0]))
+
+        now_ts = time.time()
+        _all_crypto_rolling_trim(now_ts)
+        reset_alert = _all_crypto_send_reset_if_flip()
+        rolling_alert = _all_crypto_send_rolling_if_flip(now_ts)
+        all_crypto_last_poll_ts = now_ts
+        all_crypto_last_error = None
+
+        result = {
+            "ok": True,
+            "duplicate": False,
+            "source": "direct",
+            "exchange": exchange,
+            "symbol": symbol,
+            "long": round(all_crypto_long_cumulative, 2),
+            "short": round(all_crypto_short_cumulative, 2),
+            "gap": round(all_crypto_long_cumulative - all_crypto_short_cumulative, 2),
+            "gap_state": all_crypto_gap_state,
+            "rolling_state": all_crypto_rolling_state,
+            "reset_alert_sent": reset_alert,
+            "rolling_alert_sent": rolling_alert,
+        }
+
+    _save_runtime_state()
+    print(
+        f"[ALL CRYPTO DIRECT ACCEPTED] exchange={exchange} symbol={symbol} "
+        f"side={side} notional=${amount:,.2f}",
+        flush=True,
+    )
+    return result
 
 def _all_crypto_poller_loop():
     print(f"[ALL CRYPTO POLLER] started interval={ALL_CRYPTO_POLL_SECONDS:.0f}s", flush=True)
@@ -7162,7 +7260,7 @@ def direct_liquidation_event():
     side = str(data.get("side", "")).lower().strip()
     event_key = str(data.get("event_key") or data.get("event_id") or "").strip()
 
-    if asset not in ("BTC", "XAU"):
+    if asset not in ("BTC", "XAU", "ALL"):
         return jsonify({"ok": False, "error": "invalid_asset"}), 400
 
     if exchange not in COMBINED_DIRECT_EXCHANGES:
@@ -7182,7 +7280,19 @@ def direct_liquidation_event():
     if amount <= 0:
         return jsonify({"ok": False, "error": "invalid_notional"}), 400
 
-    if asset == "BTC":
+    if asset == "ALL":
+        symbol = str(data.get("symbol", "")).upper().strip()
+        if not symbol:
+            return jsonify({"ok": False, "error": "missing_symbol"}), 400
+        result = add_all_crypto_direct_event(
+            exchange=exchange,
+            symbol=symbol,
+            side=side,
+            amount=amount,
+            event_key=event_key,
+            event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
+        )
+    elif asset == "BTC":
         result = add_direct_btc_liquidation_event(
             exchange=exchange,
             side=side,
@@ -7526,7 +7636,7 @@ def xau_minute_alert():
 
 
 # ==================================================
-# ALL CRYPTO TEST ENDPOINT - MARGINPAD /api/v1/feed
+# ALL CRYPTO 13EX STATUS / POLL ENDPOINTS
 # ==================================================
 
 @app.get("/all-crypto-status")
@@ -7537,6 +7647,8 @@ def all_crypto_status():
         return jsonify({
             "ok": True,
             "threshold_usd": ALL_CRYPTO_GAP_THRESHOLD,
+            "mode": "13EX_MARGINPAD9_PLUS_DIRECT4",
+            "exchanges": list(ALL_CRYPTO_OBSERVER_EXCHANGES),
             "reset_cycle": {
                 "long": round(all_crypto_long_cumulative, 2),
                 "short": round(all_crypto_short_cumulative, 2),
