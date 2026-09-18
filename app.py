@@ -217,6 +217,17 @@ xau_coinalyze_rolling_state = None
 xau_observer_rolling_state = None
 _xau_rolling_lock = threading.RLock()
 
+# XAU Observer mirrors the BTC 13EX universe:
+# MarginPad 9 approved exchanges + Direct 4 exchanges.
+XAU_MARGINPAD_EXCHANGES = (
+    "binance", "bybit", "okx", "hyperliquid", "gate", "htx",
+    "dydx", "bitmex", "bitfinex",
+)
+XAU_OBSERVER_EXCHANGES = (
+    *XAU_MARGINPAD_EXCHANGES,
+    "bitget", "aster", "coinex", "lighter",
+)
+
 
 # ==================================================
 # ALL CRYPTO LIQUIDATION - MARGINPAD MARKET-WIDE FEED
@@ -804,11 +815,11 @@ def add_combined_liquidation_batch(
                 if long_hit:
                     winner = "LONG"
                     xau_observer_gap_state = "LONG"
-                    title = "XAU OBSERVER LONG WINS | 100K GAP"
+                    title = "XAU OBSERVER 13EX LONG WINS | 100K GAP"
                 else:
                     winner = "SHORT"
                     xau_observer_gap_state = "SHORT"
-                    title = "XAU OBSERVER SHORT WINS | 100K GAP"
+                    title = "XAU OBSERVER 13EX SHORT WINS | 100K GAP"
             elif long_hit and short_hit:
                 winner = "BOTH HIT SAME CYCLE"
                 title = f"{asset} COMBINED BOTH HIT +{threshold/1_000_000:g}M"
@@ -1839,21 +1850,34 @@ def get_marginpad_fresh_xau_liquidations(
             event.get("side", "")
         ).strip().lower()
 
-        if side == "long_liquidated":
-            fresh_long += notional
-
-        elif side == "short_liquidated":
-            fresh_short += notional
-
-        else:
+        if side not in ("long_liquidated", "short_liquidated"):
             continue
 
         exchange = str(
             event.get("exchange", "")
         ).strip()
+        exchange_key = _btc_exchange_key(exchange)
 
-        if exchange:
-            exchanges.add(exchange)
+        # Exact BTC-style XAU 13EX architecture:
+        # MarginPad contributes only the approved 9 exchanges.
+        # Direct Bitget/Aster/CoinEx/Lighter arrive through the direct endpoint.
+        if exchange_key not in XAU_MARGINPAD_EXCHANGES:
+            print(
+                "[XAU 13EX EXCHANGE REJECT] "
+                f"exchange={exchange or '-'} | "
+                f"normalized={exchange_key or '-'} | "
+                f"side={side} | "
+                f"notional=${notional:,.2f}",
+                flush=True,
+            )
+            continue
+
+        if side == "long_liquidated":
+            fresh_long += notional
+        else:
+            fresh_short += notional
+
+        exchanges.add(exchange_key)
 
         remember_marginpad_xau_event(
             fingerprint
@@ -1861,7 +1885,7 @@ def get_marginpad_fresh_xau_liquidations(
 
         rolling_events.append({
             "ts_ms": event_ts_ms,
-            "exchange": exchange.lower() or "unknown",
+            "exchange": exchange_key,
             "side": "long" if side == "long_liquidated" else "short",
             "notional": notional,
         })
@@ -5836,7 +5860,7 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
             title = f"XAU COINALYZE ROLLING 60M {new_state} | 100K GAP"
         else:
             xau_observer_rolling_state = new_state
-            title = f"XAU OBSERVER ROLLING 60M {new_state} | 100K GAP"
+            title = f"XAU OBSERVER 13EX ROLLING 60M {new_state} | 100K GAP"
         gap = abs(signed_gap)
         try: price_text = f"{float(price):,.2f}" if price is not None else "NA"
         except (TypeError, ValueError): price_text = "NA"
