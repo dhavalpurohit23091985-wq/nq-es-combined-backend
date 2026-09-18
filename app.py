@@ -5824,7 +5824,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
 
 
 
-def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event_ts=None):
+def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event_ts=None, verified_crypto=False):
     """Add one Direct-4 crypto liquidation to the ALL Crypto 13EX state only."""
     global all_crypto_long_cumulative, all_crypto_short_cumulative
     global all_crypto_rolling_events, all_crypto_cycle_start_ts
@@ -5841,24 +5841,34 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
         return {"ok": False, "error": "invalid_all_crypto_symbol"}
 
     # CRYPTO-ONLY SAFETY GATE:
-    # The MarginPad crypto market universe is the canonical whitelist for ALL Crypto.
-    # This prevents Direct-4 venues (especially multi-asset Lighter markets) from
-    # leaking FX/equity/commodity symbols such as GBP, USDCAD or CRCL into the
-    # $5M ALL Crypto GAP accumulators. Refresh is cached for one hour.
-    _all_crypto_refresh_symbol_universe()
-    if symbol not in all_crypto_crypto_symbols:
+    # Bitget/Aster/CoinEx ALL events come from crypto-futures-specific venue paths
+    # and are explicitly marked verified_crypto by the worker. This avoids false
+    # negatives for genuine coins (e.g. UNI/ZEC/G/CROSS) that may be missing from
+    # the cached MarginPad market universe.
+    #
+    # Lighter is a mixed-asset venue, so it is NOT trusted by symbol alone and must
+    # still exist in the MarginPad crypto universe before entering the $5M totals.
+    verified_crypto = bool(verified_crypto)
+    if not verified_crypto:
+        _all_crypto_refresh_symbol_universe()
+        if symbol not in all_crypto_crypto_symbols:
+            print(
+                f"[ALL CRYPTO DIRECT REJECTED NONCRYPTO] exchange={exchange} symbol={symbol}",
+                flush=True,
+            )
+            return {
+                "ok": True,
+                "accepted": False,
+                "filtered_noncrypto": True,
+                "source": "direct",
+                "exchange": exchange,
+                "symbol": symbol,
+            }
+    else:
         print(
-            f"[ALL CRYPTO DIRECT REJECTED NONCRYPTO] exchange={exchange} symbol={symbol}",
+            f"[ALL CRYPTO DIRECT VERIFIED CRYPTO] exchange={exchange} symbol={symbol}",
             flush=True,
         )
-        return {
-            "ok": True,
-            "accepted": False,
-            "filtered_noncrypto": True,
-            "source": "direct",
-            "exchange": exchange,
-            "symbol": symbol,
-        }
 
     if side not in ("long", "short"):
         return {"ok": False, "error": "invalid_all_crypto_side"}
@@ -7312,6 +7322,7 @@ def direct_liquidation_event():
             amount=amount,
             event_key=event_key,
             event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
+            verified_crypto=bool(data.get("verified_crypto", False)),
         )
     elif asset == "BTC":
         result = add_direct_btc_liquidation_event(
