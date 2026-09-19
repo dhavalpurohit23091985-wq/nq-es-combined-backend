@@ -606,16 +606,16 @@ def _nasdaq_combined_process(title, message):
 
             combined_title = f"NASDAQ {setup} COMBINED {combined_direction} | CONFIRMED"
             combined_message = (
-                f"SETUP: {setup}\n\n"
+                f"SETUP: {setup}\n"
                 "ALERT 1:\n"
-                f"{first['source']} {first['direction']} | {first['time']}\n\n"
+                f"{first['source']} {first['direction']} | {first['time']}\n"
                 "ALERT 2:\n"
-                f"{source} {direction} | {event_time}\n\n"
+                f"{source} {direction} | {event_time}\n"
                 "SEQUENCE:\n"
-                f"{first['direction']} -> {direction}\n\n"
+                f"{first['direction']} -> {direction}\n"
                 "RESULT:\n"
-                f"COMBINED {combined_direction}\n\n"
-                f"NQ: {nq_display}\n\n"
+                f"COMBINED {combined_direction}\n"
+                f"NQ: {nq_display}\n"
                 "SEQUENCE RESET:\n"
                 f"{setup} WAITING FOR NEW ALERT"
             )
@@ -863,7 +863,7 @@ def add_combined_liquidation_batch(
                 if src_long > 0 or src_short > 0:
                     label = "MarginPad" if src_name == "marginpad" else src_name.title()
                     source_lines.append(
-                        f"{label}: L ${src_long:,.0f} | S ${src_short:,.0f}"
+                        f"{label}: L ${_usd_m(src_long)} | S ${_usd_m(src_short)}"
                     )
 
             exchange_lines = []
@@ -894,11 +894,11 @@ def add_combined_liquidation_batch(
                 for _, ex_name, ex_long, ex_short in ranked:
                     label = exchange_labels.get(ex_name, ex_name.title())
                     if display_side == "long":
-                        exchange_lines.append(f"{label}: ${ex_long:,.0f}")
+                        exchange_lines.append(f"{label}: ${_usd_m(ex_long)}")
                     elif display_side == "short":
-                        exchange_lines.append(f"{label}: ${ex_short:,.0f}")
+                        exchange_lines.append(f"{label}: ${_usd_m(ex_short)}")
                     else:
-                        exchange_lines.append(f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}")
+                        exchange_lines.append(f"{label}: L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)}")
 
             elif asset == "XAU":
                 audit_long = 0.0
@@ -913,13 +913,13 @@ def add_combined_liquidation_batch(
                     audit_short += ex_short
                     label = exchange_labels.get(ex_name, ex_name.title())
                     exchange_lines.append(
-                        f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}"
+                        f"{label}: L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)}"
                     )
                 exchange_lines.append("")
-                exchange_lines.append(f"13EX SUM LONG: ${audit_long:,.0f}")
-                exchange_lines.append(f"13EX SUM SHORT: ${audit_short:,.0f}")
-                exchange_lines.append(f"TOTAL LONG: ${cycle_long:,.0f}")
-                exchange_lines.append(f"TOTAL SHORT: ${cycle_short:,.0f}")
+                exchange_lines.append(f"13EX SUM LONG: ${_usd_m(audit_long)}")
+                exchange_lines.append(f"13EX SUM SHORT: ${_usd_m(audit_short)}")
+                exchange_lines.append(f"TOTAL LONG: ${_usd_m(cycle_long)}")
+                exchange_lines.append(f"TOTAL SHORT: ${_usd_m(cycle_short)}")
                 audit_status = (
                     "MATCH"
                     if abs(audit_long - cycle_long) < 0.01
@@ -998,19 +998,19 @@ def add_combined_liquidation_batch(
         if asset in ("BTC", "XAU") and alert_snapshot.get("exchanges"):
             breakdown = "\n".join(alert_snapshot["exchanges"])
             message = (
-                f"{breakdown}\n\n"
-                f"COMBINED SHORT: ${alert_snapshot['short']:,.0f}\n"
-                f"COMBINED LONG: ${alert_snapshot['long']:,.0f}\n"
-                f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
+                f"{breakdown}\n"
+                f"COMBINED SHORT: ${_usd_m(alert_snapshot['short'])}\n"
+                f"COMBINED LONG: ${_usd_m(alert_snapshot['long'])}\n"
+                f"GAP: ${_usd_m(alert_snapshot['gap'])}\n"
                 f"{asset} {price_text} | {asset} MOVE {move_text}"
             )
         else:
             breakdown = "\n".join(alert_snapshot["sources"]) or "No source breakdown"
             message = (
                 f"SOURCE COMBINED | WINNER {alert_snapshot['winner']} | "
-                f"LONG ${alert_snapshot['long']:,.0f} ({_usd_m(alert_snapshot['long'])}) ({alert_snapshot['long_pct']:.2f}%) | "
-                f"SHORT ${alert_snapshot['short']:,.0f} ({_usd_m(alert_snapshot['short'])}) ({alert_snapshot['short_pct']:.2f}%) | "
-                f"GAP ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])}) | "
+                f"LONG ${_usd_m(alert_snapshot['long'])} ({alert_snapshot['long_pct']:.2f}%) | "
+                f"SHORT ${_usd_m(alert_snapshot['short'])} ({alert_snapshot['short_pct']:.2f}%) | "
+                f"GAP ${_usd_m(alert_snapshot['gap'])} | "
                 f"{asset} {price_text} | {asset} MOVE {move_text}\n"
                 f"{breakdown}"
             )
@@ -1025,7 +1025,7 @@ def add_combined_liquidation_batch(
 
         print(
             f"[COMBINED ALERT] {alert_snapshot['title']} "
-            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} "
+            f"L=${_usd_m(alert_snapshot['long'])} S=${_usd_m(alert_snapshot['short'])} "
             f"sent={sent}",
             flush=True,
         )
@@ -1033,9 +1033,9 @@ def add_combined_liquidation_batch(
     else:
         print(
             f"[COMBINED {asset}] {source_key.upper()} "
-            f"+L=${long_usd:,.0f} +S=${short_usd:,.0f} | "
-            f"TOTAL L=${result['combined_long_usd']:,.0f} "
-            f"S=${result['combined_short_usd']:,.0f}",
+            f"+L=${_usd_m(long_usd)} +S=${_usd_m(short_usd)} | "
+            f"TOTAL L=${_usd_m(result['combined_long_usd'])} "
+            f"S=${_usd_m(result['combined_short_usd'])}",
             flush=True,
         )
 
@@ -5264,9 +5264,9 @@ def _btc_reference_text(reference_source, closed_minute_ts):
 
     return (
         f"REF {reference_source} CURRENT CYCLE | "
-        f"LONG ${ref_long:,.0f} ({_usd_m(ref_long)}) ({ref_long_pct:.2f}%) | "
-        f"SHORT ${ref_short:,.0f} ({_usd_m(ref_short)}) ({ref_short_pct:.2f}%) | "
-        f"GAP ${ref_gap:,.0f} ({_usd_m(ref_gap)})"
+        f"LONG ${_usd_m(ref_long)} ({ref_long_pct:.2f}%) | "
+        f"SHORT ${_usd_m(ref_short)} ({ref_short_pct:.2f}%) | "
+        f"GAP ${_usd_m(ref_gap)}"
     )
 
 
@@ -5543,13 +5543,13 @@ def process_btc(
                 f"WINNER "
                 f"{cycle_winner} | "
                 f"LONG "
-                f"${cycle_long:,.0f} ({_usd_m(cycle_long)}) "
+                f"${_usd_m(cycle_long)} "
                 f"({long_pct:.2f}%) | "
                 f"SHORT "
-                f"${cycle_short:,.0f} ({_usd_m(cycle_short)}) "
+                f"${_usd_m(cycle_short)} "
                 f"({short_pct:.2f}%) | "
                 f"GAP "
-                f"${cycle_gap:,.0f} ({_usd_m(cycle_gap)}) | "
+                f"${_usd_m(cycle_gap)} | "
                 f"BTC "
                 f"{btc_price:,.0f} | "
                 f"BTC MOVE "
@@ -5745,11 +5745,11 @@ def _btc_standalone_exchange_lines(
     for _, ex_name, ex_long, ex_short in ranked:
         label = _btc_exchange_label(ex_name)
         if display_side == "long":
-            lines.append(f"{label}: ${ex_long:,.0f}")
+            lines.append(f"{label}: ${_usd_m(ex_long)}")
         elif display_side == "short":
-            lines.append(f"{label}: ${ex_short:,.0f}")
+            lines.append(f"{label}: ${_usd_m(ex_short)}")
         else:
-            lines.append(f"{label}: L ${ex_long:,.0f} | S ${ex_short:,.0f}")
+            lines.append(f"{label}: L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)}")
     return lines
 
 
@@ -5886,9 +5886,9 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
     title = f"ALL CRYPTO 13EX ROLLING 60M {new_state} | 5M GAP"
     message = (
         "13EX: MARGINPAD 9 + DIRECT 4 | EXACT TRAILING 60 MINUTES | NO RESET\n"
-        f"LONG: ${long_total:,.0f} ({_usd_m(long_total)}) ({long_pct:.2f}%)\n"
-        f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)}) ({short_pct:.2f}%)\n"
-        f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+        f"LONG: ${_usd_m(long_total)} ({long_pct:.2f}%)\n"
+        f"SHORT: ${_usd_m(short_total)} ({short_pct:.2f}%)\n"
+        f"GAP: ${_usd_m(gap)}\n"
         f"STRONGER: {new_state}\n"
         f"STATE: {state or 'NONE'} -> {new_state}"
     )
@@ -5920,19 +5920,19 @@ def _all_crypto_send_reset_if_flip():
         if amount > 0:
             ranked.append((amount, symbol))
     ranked.sort(reverse=True)
-    top_lines = [f"{sym}: ${amount:,.0f} ({_usd_m(amount)})" for amount, sym in ranked[:8]]
+    top_lines = [f"{sym}: ${_usd_m(amount)}" for amount, sym in ranked[:8]]
     title = f"ALL CRYPTO 13EX {new_state} WINS | 5M GAP"
     message = (
         "MARKET-WIDE CRYPTO 13EX | MARGINPAD 9 + DIRECT 4 | RESET AFTER VALID FLIP\n"
-        f"LONG: ${all_crypto_long_cumulative:,.0f} ({_usd_m(all_crypto_long_cumulative)})\n"
-        f"SHORT: ${all_crypto_short_cumulative:,.0f} ({_usd_m(all_crypto_short_cumulative)})\n"
-        f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+        f"LONG: ${_usd_m(all_crypto_long_cumulative)}\n"
+        f"SHORT: ${_usd_m(all_crypto_short_cumulative)}\n"
+        f"GAP: ${_usd_m(gap)}\n"
         f"ACCUMULATION TIME: {accumulation_time}\n"
         f"STRONGER: {new_state}\n"
         f"STATE: {state or 'NONE'} -> {new_state}"
     )
     if top_lines:
-        message += "\n\nTOP CONTRIBUTORS:\n" + "\n".join(top_lines)
+        message += "\nTOP CONTRIBUTORS:\n" + "\n".join(top_lines)
     sent = send_pushover(title, message)
     print(f"[ALL CRYPTO GAP ALERT] {title} accumulation={accumulation_time} sent={sent}", flush=True)
     all_crypto_gap_state = new_state
@@ -6223,11 +6223,7 @@ def _all_crypto_send_hourly_report(boundary_ts=None):
 
     ist_dt = datetime.fromtimestamp(boundary_ts, tz=NASDAQ_COMBINED_IST)
     title = "ALL CRYPTO 13EX | HOURLY UPDATE"
-
-    lines = [
-        f"{ist_dt.strftime('%d-%m-%Y | %H:%M')} IST",
-        "",
-    ]
+    lines = [f"{ist_dt.strftime('%d-%m-%Y | %H:%M')} IST"]
 
     if ranked:
         for idx, (gap, symbol, long_usd, short_usd) in enumerate(
@@ -6243,30 +6239,19 @@ def _all_crypto_send_hourly_report(boundary_ts=None):
             short_pct = (short_usd / coin_total * 100.0) if coin_total > 0 else 0.0
             lines.extend([
                 f"{idx}. {symbol}",
-                f"LONG:  ${long_usd:,.0f} (${long_usd / 1_000_000:.2f}M) ({long_pct:.2f}%)",
-                f"SHORT: ${short_usd:,.0f} (${short_usd / 1_000_000:.2f}M) ({short_pct:.2f}%)",
-                f"GAP:   ${gap:,.0f} (${gap / 1_000_000:.2f}M)",
-                winner,
-                "",
+                f"L ${_usd_m(long_usd)} ({long_pct:.1f}%) | S ${_usd_m(short_usd)} ({short_pct:.1f}%)",
+                f"GAP ${_usd_m(gap)} | {winner}",
             ])
     else:
-        lines.extend([
-            "No accepted crypto liquidations in the last 60 minutes.",
-            "",
-        ])
+        lines.append("No accepted crypto liquidations in the last 60 minutes.")
 
-    # ALL CRYPTO TOTAL uses every accepted crypto coin in the hour,
-    # not only the displayed Top 12.
     grand_total = total_long + total_short
     total_long_pct = (total_long / grand_total * 100.0) if grand_total > 0 else 0.0
     total_short_pct = (total_short / grand_total * 100.0) if grand_total > 0 else 0.0
-
     lines.extend([
         "ALL CRYPTO TOTAL",
-        f"LONG:  ${total_long:,.0f} (${total_long / 1_000_000:.2f}M) ({total_long_pct:.2f}%)",
-        f"SHORT: ${total_short:,.0f} (${total_short / 1_000_000:.2f}M) ({total_short_pct:.2f}%)",
-        f"GAP:   ${total_gap:,.0f} (${total_gap / 1_000_000:.2f}M)",
-        total_winner,
+        f"L ${_usd_m(total_long)} ({total_long_pct:.1f}%) | S ${_usd_m(total_short)} ({total_short_pct:.1f}%)",
+        f"GAP ${_usd_m(total_gap)} | {total_winner}",
     ])
 
     message = "\n".join(lines)
@@ -6274,8 +6259,8 @@ def _all_crypto_send_hourly_report(boundary_ts=None):
 
     print(
         f"[ALL CRYPTO HOURLY] boundary={ist_dt.isoformat()} active={len(ranked)} "
-        f"L=${total_long:,.0f} S=${total_short:,.0f} "
-        f"GAP=${total_gap:,.0f} winner={total_winner} sent={sent}",
+        f"L=${_usd_m(total_long)} S=${_usd_m(total_short)} "
+        f"GAP=${_usd_m(total_gap)} winner={total_winner} sent={sent}",
         flush=True,
     )
     return bool(sent)
@@ -6412,21 +6397,21 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
                 else "MISMATCH"
             )
             exchange_lines = [
-                f"{labels.get(ex, ex.title())}: L ${by_exchange[ex]['long']:,.0f} | S ${by_exchange[ex]['short']:,.0f}"
+                f"{labels.get(ex, ex.title())}: L ${_usd_m(by_exchange[ex]['long'])} | S ${_usd_m(by_exchange[ex]['short'])}"
                 for ex in XAU_OBSERVER_EXCHANGES
             ]
             message = (
                 "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
-                f"LONG: ${long_total:,.0f} ({_usd_m(long_total)}) ({long_pct:.2f}%)\n"
-                f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)}) ({short_pct:.2f}%)\n"
-                f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                f"LONG: ${_usd_m(long_total)} ({long_pct:.2f}%)\n"
+                f"SHORT: ${_usd_m(short_total)} ({short_pct:.2f}%)\n"
+                f"GAP: ${_usd_m(gap)}\n"
                 f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
-                f"XAU: {price_text}\n\n13EX AUDIT:\n"
+                f"XAU: {price_text}\n13EX AUDIT:\n"
                 + "\n".join(exchange_lines)
-                + f"\n\n13EX SUM LONG: ${audit_long:,.0f}"
-                + f"\n13EX SUM SHORT: ${audit_short:,.0f}"
-                + f"\nTOTAL LONG: ${long_total:,.0f}"
-                + f"\nTOTAL SHORT: ${short_total:,.0f}"
+                + f"\n13EX SUM LONG: ${_usd_m(audit_long)}"
+                + f"\n13EX SUM SHORT: ${_usd_m(audit_short)}"
+                + f"\nTOTAL LONG: ${_usd_m(long_total)}"
+                + f"\nTOTAL SHORT: ${_usd_m(short_total)}"
                 + f"\nAUDIT: {audit_status}"
             )
         else:
@@ -6456,7 +6441,7 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
                 else "MISMATCH"
             )
             exchange_lines = [
-                f"{ex}: L ${vals['long']:,.0f} | S ${vals['short']:,.0f}"
+                f"{ex}: L ${_usd_m(vals['long'])} | S ${_usd_m(vals['short'])}"
                 for ex, vals in sorted(
                     by_exchange.items(),
                     key=lambda item: item[1]["long"] + item[1]["short"],
@@ -6467,23 +6452,23 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
 
             message = (
                 "WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
-                f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
-                f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
-                f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                f"LONG: ${_usd_m(long_total)}\n"
+                f"SHORT: ${_usd_m(short_total)}\n"
+                f"GAP: ${_usd_m(gap)}\n"
                 f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
-                f"XAU: {price_text}\n\nCOINALYZE EXCHANGE AUDIT:\n"
+                f"XAU: {price_text}\nCOINALYZE EXCHANGE AUDIT:\n"
                 + exchange_block
-                + f"\n\nEXCHANGE SUM LONG: ${audit_long:,.0f}"
-                + f"\nEXCHANGE SUM SHORT: ${audit_short:,.0f}"
-                + f"\nTOTAL LONG: ${long_total:,.0f}"
-                + f"\nTOTAL SHORT: ${short_total:,.0f}"
+                + f"\nEXCHANGE SUM LONG: ${_usd_m(audit_long)}"
+                + f"\nEXCHANGE SUM SHORT: ${_usd_m(audit_short)}"
+                + f"\nTOTAL LONG: ${_usd_m(long_total)}"
+                + f"\nTOTAL SHORT: ${_usd_m(short_total)}"
                 + f"\nAUDIT: {audit_status}"
             )
 
         sent = send_pushover(title, message)
         print(
             f"[XAU ROLLING 60M] {source.upper()} {new_state} "
-            f"L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}",
+            f"L=${_usd_m(long_total)} S=${_usd_m(short_total)} GAP=${_usd_m(gap)} sent={sent}",
             flush=True,
         )
         return {
@@ -6581,12 +6566,12 @@ def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=N
         try: price_text = f"{float(price):,.0f}" if price is not None else "NA"
         except (TypeError, ValueError): price_text = "NA"
         message = (f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
-                   f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
-                   f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
-                   f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                   f"LONG: ${_usd_m(long_total)}\n"
+                   f"SHORT: ${_usd_m(short_total)}\n"
+                   f"GAP: ${_usd_m(gap)}\n"
                    f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nBTC: {price_text}")
         sent = send_pushover(title, message)
-        print(f"[BTC ROLLING 60M] {source.upper()} {new_state} L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}", flush=True)
+        print(f"[BTC ROLLING 60M] {source.upper()} {new_state} L=${_usd_m(long_total)} S=${_usd_m(short_total)} GAP=${_usd_m(gap)} sent={sent}", flush=True)
         return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
 
 def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=None):
@@ -6623,12 +6608,12 @@ def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=No
         except (TypeError, ValueError): price_text = "NA"
         title = f"BTC COINALYZE ROLLING 60M {new_state} | +5M GAP"
         message = (f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\n"
-                   f"LONG: ${long_total:,.0f} ({_usd_m(long_total)})\n"
-                   f"SHORT: ${short_total:,.0f} ({_usd_m(short_total)})\n"
-                   f"GAP: ${gap:,.0f} ({_usd_m(gap)})\n"
+                   f"LONG: ${_usd_m(long_total)}\n"
+                   f"SHORT: ${_usd_m(short_total)}\n"
+                   f"GAP: ${_usd_m(gap)}\n"
                    f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nBTC: {price_text}")
         sent = send_pushover(title, message)
-        print(f"[BTC ROLLING 60M] COINALYZE {new_state} L=${long_total:,.0f} S=${short_total:,.0f} GAP=${gap:,.0f} sent={sent}", flush=True)
+        print(f"[BTC ROLLING 60M] COINALYZE {new_state} L=${_usd_m(long_total)} S=${_usd_m(short_total)} GAP=${_usd_m(gap)} sent={sent}", flush=True)
         return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
 
 
@@ -6691,11 +6676,11 @@ def _btc_observer_add(exchange_breakdown, price=None):
         for ex_name, totals in accepted.items():
             label = _btc_exchange_label(ex_name)
             update_parts.append(
-                f"{label}(+L=${totals['long']:,.0f},+S=${totals['short']:,.0f})"
+                f"{label}(+L=${_usd_m(totals['long'])},+S=${_usd_m(totals['short'])})"
             )
         print(
             f"[BTC OBSERVER] {' | '.join(update_parts)} | "
-            f"TOTAL L=${cycle_long:,.0f} S=${cycle_short:,.0f}",
+            f"TOTAL L=${_usd_m(cycle_long)} S=${_usd_m(cycle_short)}",
             flush=True,
         )
 
@@ -6735,7 +6720,7 @@ def _btc_observer_add(exchange_breakdown, price=None):
 
             observer_ranked.sort(key=lambda row: row[0], reverse=True)
             exchange_lines = [
-                f"{_btc_exchange_label(ex_name)}: LONG ${ex_long:,.0f} ({_usd_m(ex_long)}) | SHORT ${ex_short:,.0f} ({_usd_m(ex_short)})"
+                f"{_btc_exchange_label(ex_name)}: LONG ${_usd_m(ex_long)} | SHORT ${_usd_m(ex_short)}"
                 for _, ex_name, ex_long, ex_short in observer_ranked
             ]
             alert_snapshot = {
@@ -6773,16 +6758,16 @@ def _btc_observer_add(exchange_breakdown, price=None):
             if alert_snapshot["move"] is not None else "NA"
         )
         message = (
-            f"{breakdown}\n\n"
-            f"TOTAL SHORT: ${alert_snapshot['short']:,.0f} ({_usd_m(alert_snapshot['short'])})\n"
-            f"TOTAL LONG: ${alert_snapshot['long']:,.0f} ({_usd_m(alert_snapshot['long'])})\n"
-            f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
+            f"{breakdown}\n"
+            f"TOTAL SHORT: ${_usd_m(alert_snapshot['short'])}\n"
+            f"TOTAL LONG: ${_usd_m(alert_snapshot['long'])}\n"
+            f"GAP: ${_usd_m(alert_snapshot['gap'])}\n"
             f"BTC {price_text} | BTC MOVE {move_text}"
         )
         sent = send_pushover(alert_snapshot["title"], message)
         print(
             f"[BTC OBSERVER ALERT] {alert_snapshot['title']} "
-            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f} "
+            f"L=${_usd_m(alert_snapshot['long'])} S=${_usd_m(alert_snapshot['short'])} "
             f"sent={sent}",
             flush=True,
         )
@@ -6964,10 +6949,10 @@ def process_marginpad_btc(closed_minute_ts):
             else "NA"
         )
         message = (
-            f"{breakdown}\n\n"
-            f"MARGINPAD SHORT: ${alert_snapshot['short']:,.0f}\n"
-            f"MARGINPAD LONG: ${alert_snapshot['long']:,.0f}\n"
-            f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
+            f"{breakdown}\n"
+            f"MARGINPAD SHORT: ${_usd_m(alert_snapshot['short'])}\n"
+            f"MARGINPAD LONG: ${_usd_m(alert_snapshot['long'])}\n"
+            f"GAP: ${_usd_m(alert_snapshot['gap'])}\n"
             f"BTC {alert_snapshot['price']:,.0f} | BTC MOVE {move_text}"
         )
         # Standalone MarginPad BTC Pushover intentionally disabled.
@@ -6975,7 +6960,7 @@ def process_marginpad_btc(closed_minute_ts):
         sent = False
         print(
             f"[MARGINPAD BTC ALERT SILENT] {alert_snapshot['title']} "
-            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f}",
+            f"L=${_usd_m(alert_snapshot['long'])} S=${_usd_m(alert_snapshot['short'])}",
             flush=True,
         )
 
@@ -7133,10 +7118,10 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
             else "NA"
         )
         message = (
-            f"{breakdown}\n\n"
-            f"LIQUIDATOR SHORT: ${alert_snapshot['short']:,.0f}\n"
-            f"LIQUIDATOR LONG: ${alert_snapshot['long']:,.0f}\n"
-            f"GAP: ${alert_snapshot['gap']:,.0f} ({_usd_m(alert_snapshot['gap'])})\n"
+            f"{breakdown}\n"
+            f"LIQUIDATOR SHORT: ${_usd_m(alert_snapshot['short'])}\n"
+            f"LIQUIDATOR LONG: ${_usd_m(alert_snapshot['long'])}\n"
+            f"GAP: ${_usd_m(alert_snapshot['gap'])}\n"
             f"BTC {price_text} | BTC MOVE {move_text}"
         )
         # Standalone 4-exchange BTC Liquidator Pushover intentionally disabled.
@@ -7145,13 +7130,13 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
         result["alert_sent"] = False
         print(
             f"[BTC LIQUIDATOR ALERT SILENT] {alert_snapshot['title']} "
-            f"L=${alert_snapshot['long']:,.0f} S=${alert_snapshot['short']:,.0f}",
+            f"L=${_usd_m(alert_snapshot['long'])} S=${_usd_m(alert_snapshot['short'])}",
             flush=True,
         )
     else:
         print(
-            f"[BTC LIQUIDATOR] {exchange.upper()} {side.upper()} +${amount:,.0f} | "
-            f"TOTAL L=${result['long_usd']:,.0f} S=${result['short_usd']:,.0f}",
+            f"[BTC LIQUIDATOR] {exchange.upper()} {side.upper()} +${_usd_m(amount)} | "
+            f"TOTAL L=${_usd_m(result['long_usd'])} S=${_usd_m(result['short_usd'])}",
             flush=True,
         )
 
@@ -7565,7 +7550,7 @@ def process_xau(
         ranked_exchanges.sort(key=lambda row: row[0], reverse=True)
         for _, ex_name, ex_long, ex_short in ranked_exchanges:
             exchange_lines.append(
-                f"{ex_name}: L ${ex_long:,.0f} | S ${ex_short:,.0f}"
+                f"{ex_name}: L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)}"
             )
 
         audit_status = (
@@ -7582,23 +7567,23 @@ def process_xau(
                 f"WINNER "
                 f"{cycle_winner} | "
                 f"LONG "
-                f"${cycle_long:,.0f} ({_usd_m(cycle_long)}) "
+                f"${_usd_m(cycle_long)} "
                 f"({long_pct:.2f}%) | "
                 f"SHORT "
-                f"${cycle_short:,.0f} ({_usd_m(cycle_short)}) "
+                f"${_usd_m(cycle_short)} "
                 f"({short_pct:.2f}%) | "
                 f"GAP "
-                f"${cycle_gap:,.0f} ({_usd_m(cycle_gap)}) | "
+                f"${_usd_m(cycle_gap)} | "
                 f"XAU "
                 f"{xau_price:,.2f} | "
                 f"XAU MOVE "
-                f"{move_text}\n\n"
+                f"{move_text}\n"
                 f"COINALYZE EXCHANGE AUDIT:\n"
-                f"{audit_text}\n\n"
-                f"EXCHANGE SUM LONG: ${audit_long:,.0f}\n"
-                f"EXCHANGE SUM SHORT: ${audit_short:,.0f}\n"
-                f"TOTAL LONG: ${cycle_long:,.0f}\n"
-                f"TOTAL SHORT: ${cycle_short:,.0f}\n"
+                f"{audit_text}\n"
+                f"EXCHANGE SUM LONG: ${_usd_m(audit_long)}\n"
+                f"EXCHANGE SUM SHORT: ${_usd_m(audit_short)}\n"
+                f"TOTAL LONG: ${_usd_m(cycle_long)}\n"
+                f"TOTAL SHORT: ${_usd_m(cycle_short)}\n"
                 f"AUDIT: {audit_status}"
             )
         )
