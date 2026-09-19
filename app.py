@@ -2475,10 +2475,10 @@ def _load_runtime_state():
         _all_rows = deque()
         for row in (allc.get('rolling_events') or []):
             try:
-                ts=float(row[0]); side=str(row[1]); amount=float(row[2]); symbol=str(row[3]) if len(row)>3 else ""
+                ts=float(row[0]); side=str(row[1]); amount=float(row[2]); symbol=str(row[3]) if len(row)>3 else ""; exchange=str(row[4]) if len(row)>4 else ""
                 if ts > 10_000_000_000: ts /= 1000.0
                 if ts > _all_cutoff and side in ('long','short') and amount > 0:
-                    _all_rows.append((ts,side,amount,symbol))
+                    _all_rows.append((ts,side,amount,symbol,exchange))
             except (TypeError,ValueError,IndexError):
                 pass
         all_crypto_rolling_events = deque(sorted(_all_rows,key=lambda r:r[0]))
@@ -5883,6 +5883,49 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
         return False
     all_crypto_rolling_state = new_state
     gap = abs(signed_gap)
+
+    # Display-only exchange audit for the SAME exact trailing 60-minute rows.
+    # Trigger, threshold, reverse-only state and NO RESET behavior are unchanged.
+    by_exchange = {
+        ex: {"long": 0.0, "short": 0.0}
+        for ex in ALL_CRYPTO_OBSERVER_EXCHANGES
+    }
+    legacy_unknown = {"long": 0.0, "short": 0.0}
+    for row in all_crypto_rolling_events:
+        try:
+            side = str(row[1]).lower().strip()
+            amount = float(row[2])
+            exchange = _btc_exchange_key(row[4]) if len(row) > 4 and row[4] else ""
+        except (TypeError, ValueError, IndexError):
+            continue
+        if side not in ("long", "short") or amount <= 0:
+            continue
+        if exchange in by_exchange:
+            by_exchange[exchange][side] += amount
+        else:
+            # Backward compatibility: rows persisted before exchange was stored.
+            legacy_unknown[side] += amount
+
+    exchange_labels = {
+        "binance": "Binance", "bybit": "Bybit", "okx": "OKX",
+        "hyperliquid": "Hyperliquid", "gate": "Gate", "htx": "HTX",
+        "dydx": "dYdX", "bitmex": "BitMEX", "bitfinex": "Bitfinex",
+        "bitget": "Bitget", "aster": "Aster", "coinex": "CoinEx",
+        "lighter": "Lighter",
+    }
+    exchange_lines = []
+    for ex in ALL_CRYPTO_OBSERVER_EXCHANGES:
+        ex_long = by_exchange[ex]["long"]
+        ex_short = by_exchange[ex]["short"]
+        if ex_long > 0 or ex_short > 0:
+            exchange_lines.append(
+                f"{exchange_labels.get(ex, ex.title())}: L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)}"
+            )
+    if legacy_unknown["long"] > 0 or legacy_unknown["short"] > 0:
+        exchange_lines.append(
+            f"Legacy/Unknown: L ${_usd_m(legacy_unknown['long'])} | S ${_usd_m(legacy_unknown['short'])}"
+        )
+
     title = f"ALL CRYPTO 13EX ROLLING 60M {new_state} | 5M GAP"
     message = (
         "13EX: MARGINPAD 9 + DIRECT 4 | EXACT TRAILING 60 MINUTES | NO RESET\n"
@@ -5892,6 +5935,8 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
         f"STRONGER: {new_state}\n"
         f"STATE: {state or 'NONE'} -> {new_state}"
     )
+    if exchange_lines:
+        message += "\nEXCHANGE BREAKDOWN (LAST 60M):\n" + "\n".join(exchange_lines)
     sent = send_pushover(title, message)
     print(f"[ALL CRYPTO ROLLING ALERT] {title} sent={sent}", flush=True)
     return bool(sent)
@@ -6022,7 +6067,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                     all_crypto_short_cumulative += notional
                 bucket = all_crypto_by_symbol.setdefault(symbol or "UNKNOWN", {"long": 0.0, "short": 0.0})
                 bucket[side] += notional
-                all_crypto_rolling_events.append((ts_sec, side, notional, symbol))
+                all_crypto_rolling_events.append((ts_sec, side, notional, symbol, exchange_key))
                 accepted += 1
                 print(
                     f"[ALL CRYPTO MARGINPAD ACCEPTED] ts_ms={ts_ms} symbol={symbol or '-'} "
@@ -6138,7 +6183,7 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
 
         bucket = all_crypto_by_symbol.setdefault(symbol, {"long": 0.0, "short": 0.0})
         bucket[side] += amount
-        all_crypto_rolling_events.append((ts_sec, side, amount, symbol))
+        all_crypto_rolling_events.append((ts_sec, side, amount, symbol, exchange))
         if len(all_crypto_rolling_events) > 1 and ts_sec < float(all_crypto_rolling_events[-2][0]):
             all_crypto_rolling_events = deque(sorted(all_crypto_rolling_events, key=lambda r: r[0]))
 
@@ -6180,7 +6225,7 @@ def _all_crypto_hourly_snapshot(now_ts=None):
         by_symbol = {}
         for row in all_crypto_rolling_events:
             try:
-                _, side, amount, symbol = row
+                _, side, amount, symbol = row[:4]
                 side = str(side).lower().strip()
                 amount = float(amount)
                 symbol = str(symbol or "UNKNOWN").upper().strip() or "UNKNOWN"
