@@ -6238,11 +6238,14 @@ def _all_crypto_send_hourly_report(boundary_ts=None):
                 else "SHORT WINS" if short_usd > long_usd
                 else "TIE"
             )
+            coin_total = long_usd + short_usd
+            long_pct = (long_usd / coin_total * 100.0) if coin_total > 0 else 0.0
+            short_pct = (short_usd / coin_total * 100.0) if coin_total > 0 else 0.0
             lines.extend([
                 f"{idx}. {symbol}",
-                f"LONG:  ${long_usd:,.0f}",
-                f"SHORT: ${short_usd:,.0f}",
-                f"GAP:   ${gap:,.0f}",
+                f"LONG:  ${long_usd:,.0f} (${long_usd / 1_000_000:.2f}M) ({long_pct:.2f}%)",
+                f"SHORT: ${short_usd:,.0f} (${short_usd / 1_000_000:.2f}M) ({short_pct:.2f}%)",
+                f"GAP:   ${gap:,.0f} (${gap / 1_000_000:.2f}M)",
                 winner,
                 "",
             ])
@@ -6254,11 +6257,15 @@ def _all_crypto_send_hourly_report(boundary_ts=None):
 
     # ALL CRYPTO TOTAL uses every accepted crypto coin in the hour,
     # not only the displayed Top 12.
+    grand_total = total_long + total_short
+    total_long_pct = (total_long / grand_total * 100.0) if grand_total > 0 else 0.0
+    total_short_pct = (total_short / grand_total * 100.0) if grand_total > 0 else 0.0
+
     lines.extend([
         "ALL CRYPTO TOTAL",
-        f"LONG:  ${total_long:,.0f}",
-        f"SHORT: ${total_short:,.0f}",
-        f"GAP:   ${total_gap:,.0f}",
+        f"LONG:  ${total_long:,.0f} (${total_long / 1_000_000:.2f}M) ({total_long_pct:.2f}%)",
+        f"SHORT: ${total_short:,.0f} (${total_short / 1_000_000:.2f}M) ({total_short_pct:.2f}%)",
+        f"GAP:   ${total_gap:,.0f} (${total_gap / 1_000_000:.2f}M)",
         total_winner,
     ])
 
