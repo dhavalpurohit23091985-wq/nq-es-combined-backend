@@ -194,6 +194,10 @@ btc_coinalyze_rolling_events = deque()
 btc_observer_rolling_events = deque()
 btc_coinalyze_rolling_state = None
 btc_observer_rolling_state = None
+# Display-only timestamps: when the current rolling direction was first triggered.
+# Used only to show CHANGE TIME on the next reverse alert.
+btc_coinalyze_rolling_state_ts = None
+btc_observer_rolling_state_ts = None
 _btc_rolling_lock = threading.RLock()
 
 
@@ -215,6 +219,9 @@ xau_coinalyze_rolling_events = deque()
 xau_observer_rolling_events = deque()
 xau_coinalyze_rolling_state = None
 xau_observer_rolling_state = None
+# Display-only timestamps for rolling direction changes.
+xau_coinalyze_rolling_state_ts = None
+xau_observer_rolling_state_ts = None
 _xau_rolling_lock = threading.RLock()
 
 # XAU Observer mirrors the BTC 13EX universe:
@@ -264,6 +271,8 @@ all_crypto_gap_state = None
 all_crypto_cycle_start_ts = None
 all_crypto_rolling_events = deque()
 all_crypto_rolling_state = None
+# Display-only timestamp for the current rolling direction.
+all_crypto_rolling_state_ts = None
 all_crypto_seen_queue = deque()
 all_crypto_seen_set = set()
 all_crypto_by_symbol = {}
@@ -2231,6 +2240,8 @@ def _runtime_state_payload():
         'btc_rolling_60m': {
             'coinalyze_state': btc_coinalyze_rolling_state,
             'observer_state': btc_observer_rolling_state,
+            'coinalyze_state_ts': btc_coinalyze_rolling_state_ts,
+            'observer_state_ts': btc_observer_rolling_state_ts,
             'coinalyze_events': list(btc_coinalyze_rolling_events),
             'observer_events': list(btc_observer_rolling_events),
         },
@@ -2241,6 +2252,7 @@ def _runtime_state_payload():
             'gap_state': all_crypto_gap_state,
             'cycle_start_ts': all_crypto_cycle_start_ts,
             'rolling_state': all_crypto_rolling_state,
+            'rolling_state_ts': all_crypto_rolling_state_ts,
             'rolling_events': list(all_crypto_rolling_events),
             'seen_queue': list(all_crypto_seen_queue),
             'by_symbol': all_crypto_by_symbol,
@@ -2265,6 +2277,8 @@ def _runtime_state_payload():
         'xau_rolling_60m': {
             'coinalyze_state': xau_coinalyze_rolling_state,
             'observer_state': xau_observer_rolling_state,
+            'coinalyze_state_ts': xau_coinalyze_rolling_state_ts,
+            'observer_state_ts': xau_observer_rolling_state_ts,
             'coinalyze_events': list(xau_coinalyze_rolling_events),
             'observer_events': list(xau_observer_rolling_events),
         },
@@ -2352,8 +2366,10 @@ def _load_runtime_state():
     global btc_coinalyze_gap_state, btc_observer_gap_state
     global btc_coinalyze_rolling_events, btc_observer_rolling_events
     global btc_coinalyze_rolling_state, btc_observer_rolling_state
+    global btc_coinalyze_rolling_state_ts, btc_observer_rolling_state_ts
     global all_crypto_long_cumulative, all_crypto_short_cumulative
     global all_crypto_gap_state, all_crypto_rolling_events, all_crypto_rolling_state
+    global all_crypto_rolling_state_ts
     global all_crypto_cycle_start_ts
     global all_crypto_seen_queue, all_crypto_seen_set, all_crypto_by_symbol
     global all_crypto_last_poll_ts, all_crypto_crypto_symbols
@@ -2363,6 +2379,7 @@ def _load_runtime_state():
     global xau_coinalyze_gap_state, xau_observer_gap_state
     global xau_coinalyze_rolling_events, xau_observer_rolling_events
     global xau_coinalyze_rolling_state, xau_observer_rolling_state
+    global xau_coinalyze_rolling_state_ts, xau_observer_rolling_state_ts
     global marginpad_xau_long_cumulative, marginpad_xau_short_cumulative
     global marginpad_xau_cycle_ref_price, marginpad_xau_processed_through_ms
     global marginpad_xau_seen_queue, marginpad_xau_seen_set
@@ -2446,6 +2463,14 @@ def _load_runtime_state():
         rolling = data.get('btc_rolling_60m') or {}
         btc_coinalyze_rolling_state = rolling.get('coinalyze_state') if rolling.get('coinalyze_state') in ('LONG','SHORT') else None
         btc_observer_rolling_state = rolling.get('observer_state') if rolling.get('observer_state') in ('LONG','SHORT') else None
+        try:
+            btc_coinalyze_rolling_state_ts = float(rolling.get('coinalyze_state_ts')) if rolling.get('coinalyze_state_ts') is not None else None
+        except (TypeError, ValueError):
+            btc_coinalyze_rolling_state_ts = None
+        try:
+            btc_observer_rolling_state_ts = float(rolling.get('observer_state_ts')) if rolling.get('observer_state_ts') is not None else None
+        except (TypeError, ValueError):
+            btc_observer_rolling_state_ts = None
         def _restore_roll(rows):
             out = deque(); cutoff = time.time() - BTC_ROLLING_WINDOW_SECONDS
             for row in (rows or []):
@@ -2471,6 +2496,10 @@ def _load_runtime_state():
         if all_crypto_cycle_start_ts is None and (all_crypto_long_cumulative > 0 or all_crypto_short_cumulative > 0):
             all_crypto_cycle_start_ts = time.time()
         all_crypto_rolling_state = allc.get('rolling_state') if allc.get('rolling_state') in ('LONG','SHORT') else None
+        try:
+            all_crypto_rolling_state_ts = float(allc.get('rolling_state_ts')) if allc.get('rolling_state_ts') is not None else None
+        except (TypeError, ValueError):
+            all_crypto_rolling_state_ts = None
         _all_cutoff = time.time() - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
         _all_rows = deque()
         for row in (allc.get('rolling_events') or []):
@@ -2516,6 +2545,14 @@ def _load_runtime_state():
         xroll = data.get('xau_rolling_60m') or {}
         xau_coinalyze_rolling_state = xroll.get('coinalyze_state') if xroll.get('coinalyze_state') in ('LONG','SHORT') else None
         xau_observer_rolling_state = xroll.get('observer_state') if xroll.get('observer_state') in ('LONG','SHORT') else None
+        try:
+            xau_coinalyze_rolling_state_ts = float(xroll.get('coinalyze_state_ts')) if xroll.get('coinalyze_state_ts') is not None else None
+        except (TypeError, ValueError):
+            xau_coinalyze_rolling_state_ts = None
+        try:
+            xau_observer_rolling_state_ts = float(xroll.get('observer_state_ts')) if xroll.get('observer_state_ts') is not None else None
+        except (TypeError, ValueError):
+            xau_observer_rolling_state_ts = None
         def _restore_xau_roll(rows):
             out = deque(); cutoff = time.time() - XAU_ROLLING_WINDOW_SECONDS
             for row in (rows or []):
@@ -5865,7 +5902,7 @@ def _format_accumulation_duration(start_ts, end_ts=None):
 
 
 def _all_crypto_send_rolling_if_flip(now_ts=None):
-    global all_crypto_rolling_state
+    global all_crypto_rolling_state, all_crypto_rolling_state_ts
     now_ts = float(now_ts) if now_ts is not None else time.time()
     _all_crypto_rolling_trim(now_ts)
     long_total, short_total = _all_crypto_rolling_totals()
@@ -5881,7 +5918,9 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
         new_state = "SHORT"
     if new_state == state:
         return False
+    change_time = _format_accumulation_duration(all_crypto_rolling_state_ts, now_ts)
     all_crypto_rolling_state = new_state
+    all_crypto_rolling_state_ts = now_ts
     gap = abs(signed_gap)
 
     # Display-only exchange audit for the SAME exact trailing 60-minute rows.
@@ -5943,7 +5982,8 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
         f"SHORT: ${_usd_m(short_total)} ({short_pct:.2f}%)\n"
         f"GAP: ${_usd_m(gap)}\n"
         f"STRONGER: {new_state}\n"
-        f"STATE: {state or 'NONE'} -> {new_state}"
+        f"STATE: {state or 'NONE'} -> {new_state}\n"
+        f"CHANGE TIME: {change_time}"
     )
     if exchange_lines:
         message += "\nEXCHANGE BREAKDOWN (LAST 60M):\n" + "\n".join(exchange_lines)
@@ -6377,6 +6417,7 @@ def _xau_rolling_totals(events):
 
 def _xau_rolling_evaluate(source, price=None, now_ts=None):
     global xau_coinalyze_rolling_state, xau_observer_rolling_state
+    global xau_coinalyze_rolling_state_ts, xau_observer_rolling_state_ts
     source = str(source or "").lower().strip()
     if source not in ("coinalyze", "observer"):
         return None
@@ -6394,11 +6435,19 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
             new_state = "SHORT"
         if new_state == state:
             return None
+        previous_state_ts = (
+            xau_coinalyze_rolling_state_ts
+            if source == "coinalyze"
+            else xau_observer_rolling_state_ts
+        )
+        change_time = _format_accumulation_duration(previous_state_ts, now_ts)
         if source == "coinalyze":
             xau_coinalyze_rolling_state = new_state
+            xau_coinalyze_rolling_state_ts = now_ts
             title = f"XAU COINALYZE ROLLING 60M {new_state} | 100K GAP"
         else:
             xau_observer_rolling_state = new_state
+            xau_observer_rolling_state_ts = now_ts
             title = f"XAU OBSERVER 13EX ROLLING 60M {new_state} | 100K GAP"
         gap = abs(signed_gap)
         rolling_total = long_total + short_total
@@ -6452,7 +6501,7 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
                 f"LONG: ${_usd_m(long_total)} ({long_pct:.2f}%)\n"
                 f"SHORT: ${_usd_m(short_total)} ({short_pct:.2f}%)\n"
                 f"GAP: ${_usd_m(gap)}\n"
-                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
+                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nCHANGE TIME: {change_time}\n"
                 f"XAU: {price_text}\n13EX AUDIT:\n"
                 + "\n".join(exchange_lines)
                 + f"\n13EX SUM LONG: ${_usd_m(audit_long)}"
@@ -6502,7 +6551,7 @@ def _xau_rolling_evaluate(source, price=None, now_ts=None):
                 f"LONG: ${_usd_m(long_total)}\n"
                 f"SHORT: ${_usd_m(short_total)}\n"
                 f"GAP: ${_usd_m(gap)}\n"
-                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\n"
+                f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nCHANGE TIME: {change_time}\n"
                 f"XAU: {price_text}\nCOINALYZE EXCHANGE AUDIT:\n"
                 + exchange_block
                 + f"\nEXCHANGE SUM LONG: ${_usd_m(audit_long)}"
@@ -6573,6 +6622,7 @@ def _btc_rolling_totals(events):
 
 def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=None):
     global btc_coinalyze_rolling_state, btc_observer_rolling_state
+    global btc_coinalyze_rolling_state_ts, btc_observer_rolling_state_ts
     source = str(source or "").lower().strip()
     side = str(side or "").lower().strip()
     if source not in ("coinalyze", "observer") or side not in ("long", "short"):
@@ -6603,11 +6653,19 @@ def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=N
             new_state = "SHORT"
         if new_state == state:
             return None
+        previous_state_ts = (
+            btc_coinalyze_rolling_state_ts
+            if source == "coinalyze"
+            else btc_observer_rolling_state_ts
+        )
+        change_time = _format_accumulation_duration(previous_state_ts, now_ts)
         if source == "coinalyze":
             btc_coinalyze_rolling_state = new_state
+            btc_coinalyze_rolling_state_ts = now_ts
             title = f"BTC COINALYZE ROLLING 60M {new_state} | +5M GAP"
         else:
             btc_observer_rolling_state = new_state
+            btc_observer_rolling_state_ts = now_ts
             title = f"BTC OBSERVER 13EX ROLLING 60M {new_state} | +5M GAP"
         gap = abs(signed_gap)
         try: price_text = f"{float(price):,.0f}" if price is not None else "NA"
@@ -6616,13 +6674,13 @@ def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=N
                    f"LONG: ${_usd_m(long_total)}\n"
                    f"SHORT: ${_usd_m(short_total)}\n"
                    f"GAP: ${_usd_m(gap)}\n"
-                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nBTC: {price_text}")
+                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nCHANGE TIME: {change_time}\nBTC: {price_text}")
         sent = send_pushover(title, message)
         print(f"[BTC ROLLING 60M] {source.upper()} {new_state} L=${_usd_m(long_total)} S=${_usd_m(short_total)} GAP=${_usd_m(gap)} sent={sent}", flush=True)
         return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
 
 def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=None):
-    global btc_coinalyze_rolling_state
+    global btc_coinalyze_rolling_state, btc_coinalyze_rolling_state_ts
     try:
         long_amount = max(0.0, float(long_amount or 0.0))
         short_amount = max(0.0, float(short_amount or 0.0))
@@ -6649,7 +6707,10 @@ def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=No
             new_state = "SHORT"
         if new_state == state:
             return None
+        now_ts = max(time.time(), ts)
+        change_time = _format_accumulation_duration(btc_coinalyze_rolling_state_ts, now_ts)
         btc_coinalyze_rolling_state = new_state
+        btc_coinalyze_rolling_state_ts = now_ts
         gap = abs(signed_gap)
         try: price_text = f"{float(price):,.0f}" if price is not None else "NA"
         except (TypeError, ValueError): price_text = "NA"
@@ -6658,7 +6719,7 @@ def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=No
                    f"LONG: ${_usd_m(long_total)}\n"
                    f"SHORT: ${_usd_m(short_total)}\n"
                    f"GAP: ${_usd_m(gap)}\n"
-                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nBTC: {price_text}")
+                   f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nCHANGE TIME: {change_time}\nBTC: {price_text}")
         sent = send_pushover(title, message)
         print(f"[BTC ROLLING 60M] COINALYZE {new_state} L=${_usd_m(long_total)} S=${_usd_m(short_total)} GAP=${_usd_m(gap)} sent={sent}", flush=True)
         return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
