@@ -6282,19 +6282,11 @@ def _all_crypto_hourly_reporter_loop():
 
 
 def _start_all_crypto_hourly_reporter_once():
+    """ALL CRYPTO 13EX hourly Top-12 Pushover report intentionally disabled."""
     global _all_crypto_hourly_reporter_started
-    enabled = str(os.environ.get("ALL_CRYPTO_HOURLY_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
-    if not enabled or _all_crypto_hourly_reporter_started:
-        return False
-    _all_crypto_hourly_reporter_started = True
-    thread = threading.Thread(
-        target=_all_crypto_hourly_reporter_loop,
-        name="all-crypto-hourly-reporter",
-        daemon=True,
-    )
-    thread.start()
-    return True
-
+    _all_crypto_hourly_reporter_started = False
+    print("[ALL CRYPTO HOURLY] REPORTER OFF", flush=True)
+    return False
 
 def _all_crypto_poller_loop():
     print(f"[ALL CRYPTO POLLER] started interval={ALL_CRYPTO_POLL_SECONDS:.0f}s", flush=True)
