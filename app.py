@@ -5918,12 +5918,22 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
         ex_long = by_exchange[ex]["long"]
         ex_short = by_exchange[ex]["short"]
         if ex_long > 0 or ex_short > 0:
+            ex_signed_gap = ex_long - ex_short
+            ex_gap = abs(ex_signed_gap)
+            ex_stronger = "L" if ex_signed_gap > 0 else "S" if ex_signed_gap < 0 else "EVEN"
             exchange_lines.append(
-                f"{exchange_labels.get(ex, ex.title())}: L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)}"
+                f"{exchange_labels.get(ex, ex.title())}: "
+                f"L ${_usd_m(ex_long)} | S ${_usd_m(ex_short)} | "
+                f"GAP ${_usd_m(ex_gap)} {ex_stronger}"
             )
     if legacy_unknown["long"] > 0 or legacy_unknown["short"] > 0:
+        legacy_signed_gap = legacy_unknown["long"] - legacy_unknown["short"]
+        legacy_gap = abs(legacy_signed_gap)
+        legacy_stronger = "L" if legacy_signed_gap > 0 else "S" if legacy_signed_gap < 0 else "EVEN"
         exchange_lines.append(
-            f"Legacy/Unknown: L ${_usd_m(legacy_unknown['long'])} | S ${_usd_m(legacy_unknown['short'])}"
+            f"Legacy/Unknown: L ${_usd_m(legacy_unknown['long'])} | "
+            f"S ${_usd_m(legacy_unknown['short'])} | "
+            f"GAP ${_usd_m(legacy_gap)} {legacy_stronger}"
         )
 
     title = f"ALL CRYPTO 13EX ROLLING 60M {new_state} | 5M GAP"
