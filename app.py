@@ -8332,6 +8332,108 @@ def all_crypto_status():
         }), 200
 
 
+
+@app.get("/gap-check")
+def gap_check():
+    """Read-only quick check for the four $5M GAP setups."""
+    now_ts = time.time()
+
+    def snapshot(name, long_total, short_total, state, threshold=5_000_000.0):
+        long_total = float(long_total or 0.0)
+        short_total = float(short_total or 0.0)
+        signed_gap = long_total - short_total
+        abs_gap = abs(signed_gap)
+
+        if signed_gap > 0:
+            stronger = "LONG"
+        elif signed_gap < 0:
+            stronger = "SHORT"
+        else:
+            stronger = "EVEN"
+
+        return {
+            "name": name,
+            "long": long_total,
+            "short": short_total,
+            "signed_gap": signed_gap,
+            "gap": abs_gap,
+            "stronger": stronger,
+            "state": state or "NONE",
+            "hit_5m": abs_gap >= threshold,
+        }
+
+    # ALL CRYPTO cumulative/reset cycle.
+    with _all_crypto_lock:
+        all_normal = snapshot(
+            "ALL CRYPTO NORMAL",
+            all_crypto_long_cumulative,
+            all_crypto_short_cumulative,
+            all_crypto_gap_state,
+            ALL_CRYPTO_GAP_THRESHOLD,
+        )
+
+        # Read-only exact trailing 60m calculation: do not trim/mutate the deque here.
+        cutoff = now_ts - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
+        rolling_rows = [
+            row for row in all_crypto_rolling_events
+            if float(row[0]) > cutoff
+        ]
+        rolling_long = sum(
+            float(row[2]) for row in rolling_rows if row[1] == "long"
+        )
+        rolling_short = sum(
+            float(row[2]) for row in rolling_rows if row[1] == "short"
+        )
+        all_rolling = snapshot(
+            "ALL CRYPTO ROLLING 60M",
+            rolling_long,
+            rolling_short,
+            all_crypto_rolling_state,
+            ALL_CRYPTO_ROLLING_GAP_THRESHOLD,
+        )
+
+    # BTC Observer 13EX cumulative/reset cycle.
+    with _combined_liq_lock:
+        btc_observer = snapshot(
+            "BTC OBSERVER 13EX",
+            btc_observer_long_cumulative,
+            btc_observer_short_cumulative,
+            btc_observer_gap_state,
+            BTC_GAP_THRESHOLD,
+        )
+
+    # BTC Coinalyze cumulative GAP cycle.
+    btc_coinalyze = snapshot(
+        "BTC COINALYZE",
+        btc_long_cumulative,
+        btc_short_cumulative,
+        btc_coinalyze_gap_state,
+        BTC_GAP_THRESHOLD,
+    )
+
+    rows = [all_normal, all_rolling, btc_observer, btc_coinalyze]
+
+    def money(value):
+        return "$" + _usd_m(abs(float(value or 0.0)))
+
+    lines = ["5M GAP CHECK", ""]
+    for row in rows:
+        sign = "+" if row["signed_gap"] > 0 else "-" if row["signed_gap"] < 0 else ""
+        lines.extend([
+            row["name"],
+            f"L: {money(row['long'])} | S: {money(row['short'])}",
+            f"GAP: {sign}{money(row['signed_gap'])} {row['stronger']}",
+            f"STATE: {row['state']}",
+            f"5M: {'YES' if row['hit_5m'] else 'NO'}",
+            "",
+        ])
+
+    return app.response_class(
+        response="\n".join(lines).rstrip() + "\n",
+        status=200,
+        mimetype="text/plain",
+    )
+
 @app.get("/all-crypto-poll-now")
 def all_crypto_poll_now():
     if not cron_authorized():
