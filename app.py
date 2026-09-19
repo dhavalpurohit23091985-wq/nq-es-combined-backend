@@ -8423,7 +8423,7 @@ def gap_check():
             row["name"],
             f"L: {money(row['long'])} | S: {money(row['short'])}",
             f"GAP: {sign}{money(row['signed_gap'])} {row['stronger']}",
-            f"STATE: {row['state']}",
+            f"STATE: {'RESET' if row['state'] == 'NONE' else row['state']}",
             f"5M: {'YES' if row['hit_5m'] else 'NO'}",
             "",
         ])
