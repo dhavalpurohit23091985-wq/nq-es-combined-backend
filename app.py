@@ -2202,6 +2202,112 @@ _nasdaq_combined_lock = threading.RLock()
 # ==================================================
 # PERSISTENT RUNTIME STATE - BTC/XAU/NVDA
 # ==================================================
+# ETH + SOL ROLLING 60M - BTC LOGIC CLONES
+# ==================================================
+ALT_ROLLING_ASSETS = ("ETH", "SOL")
+ALT_ROLLING_GAP_THRESHOLD = 5_000_000.0
+ALT_ROLLING_WINDOW_SECONDS = 3600
+_alt_rolling_lock = threading.RLock()
+alt_rolling = {a: {
+    "coinalyze_events": deque(), "observer_events": deque(),
+    "coinalyze_state": None, "observer_state": None,
+    "coinalyze_state_ts": None, "observer_state_ts": None,
+    "coinalyze_last_processed_ts": None, "marginpad_processed_through_ms": None,
+    "marginpad_seen_queue": deque(), "marginpad_seen_set": set(),
+    "direct_seen_queue": deque(), "direct_seen_set": set(),
+} for a in ALT_ROLLING_ASSETS}
+
+def _alt_price(asset):
+    return get_coinalyze_price(f"{asset}USDT_PERP.A", f"{asset.lower()}-price")
+
+def _alt_trim(events, now_ts):
+    cutoff=float(now_ts)-ALT_ROLLING_WINDOW_SECONDS
+    while events and float(events[0][0]) <= cutoff: events.popleft()
+
+def _alt_totals(events):
+    return (sum(float(r[2]) for r in events if r[1]=="long"), sum(float(r[2]) for r in events if r[1]=="short"))
+
+def _alt_evaluate(asset, source, price=None, now_ts=None):
+    asset=str(asset).upper(); source=str(source).lower(); now_ts=float(now_ts or time.time())
+    s=alt_rolling[asset]
+    with _alt_rolling_lock:
+        ev=s[f"{source}_events"]; _alt_trim(ev,now_ts); L,S=_alt_totals(ev); gap_signed=L-S
+        old=s[f"{source}_state"]; new=old
+        if gap_signed >= ALT_ROLLING_GAP_THRESHOLD and old != "LONG": new="LONG"
+        elif gap_signed <= -ALT_ROLLING_GAP_THRESHOLD and old != "SHORT": new="SHORT"
+        if new==old: return None
+        change=_format_accumulation_duration(s[f"{source}_state_ts"],now_ts)
+        s[f"{source}_state"]=new; s[f"{source}_state_ts"]=now_ts
+        try: px=f"{float(price):,.2f}" if price is not None else "NA"
+        except (TypeError,ValueError): px="NA"
+        title=(f"{asset} COINALYZE ROLLING 60M {new} | +5M GAP" if source=="coinalyze" else f"{asset} OBSERVER 13EX ROLLING 60M {new} | +5M GAP")
+        msg=(f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\nLONG: ${_usd_m(L)}\nSHORT: ${_usd_m(S)}\nGAP: ${_usd_m(abs(gap_signed))}\nSTRONGER: {new}\nSTATE: {old or 'NONE'} -> {new}\nCHANGE TIME: {change}\n{asset}: {px}")
+        sent=send_pushover(title,msg)
+        print(f"[{asset} ROLLING 60M] {source.upper()} {new} L=${_usd_m(L)} S=${_usd_m(S)} GAP=${_usd_m(abs(gap_signed))} sent={sent}",flush=True)
+        return {"direction":new,"long":L,"short":S,"gap":abs(gap_signed),"alert_sent":bool(sent)}
+
+def _alt_add(asset,source,side,amount,event_ts=None,exchange=None,price=None):
+    asset=str(asset).upper(); source=str(source).lower(); side=str(side).lower()
+    if asset not in ALT_ROLLING_ASSETS or source not in ("coinalyze","observer") or side not in ("long","short"): return None
+    try: amount=float(amount or 0); ts=float(event_ts) if event_ts is not None else time.time()
+    except (TypeError,ValueError): return None
+    if amount<=0: return None
+    if ts>10_000_000_000: ts/=1000.0
+    with _alt_rolling_lock:
+        ev=alt_rolling[asset][f"{source}_events"]; ev.append((ts,side,amount,str(exchange or "")))
+        if len(ev)>1 and ev[-2][0]>ts:
+            ordered=sorted(ev,key=lambda r:r[0]); ev.clear(); ev.extend(ordered)
+    return _alt_evaluate(asset,source,price,max(time.time(),ts))
+
+def _alt_add_coinalyze_row(asset,L,S,ts,exchange=None,price=None):
+    try: L=max(0,float(L or 0)); S=max(0,float(S or 0)); ts=float(ts)
+    except (TypeError,ValueError): return None
+    if L>0: _alt_add(asset,"coinalyze","long",L,ts,exchange,price)
+    if S>0: return _alt_add(asset,"coinalyze","short",S,ts,exchange,price)
+
+def process_alt_coinalyze(asset,closed_minute_ts):
+    asset=str(asset).upper(); s=alt_rolling[asset]; price,err=_alt_price(asset)
+    if err: return {"ok":False,"asset":asset,"source":"Coinalyze","error":err}
+    prev=s["coinalyze_last_processed_ts"]
+    if prev is None: s["coinalyze_last_processed_ts"]=closed_minute_ts; return {"ok":True,"asset":asset,"source":"Coinalyze","initialized":True}
+    if closed_minute_ts<=prev: return {"ok":True,"asset":asset,"source":"Coinalyze","new_closed_minute":False}
+    fresh,err=get_fresh_liquidations(asset,prev,closed_minute_ts)
+    if err: return {"ok":False,"asset":asset,"source":"Coinalyze","error":err}
+    for r in fresh.get("rolling_rows",[]): _alt_add_coinalyze_row(asset,r.get("long",0),r.get("short",0),r.get("ts"),r.get("exchange"),price)
+    s["coinalyze_last_processed_ts"]=closed_minute_ts
+    return {"ok":True,"asset":asset,"source":"Coinalyze","fresh_long_usd":fresh.get("fresh_long_usd",0),"fresh_short_usd":fresh.get("fresh_short_usd",0)}
+
+def process_alt_marginpad(asset,closed_minute_ts):
+    asset=str(asset).upper(); s=alt_rolling[asset]
+    pp,pe=marginpad_get("/api/v1/price",params={"symbol":asset},timeout=10,stage=f"marginpad-{asset.lower()}-price"); price=None
+    if not pe:
+        try: price=float((pp.get("data") or {}).get("price"))
+        except (TypeError,ValueError,AttributeError): pass
+    end=(closed_minute_ts+59)*1000+999; prev=s["marginpad_processed_through_ms"]; low=(end-MARGINPAD_OVERLAP_MS if prev is None else max(0,int(prev)-MARGINPAD_OVERLAP_MS))
+    payload,err=marginpad_get("/api/v1/liquidations/live",params={"symbol":asset,"limit":MARGINPAD_LIVE_LIMIT},timeout=12,stage=f"marginpad-{asset.lower()}-liquidations")
+    if err: return {"ok":False,"asset":asset,"source":"MarginPad","error":err}
+    accepted=0
+    for e in sorted(extract_marginpad_events(payload),key=lambda x:normalize_marginpad_ts_ms(x.get("ts")) or 0):
+        if not isinstance(e,dict): continue
+        ets=normalize_marginpad_ts_ms(e.get("ts"))
+        if ets is None or ets>end or ets<=low: continue
+        if str(e.get("symbol",asset)).upper().strip() not in ("",asset): continue
+        ex=_btc_exchange_key(e.get("exchange",""))
+        if ex not in BTC_OBSERVER_EXCHANGES[:9]: continue
+        fp=marginpad_event_fingerprint(e)
+        if fp in s["marginpad_seen_set"]: continue
+        try: amt=abs(float(e.get("notional",0) or 0))
+        except (TypeError,ValueError): continue
+        raw=str(e.get("side","")).lower(); side="long" if raw=="long_liquidated" else "short" if raw=="short_liquidated" else None
+        if not side or amt<=0: continue
+        s["marginpad_seen_set"].add(fp); s["marginpad_seen_queue"].append(fp)
+        while len(s["marginpad_seen_queue"])>MARGINPAD_SEEN_MAX: s["marginpad_seen_set"].discard(s["marginpad_seen_queue"].popleft())
+        _alt_add(asset,"observer",side,amt,ets,ex,price); accepted+=1
+    s["marginpad_processed_through_ms"]=end
+    return {"ok":True,"asset":asset,"source":"MarginPad","events_accepted":accepted}
+
+
+# ==================================================
 # Core strategy logic is unchanged. This only preserves in-memory runtime
 # state across Render deploys/restarts using the existing /var/data disk.
 
@@ -2275,6 +2381,14 @@ def _runtime_state_payload():
             'coinalyze_events': list(btc_coinalyze_rolling_events),
             'observer_events': list(btc_observer_rolling_events),
         },
+
+        'alt_crypto_rolling_60m': {a: {
+            'coinalyze_state': alt_rolling[a]['coinalyze_state'], 'observer_state': alt_rolling[a]['observer_state'],
+            'coinalyze_state_ts': alt_rolling[a]['coinalyze_state_ts'], 'observer_state_ts': alt_rolling[a]['observer_state_ts'],
+            'coinalyze_last_processed_ts': alt_rolling[a]['coinalyze_last_processed_ts'], 'marginpad_processed_through_ms': alt_rolling[a]['marginpad_processed_through_ms'],
+            'coinalyze_events': list(alt_rolling[a]['coinalyze_events']), 'observer_events': list(alt_rolling[a]['observer_events']),
+            'marginpad_seen_queue': list(alt_rolling[a]['marginpad_seen_queue']), 'direct_seen_queue': list(alt_rolling[a]['direct_seen_queue']),
+        } for a in ALT_ROLLING_ASSETS},
 
         'all_crypto_marginpad': {
             'long_cumulative': all_crypto_long_cumulative,
@@ -2523,6 +2637,18 @@ def _load_runtime_state():
             return deque(sorted(out,key=lambda r:r[0]))
         btc_coinalyze_rolling_events = _restore_roll(rolling.get('coinalyze_events'))
         btc_observer_rolling_events = _restore_roll(rolling.get('observer_events'))
+
+        _alt_saved=data.get('alt_crypto_rolling_60m') or {}
+        for _a in ALT_ROLLING_ASSETS:
+            _src=_alt_saved.get(_a) or {}; _st=alt_rolling[_a]
+            _st['coinalyze_state']=_src.get('coinalyze_state') if _src.get('coinalyze_state') in ('LONG','SHORT') else None
+            _st['observer_state']=_src.get('observer_state') if _src.get('observer_state') in ('LONG','SHORT') else None
+            for _k in ('coinalyze_state_ts','observer_state_ts','coinalyze_last_processed_ts','marginpad_processed_through_ms'):
+                try: _st[_k]=float(_src.get(_k)) if _src.get(_k) is not None else None
+                except (TypeError,ValueError): _st[_k]=None
+            _st['coinalyze_events']=_restore_roll(_src.get('coinalyze_events')); _st['observer_events']=_restore_roll(_src.get('observer_events'))
+            _seen=list(_src.get('marginpad_seen_queue') or [])[-MARGINPAD_SEEN_MAX:]; _st['marginpad_seen_queue']=deque(_seen); _st['marginpad_seen_set']=set(_seen)
+            _dseen=list(_src.get('direct_seen_queue') or [])[-COMBINED_DIRECT_SEEN_MAX:]; _st['direct_seen_queue']=deque(_dseen); _st['direct_seen_set']=set(_dseen)
 
         allc = data.get('all_crypto_marginpad') or {}
         all_crypto_long_cumulative = float(allc.get('long_cumulative', 0.0) or 0.0)
@@ -8018,6 +8144,9 @@ def btc_minute_alert():
             )
         )
 
+        eth_result = process_alt_coinalyze("ETH", closed_minute_ts)
+        sol_result = process_alt_coinalyze("SOL", closed_minute_ts)
+
         if not btc_result.get(
             "ok",
             False
@@ -8044,8 +8173,9 @@ def btc_minute_alert():
             "closed_minute_ts":
                 closed_minute_ts,
 
-            "btc":
-                btc_result
+            "btc": btc_result,
+            "eth": eth_result,
+            "sol": sol_result
         }), 200
 
     except Exception as e:
@@ -8080,7 +8210,7 @@ def direct_liquidation_event():
     side = str(data.get("side", "")).lower().strip()
     event_key = str(data.get("event_key") or data.get("event_id") or "").strip()
 
-    if asset not in ("BTC", "XAU", "ALL"):
+    if asset not in ("BTC", "ETH", "SOL", "XAU", "ALL"):
         return jsonify({"ok": False, "error": "invalid_asset"}), 400
 
     if exchange not in COMBINED_DIRECT_EXCHANGES:
@@ -8122,6 +8252,17 @@ def direct_liquidation_event():
             price=data.get("price"),
             event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
         )
+    elif asset in ("ETH", "SOL"):
+        event_ts = (data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp"))
+        _st = alt_rolling[asset]
+        if event_key in _st["direct_seen_set"]:
+            result = {"ok": True, "duplicate": True, "asset": asset, "source": "direct", "exchange": exchange, "rolling_observer": True}
+        else:
+            _st["direct_seen_set"].add(event_key); _st["direct_seen_queue"].append(event_key)
+            while len(_st["direct_seen_queue"]) > COMBINED_DIRECT_SEEN_MAX:
+                _st["direct_seen_set"].discard(_st["direct_seen_queue"].popleft())
+            _alt_add(asset, "observer", side, amount, event_ts, exchange=exchange, price=data.get("price"))
+            result = {"ok": True, "duplicate": False, "asset": asset, "source": "direct", "exchange": exchange, "rolling_observer": True}
     else:
         event_ts = (data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp"))
         result = add_combined_liquidation_batch(
@@ -8283,6 +8424,9 @@ def marginpad_btc_minute_alert():
             )
         )
 
+        eth_result = process_alt_marginpad("ETH", closed_minute_ts)
+        sol_result = process_alt_marginpad("SOL", closed_minute_ts)
+
         if not btc_result.get(
             "ok",
             False
@@ -8309,8 +8453,9 @@ def marginpad_btc_minute_alert():
             "closed_minute_ts":
                 closed_minute_ts,
 
-            "marginpad_btc":
-                btc_result
+            "marginpad_btc": btc_result,
+            "marginpad_eth": eth_result,
+            "marginpad_sol": sol_result
         }), 200
 
     except Exception as e:
@@ -8699,4 +8844,3 @@ def gap_check():
         status=200,
         mimetype="text/plain",
     )
-
