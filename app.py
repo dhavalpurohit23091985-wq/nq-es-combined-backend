@@ -8420,7 +8420,11 @@ def unusual_liquidations():
             long_total = float(totals.get("long", 0.0) or 0.0)
             short_total = float(totals.get("short", 0.0) or 0.0)
             signed_gap = long_total - short_total
-            if abs(signed_gap) < ALL_CRYPTO_UNUSUAL_GAP_THRESHOLD:
+            hit_ts = totals.get("hit_5m_ts")
+            # Once a coin has crossed the $5M absolute GAP threshold, keep it
+            # visible permanently in this no-reset ledger even if its later
+            # LONG/SHORT totals offset and the current GAP falls back below $5M.
+            if hit_ts is None:
                 continue
             rows.append({
                 "symbol": str(symbol),
@@ -8428,7 +8432,7 @@ def unusual_liquidations():
                 "short": short_total,
                 "gap": abs(signed_gap),
                 "side": "LONG" if signed_gap > 0 else "SHORT" if signed_gap < 0 else "EVEN",
-                "hit_ts": totals.get("hit_5m_ts"),
+                "hit_ts": hit_ts,
             })
 
     rows.sort(key=lambda row: row["gap"], reverse=True)
@@ -8458,7 +8462,7 @@ def unusual_liquidations():
         for row in rows
     )
     if not body_rows:
-        body_rows = '<tr><td colspan="6" class="empty">No coin currently has a $5M+ GAP.</td></tr>'
+        body_rows = '<tr><td colspan="6" class="empty">No coin has crossed a $5M GAP yet.</td></tr>'
 
     html = f"""<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -8481,7 +8485,7 @@ tfoot td{{font-weight:700;border-top:2px solid #111;border-bottom:0}} .long{{fon
 <tbody>{body_rows}</tbody>
 <tfoot><tr><td>TOTAL</td><td>{money(total_long)}</td><td>{money(total_short)}</td><td>{money(total_signed_gap)}</td><td>{total_side}</td><td>—</td></tr></tfoot>
 </table></div>
-<div class="note">TOTAL includes only coins currently shown in the $5M+ table.</div>
+<div class="note">TOTAL includes all coins that have ever crossed the $5M GAP threshold in this no-reset ledger.</div>
 <script>
 (function() {{
   const key = "unusual_liquidations_last_checked_ist";
