@@ -266,6 +266,8 @@ ALL_CRYPTO_OBSERVER_EXCHANGES = (
 all_crypto_long_cumulative = 0.0
 all_crypto_short_cumulative = 0.0
 all_crypto_gap_state = None
+# Display-only timestamp of the last valid +/-$5M cumulative state change.
+all_crypto_gap_state_ts = None
 # Start timestamp of the current cumulative RESET cycle.
 # Starts on the first accepted liquidation after reset and persists across restarts.
 all_crypto_cycle_start_ts = None
@@ -2255,6 +2257,7 @@ def _runtime_state_payload():
             'long_cumulative': all_crypto_long_cumulative,
             'short_cumulative': all_crypto_short_cumulative,
             'gap_state': all_crypto_gap_state,
+            'gap_state_ts': all_crypto_gap_state_ts,
             'cycle_start_ts': all_crypto_cycle_start_ts,
             'rolling_state': all_crypto_rolling_state,
             'rolling_state_ts': all_crypto_rolling_state_ts,
@@ -2374,7 +2377,7 @@ def _load_runtime_state():
     global btc_coinalyze_rolling_state, btc_observer_rolling_state
     global btc_coinalyze_rolling_state_ts, btc_observer_rolling_state_ts
     global all_crypto_long_cumulative, all_crypto_short_cumulative
-    global all_crypto_gap_state, all_crypto_rolling_events, all_crypto_rolling_state
+    global all_crypto_gap_state, all_crypto_gap_state_ts, all_crypto_rolling_events, all_crypto_rolling_state
     global all_crypto_rolling_state_ts
     global all_crypto_cycle_start_ts
     global all_crypto_seen_queue, all_crypto_seen_set, all_crypto_by_symbol
@@ -2494,6 +2497,10 @@ def _load_runtime_state():
         all_crypto_long_cumulative = float(allc.get('long_cumulative', 0.0) or 0.0)
         all_crypto_short_cumulative = float(allc.get('short_cumulative', 0.0) or 0.0)
         all_crypto_gap_state = allc.get('gap_state') if allc.get('gap_state') in ('LONG','SHORT') else None
+        try:
+            all_crypto_gap_state_ts = float(allc.get('gap_state_ts')) if allc.get('gap_state_ts') is not None else None
+        except (TypeError, ValueError):
+            all_crypto_gap_state_ts = None
         _saved_all_crypto_cycle_start = allc.get('cycle_start_ts')
         try:
             all_crypto_cycle_start_ts = float(_saved_all_crypto_cycle_start) if _saved_all_crypto_cycle_start is not None else None
@@ -6060,7 +6067,7 @@ def _all_crypto_unusual_add(symbol, side, amount, event_ts):
 
 def _all_crypto_send_reset_if_flip():
     global all_crypto_long_cumulative, all_crypto_short_cumulative
-    global all_crypto_gap_state, all_crypto_by_symbol
+    global all_crypto_gap_state, all_crypto_gap_state_ts, all_crypto_by_symbol
     global all_crypto_cycle_start_ts
     signed_gap = all_crypto_long_cumulative - all_crypto_short_cumulative
     state = all_crypto_gap_state
@@ -6097,6 +6104,7 @@ def _all_crypto_send_reset_if_flip():
     sent = send_pushover(title, message)
     print(f"[ALL CRYPTO GAP ALERT] {title} accumulation={accumulation_time} sent={sent}", flush=True)
     all_crypto_gap_state = new_state
+    all_crypto_gap_state_ts = signal_ts
     # RESET totals only after a valid reverse-only signal. Direction state persists.
     all_crypto_long_cumulative = 0.0
     all_crypto_short_cumulative = 0.0
@@ -8498,7 +8506,7 @@ def gap_check():
     """Read-only quick check for the four $5M GAP setups."""
     now_ts = time.time()
 
-    def snapshot(name, long_total, short_total, state, threshold=5_000_000.0):
+    def snapshot(name, long_total, short_total, state, threshold=5_000_000.0, state_ts=None):
         long_total = float(long_total or 0.0)
         short_total = float(short_total or 0.0)
         signed_gap = long_total - short_total
@@ -8519,6 +8527,7 @@ def gap_check():
             "gap": abs_gap,
             "stronger": stronger,
             "state": state or "NONE",
+            "state_ts": state_ts,
             "hit_5m": abs_gap >= threshold,
         }
 
@@ -8530,6 +8539,7 @@ def gap_check():
             all_crypto_short_cumulative,
             all_crypto_gap_state,
             ALL_CRYPTO_GAP_THRESHOLD,
+            all_crypto_gap_state_ts,
         )
 
         # Read-only exact trailing 60m calculation: do not trim/mutate the deque here.
@@ -8550,6 +8560,7 @@ def gap_check():
             rolling_short,
             all_crypto_rolling_state,
             ALL_CRYPTO_ROLLING_GAP_THRESHOLD,
+            all_crypto_rolling_state_ts,
         )
 
     # BTC rolling rows: use the SAME exact trailing-60m event deques/state
@@ -8569,6 +8580,7 @@ def gap_check():
             observer_short,
             btc_observer_rolling_state,
             BTC_ROLLING_GAP_THRESHOLD,
+            btc_observer_rolling_state_ts,
         )
 
         coinalyze_rows = [
@@ -8583,12 +8595,23 @@ def gap_check():
             coinalyze_short,
             btc_coinalyze_rolling_state,
             BTC_ROLLING_GAP_THRESHOLD,
+            btc_coinalyze_rolling_state_ts,
         )
 
     rows = [all_normal, all_rolling, btc_observer, btc_coinalyze]
 
     def money(value):
         return "$" + _usd_m(abs(float(value or 0.0)))
+
+    def state_time_ist(value):
+        if value is None:
+            return "NA"
+        try:
+            return datetime.fromtimestamp(float(value), timezone.utc).astimezone(
+                ZoneInfo("Asia/Kolkata")
+            ).strftime("%d/%m/%Y %H:%M:%S IST")
+        except (TypeError, ValueError, OSError):
+            return "NA"
 
     lines = ["5M GAP CHECK", ""]
     for row in rows:
@@ -8598,6 +8621,7 @@ def gap_check():
             f"L: {money(row['long'])} | S: {money(row['short'])}",
             f"GAP: {sign}{money(row['signed_gap'])} {row['stronger']}",
             f"STATE: {'RESET' if row['state'] == 'NONE' else row['state']}",
+            f"LAST 5M CHANGE: {state_time_ist(row['state_ts'])}",
             f"5M: {'YES' if row['hit_5m'] else 'NO'}",
             "",
         ])
