@@ -2247,6 +2247,35 @@ def _alt_evaluate(asset, source, price=None, now_ts=None):
         title=(f"{asset} COINALYZE ROLLING 60M {new} | +5M GAP" if source=="coinalyze" else f"{asset} OBSERVER 13EX ROLLING 60M {new} | +5M GAP")
         msg=(f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\nLONG: ${_usd_m(L)}\nSHORT: ${_usd_m(S)}\nGAP: ${_usd_m(abs(gap_signed))}\nSTRONGER: {new}\nSTATE: {old or 'NONE'} -> {new}\nCHANGE TIME: {change}\n{asset}: {px}")
         sent=send_pushover(title,msg)
+
+        # Mirror a VALID ETH/SOL 13EX Observer +/-$5M rolling alert into the
+        # read-only ALL COINS $5M+ no-reset ledger.  This does not change the
+        # rolling calculation, state, threshold or Pushover logic.
+        #
+        # The market-wide ALL CRYPTO feed intentionally seeds old events on
+        # startup/deploy, while the per-asset rolling observer can already have
+        # enough trailing-60m history to fire.  In that case the alert existed
+        # but the unusual ledger had no $5M-hit timestamp yet.
+        if source == "observer":
+            with _all_crypto_lock:
+                unusual_bucket = all_crypto_unusual_by_symbol.setdefault(
+                    asset, {"long": 0.0, "short": 0.0, "hit_5m_ts": None}
+                )
+
+                # Preserve any no-reset totals already collected by the ALL
+                # CRYPTO feed.  If it started later than this rolling observer,
+                # seed only the missing historical floor from the valid alert
+                # snapshot instead of adding the snapshot again.
+                unusual_bucket["long"] = max(
+                    float(unusual_bucket.get("long", 0.0) or 0.0), float(L)
+                )
+                unusual_bucket["short"] = max(
+                    float(unusual_bucket.get("short", 0.0) or 0.0), float(S)
+                )
+
+                if unusual_bucket.get("hit_5m_ts") is None:
+                    unusual_bucket["hit_5m_ts"] = now_ts
+
         _gap_check_capture(
             f"{asset.lower()}_coinalyze_rolling" if source == "coinalyze" else f"{asset.lower()}_observer_rolling",
             old, new, L, S, ALT_ROLLING_GAP_THRESHOLD, now_ts, title
