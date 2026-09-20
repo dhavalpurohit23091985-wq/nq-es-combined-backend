@@ -2231,6 +2231,54 @@ def _alt_trim(events, now_ts):
 def _alt_totals(events):
     return (sum(float(r[2]) for r in events if r[1]=="long"), sum(float(r[2]) for r in events if r[1]=="short"))
 
+def _rolling_exchange_breakdown_lines(events, total_signed_gap, stronger, exchange_order=None):
+    """Display-only trailing-window exchange audit. Does not affect alert logic."""
+    by_exchange = {}
+    for row in events:
+        if len(row) < 4:
+            continue
+        try:
+            side = str(row[1]).lower()
+            amount = float(row[2] or 0.0)
+            ex = _btc_exchange_key(row[3])
+        except (TypeError, ValueError):
+            continue
+        if side not in ("long", "short") or amount <= 0:
+            continue
+        ex = ex or "unknown"
+        bucket = by_exchange.setdefault(ex, {"long": 0.0, "short": 0.0})
+        bucket[side] += amount
+
+    labels = {
+        "binance": "Binance", "bybit": "Bybit", "okx": "OKX",
+        "hyperliquid": "Hyperliquid", "gate": "Gate", "htx": "HTX",
+        "dydx": "dYdX", "bitmex": "BitMEX", "bitfinex": "Bitfinex",
+        "bitget": "Bitget", "aster": "Aster", "coinex": "CoinEx",
+        "lighter": "Lighter", "coinalyze": "Coinalyze", "unknown": "Unknown",
+    }
+    if exchange_order:
+        names = [x for x in exchange_order if x in by_exchange]
+        names += [x for x in by_exchange if x not in names]
+    else:
+        names = list(by_exchange)
+
+    # Rank by absolute exchange net GAP so the biggest contributors are easiest to see.
+    names.sort(key=lambda x: abs(by_exchange[x]["long"] - by_exchange[x]["short"]), reverse=True)
+    denom = abs(float(total_signed_gap or 0.0))
+    lines = ["", "EXCHANGE BREAKDOWN — TRAILING 60M"]
+    for ex in names:
+        L = by_exchange[ex]["long"]; S = by_exchange[ex]["short"]
+        signed = L - S
+        ex_gap = abs(signed)
+        ex_side = "LONG" if signed > 0 else "SHORT" if signed < 0 else "EVEN"
+        aligned = signed if stronger == "LONG" else -signed
+        pct = (aligned / denom * 100.0) if denom > 0 else 0.0
+        label = labels.get(ex, ex.title())
+        lines.append(f"{label}: L ${_usd_m(L)} | S ${_usd_m(S)} | GAP ${_usd_m(ex_gap)} {ex_side} | {pct:+.1f}%")
+    lines.append(f"TOTAL GAP: ${_usd_m(denom)} {stronger} | 100.0%")
+    return lines
+
+
 def _alt_evaluate(asset, source, price=None, now_ts=None):
     asset=str(asset).upper(); source=str(source).lower(); now_ts=float(now_ts or time.time())
     s=alt_rolling[asset]
@@ -2246,6 +2294,10 @@ def _alt_evaluate(asset, source, price=None, now_ts=None):
         except (TypeError,ValueError): px="NA"
         title=(f"{asset} COINALYZE ROLLING 60M {new} | +5M GAP" if source=="coinalyze" else f"{asset} OBSERVER 13EX ROLLING 60M {new} | +5M GAP")
         msg=(f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\nLONG: ${_usd_m(L)}\nSHORT: ${_usd_m(S)}\nGAP: ${_usd_m(abs(gap_signed))}\nSTRONGER: {new}\nSTATE: {old or 'NONE'} -> {new}\nCHANGE TIME: {change}\n{asset}: {px}")
+        if asset == "ETH" and source == "observer":
+            msg += "\n" + "\n".join(_rolling_exchange_breakdown_lines(
+                ev, gap_signed, new, BTC_OBSERVER_EXCHANGES
+            ))
         sent=send_pushover(title,msg)
 
         # Mirror a VALID ETH/SOL 13EX Observer +/-$5M rolling alert into the
@@ -5693,7 +5745,8 @@ def process_btc(
 
     for rr in fresh.get("rolling_rows", []):
         _btc_rolling_add_coinalyze_row(
-            rr.get("long", 0.0), rr.get("short", 0.0), rr.get("ts"), price=btc_price
+            rr.get("long", 0.0), rr.get("short", 0.0), rr.get("ts"),
+            exchange=rr.get("exchange"), price=btc_price
         )
 
     btc_long_cumulative += (
@@ -6982,6 +7035,9 @@ def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=N
                    f"SHORT: ${_usd_m(short_total)}\n"
                    f"GAP: ${_usd_m(gap)}\n"
                    f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nCHANGE TIME: {change_time}\nBTC: {price_text}")
+        message += "\n" + "\n".join(_rolling_exchange_breakdown_lines(
+            events, signed_gap, new_state, BTC_OBSERVER_EXCHANGES if source == "observer" else None
+        ))
         sent = send_pushover(title, message)
         _gap_check_capture(
             "btc_coinalyze_rolling" if source == "coinalyze" else "btc_observer_rolling",
@@ -6991,7 +7047,7 @@ def _btc_rolling_add(source, side, amount, event_ts=None, exchange=None, price=N
         print(f"[BTC ROLLING 60M] {source.upper()} {new_state} L=${_usd_m(long_total)} S=${_usd_m(short_total)} GAP=${_usd_m(gap)} sent={sent}", flush=True)
         return {"direction":new_state,"long":long_total,"short":short_total,"gap":gap,"alert_sent":bool(sent)}
 
-def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=None):
+def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, exchange=None, price=None):
     global btc_coinalyze_rolling_state, btc_coinalyze_rolling_state_ts
     try:
         long_amount = max(0.0, float(long_amount or 0.0))
@@ -7005,9 +7061,9 @@ def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=No
         return None
     with _btc_rolling_lock:
         if long_amount > 0:
-            btc_coinalyze_rolling_events.append((ts, "long", long_amount, "coinalyze"))
+            btc_coinalyze_rolling_events.append((ts, "long", long_amount, str(exchange or "coinalyze")))
         if short_amount > 0:
-            btc_coinalyze_rolling_events.append((ts, "short", short_amount, "coinalyze"))
+            btc_coinalyze_rolling_events.append((ts, "short", short_amount, str(exchange or "coinalyze")))
         _btc_rolling_trim(btc_coinalyze_rolling_events, max(time.time(), ts))
         long_total, short_total = _btc_rolling_totals(btc_coinalyze_rolling_events)
         signed_gap = long_total - short_total
@@ -7032,6 +7088,9 @@ def _btc_rolling_add_coinalyze_row(long_amount, short_amount, event_ts, price=No
                    f"SHORT: ${_usd_m(short_total)}\n"
                    f"GAP: ${_usd_m(gap)}\n"
                    f"STRONGER: {new_state}\nSTATE: {state or 'NONE'} -> {new_state}\nCHANGE TIME: {change_time}\nBTC: {price_text}")
+        message += "\n" + "\n".join(_rolling_exchange_breakdown_lines(
+            btc_coinalyze_rolling_events, signed_gap, new_state
+        ))
         sent = send_pushover(title, message)
         _gap_check_capture(
             "btc_coinalyze_rolling", state, new_state, long_total, short_total,
