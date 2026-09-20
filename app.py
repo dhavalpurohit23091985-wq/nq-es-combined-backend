@@ -6006,9 +6006,11 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
     )
     if exchange_lines:
         message += "\nEXCHANGE BREAKDOWN (LAST 60M):\n" + "\n".join(exchange_lines)
-    sent = send_pushover(title, message)
-    print(f"[ALL CRYPTO ROLLING ALERT] {title} sent={sent}", flush=True)
-    return bool(sent)
+    # Pushover intentionally disabled for ALL CRYPTO 13EX Rolling 60M.
+    # Keep rolling calculations/state/data collection unchanged for gap-check/audit.
+    sent = False
+    print(f"[ALL CRYPTO ROLLING ALERT SILENT] {title} sent={sent}", flush=True)
+    return False
 
 
 def _all_crypto_unusual_add(symbol, side, amount, event_ts):
