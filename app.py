@@ -276,6 +276,11 @@ all_crypto_rolling_state_ts = None
 all_crypto_seen_queue = deque()
 all_crypto_seen_set = set()
 all_crypto_by_symbol = {}
+# Read-only unusual-strength ledger: lifetime/no-reset per-symbol totals.
+# It receives the same already-accepted ALL CRYPTO 13EX events, sends NO alerts,
+# and remembers the first time each symbol reaches an absolute $5M GAP.
+ALL_CRYPTO_UNUSUAL_GAP_THRESHOLD = 5_000_000.0
+all_crypto_unusual_by_symbol = {}
 all_crypto_last_poll_ts = None
 all_crypto_last_error = None
 all_crypto_crypto_symbols = set()
@@ -2256,6 +2261,7 @@ def _runtime_state_payload():
             'rolling_events': list(all_crypto_rolling_events),
             'seen_queue': list(all_crypto_seen_queue),
             'by_symbol': all_crypto_by_symbol,
+            'unusual_by_symbol': all_crypto_unusual_by_symbol,
             'last_poll_ts': all_crypto_last_poll_ts,
             'crypto_symbols': sorted(all_crypto_crypto_symbols),
             'crypto_symbols_refreshed_ts': all_crypto_crypto_symbols_refreshed_ts,
@@ -2372,6 +2378,7 @@ def _load_runtime_state():
     global all_crypto_rolling_state_ts
     global all_crypto_cycle_start_ts
     global all_crypto_seen_queue, all_crypto_seen_set, all_crypto_by_symbol
+    global all_crypto_unusual_by_symbol
     global all_crypto_last_poll_ts, all_crypto_crypto_symbols
     global all_crypto_crypto_symbols_refreshed_ts, all_crypto_first_poll_seeded
     global xau_long_cumulative, xau_short_cumulative, xau_coinalyze_by_exchange
@@ -2520,6 +2527,18 @@ def _load_runtime_state():
                 all_crypto_by_symbol[str(sym).upper()] = {
                     'long': float(totals.get('long', 0.0) or 0.0),
                     'short': float(totals.get('short', 0.0) or 0.0),
+                }
+        all_crypto_unusual_by_symbol = {}
+        for sym, totals in (allc.get('unusual_by_symbol') or {}).items():
+            if isinstance(totals, dict):
+                try:
+                    hit_ts = float(totals.get('hit_5m_ts')) if totals.get('hit_5m_ts') is not None else None
+                except (TypeError, ValueError):
+                    hit_ts = None
+                all_crypto_unusual_by_symbol[str(sym).upper()] = {
+                    'long': float(totals.get('long', 0.0) or 0.0),
+                    'short': float(totals.get('short', 0.0) or 0.0),
+                    'hit_5m_ts': hit_ts,
                 }
         all_crypto_last_poll_ts = allc.get('last_poll_ts')
         all_crypto_crypto_symbols = set(str(x).upper() for x in (allc.get('crypto_symbols') or []) if x)
@@ -5992,6 +6011,29 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
     return bool(sent)
 
 
+def _all_crypto_unusual_add(symbol, side, amount, event_ts):
+    """No-reset, no-alert per-symbol ledger fed only by accepted 13EX events."""
+    symbol = str(symbol or "UNKNOWN").upper().strip() or "UNKNOWN"
+    side = str(side or "").lower().strip()
+    if side not in ("long", "short"):
+        return
+    try:
+        amount = float(amount or 0.0)
+        event_ts = float(event_ts or time.time())
+    except (TypeError, ValueError):
+        return
+    if amount <= 0:
+        return
+
+    bucket = all_crypto_unusual_by_symbol.setdefault(
+        symbol, {"long": 0.0, "short": 0.0, "hit_5m_ts": None}
+    )
+    bucket[side] = float(bucket.get(side, 0.0) or 0.0) + amount
+    signed_gap = float(bucket.get("long", 0.0) or 0.0) - float(bucket.get("short", 0.0) or 0.0)
+    if bucket.get("hit_5m_ts") is None and abs(signed_gap) >= ALL_CRYPTO_UNUSUAL_GAP_THRESHOLD:
+        bucket["hit_5m_ts"] = event_ts
+
+
 def _all_crypto_send_reset_if_flip():
     global all_crypto_long_cumulative, all_crypto_short_cumulative
     global all_crypto_gap_state, all_crypto_by_symbol
@@ -6117,6 +6159,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                     all_crypto_short_cumulative += notional
                 bucket = all_crypto_by_symbol.setdefault(symbol or "UNKNOWN", {"long": 0.0, "short": 0.0})
                 bucket[side] += notional
+                _all_crypto_unusual_add(symbol or "UNKNOWN", side, notional, ts_sec)
                 all_crypto_rolling_events.append((ts_sec, side, notional, symbol, exchange_key))
                 accepted += 1
                 print(
@@ -6233,6 +6276,7 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
 
         bucket = all_crypto_by_symbol.setdefault(symbol, {"long": 0.0, "short": 0.0})
         bucket[side] += amount
+        _all_crypto_unusual_add(symbol, side, amount, ts_sec)
         all_crypto_rolling_events.append((ts_sec, side, amount, symbol, exchange))
         if len(all_crypto_rolling_events) > 1 and ts_sec < float(all_crypto_rolling_events[-2][0]):
             all_crypto_rolling_events = deque(sorted(all_crypto_rolling_events, key=lambda r: r[0]))
@@ -8331,6 +8375,82 @@ def all_crypto_status():
             "last_error": all_crypto_last_error,
         }), 200
 
+
+
+@app.get("/unusual-liquidations")
+def unusual_liquidations():
+    """Read-only no-reset $5M+ per-coin liquidation GAP table. No alerts."""
+    from html import escape
+
+    with _all_crypto_lock:
+        rows = []
+        for symbol, totals in all_crypto_unusual_by_symbol.items():
+            long_total = float(totals.get("long", 0.0) or 0.0)
+            short_total = float(totals.get("short", 0.0) or 0.0)
+            signed_gap = long_total - short_total
+            if abs(signed_gap) < ALL_CRYPTO_UNUSUAL_GAP_THRESHOLD:
+                continue
+            rows.append({
+                "symbol": str(symbol),
+                "long": long_total,
+                "short": short_total,
+                "gap": abs(signed_gap),
+                "side": "LONG" if signed_gap > 0 else "SHORT" if signed_gap < 0 else "EVEN",
+                "hit_ts": totals.get("hit_5m_ts"),
+            })
+
+    rows.sort(key=lambda row: row["gap"], reverse=True)
+    total_long = sum(row["long"] for row in rows)
+    total_short = sum(row["short"] for row in rows)
+    total_signed_gap = total_long - total_short
+    total_side = "LONG" if total_signed_gap > 0 else "SHORT" if total_signed_gap < 0 else "EVEN"
+
+    ist = ZoneInfo("Asia/Kolkata")
+    def money(value):
+        return "$" + _usd_m(abs(float(value or 0.0)))
+    def hit_time(value):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).astimezone(ist).strftime("%d-%m %H:%M")
+        except (TypeError, ValueError, OSError):
+            return "NA"
+
+    body_rows = "".join(
+        "<tr>"
+        f"<td>{escape(row['symbol'])}</td>"
+        f"<td>{money(row['long'])}</td>"
+        f"<td>{money(row['short'])}</td>"
+        f"<td>{money(row['gap'])}</td>"
+        f"<td class='{row['side'].lower()}'>{row['side']}</td>"
+        f"<td>{hit_time(row['hit_ts'])}</td>"
+        "</tr>"
+        for row in rows
+    )
+    if not body_rows:
+        body_rows = '<tr><td colspan="6" class="empty">No coin currently has a $5M+ GAP.</td></tr>'
+
+    html = f"""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Unusual Liquidations</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:16px;background:#fff;color:#111}}
+h2{{margin:0 0 5px;font-size:20px}} .sub{{font-size:12px;color:#666;margin-bottom:14px}}
+.wrap{{overflow-x:auto}} table{{border-collapse:collapse;width:100%;min-width:620px;font-size:14px}}
+th,td{{padding:9px 8px;border-bottom:1px solid #ddd;text-align:right;white-space:nowrap}}
+th:first-child,td:first-child{{text-align:left;font-weight:700}} th{{background:#f5f5f5;position:sticky;top:0}}
+tfoot td{{font-weight:700;border-top:2px solid #111;border-bottom:0}} .long{{font-weight:700}} .short{{font-weight:700}}
+.empty{{text-align:center!important;color:#666;font-weight:400!important;padding:18px}}
+.note{{font-size:11px;color:#777;margin-top:10px}}
+</style></head><body>
+<h2>ALL COINS — $5M+ LIQUIDATION GAP</h2>
+<div class="sub">13EX • NO RESET • NO ALERT • Largest GAP first • $5M HIT = first threshold-cross time (IST)</div>
+<div class="wrap"><table>
+<thead><tr><th>COIN</th><th>LONG</th><th>SHORT</th><th>GAP</th><th>SIDE</th><th>$5M HIT</th></tr></thead>
+<tbody>{body_rows}</tbody>
+<tfoot><tr><td>TOTAL</td><td>{money(total_long)}</td><td>{money(total_short)}</td><td>{money(total_signed_gap)}</td><td>{total_side}</td><td>—</td></tr></tfoot>
+</table></div>
+<div class="note">TOTAL includes only coins currently shown in the $5M+ table.</div>
+</body></html>"""
+    return app.response_class(response=html, status=200, mimetype="text/html")
 
 
 @app.get("/gap-check")
