@@ -284,6 +284,10 @@ gap_check_last_alerts = {
     "all_crypto_rolling": None,
     "btc_observer_rolling": None,
     "btc_coinalyze_rolling": None,
+    "eth_observer_rolling": None,
+    "eth_coinalyze_rolling": None,
+    "sol_observer_rolling": None,
+    "sol_coinalyze_rolling": None,
     "xau_observer_normal": None,
     "xau_coinalyze_normal": None,
     "xau_observer_rolling": None,
@@ -2243,6 +2247,10 @@ def _alt_evaluate(asset, source, price=None, now_ts=None):
         title=(f"{asset} COINALYZE ROLLING 60M {new} | +5M GAP" if source=="coinalyze" else f"{asset} OBSERVER 13EX ROLLING 60M {new} | +5M GAP")
         msg=(f"WINDOW: EXACT TRAILING 60 MINUTES | NO RESET\nLONG: ${_usd_m(L)}\nSHORT: ${_usd_m(S)}\nGAP: ${_usd_m(abs(gap_signed))}\nSTRONGER: {new}\nSTATE: {old or 'NONE'} -> {new}\nCHANGE TIME: {change}\n{asset}: {px}")
         sent=send_pushover(title,msg)
+        _gap_check_capture(
+            f"{asset.lower()}_coinalyze_rolling" if source == "coinalyze" else f"{asset.lower()}_observer_rolling",
+            old, new, L, S, ALT_ROLLING_GAP_THRESHOLD, now_ts, title
+        )
         print(f"[{asset} ROLLING 60M] {source.upper()} {new} L=${_usd_m(L)} S=${_usd_m(S)} GAP=${_usd_m(abs(gap_signed))} sent={sent}",flush=True)
         return {"direction":new,"long":L,"short":S,"gap":abs(gap_signed),"alert_sent":bool(sent)}
 
@@ -8736,7 +8744,7 @@ tfoot td{{font-weight:700;border-top:2px solid #111;border-bottom:0}} .long{{fon
 def gap_check():
     """
     Read-only LAST VALID ALERT dashboard.
-    Values change ONLY when one of the 8 existing individual alert conditions fires.
+    Values change ONLY when one of the existing individual alert conditions fires.
     No live rolling/cumulative movement is shown here.
     """
     ist = ZoneInfo("Asia/Kolkata")
@@ -8809,6 +8817,10 @@ def gap_check():
         normalized_snapshot("all_crypto_rolling", "ALL CRYPTO ROLLING 60M"),
         normalized_snapshot("btc_observer_rolling", "BTC OBSERVER 13EX ROLLING 60M"),
         normalized_snapshot("btc_coinalyze_rolling", "BTC COINALYZE ROLLING 60M"),
+        normalized_snapshot("eth_observer_rolling", "ETH OBSERVER 13EX ROLLING 60M"),
+        normalized_snapshot("eth_coinalyze_rolling", "ETH COINALYZE ROLLING 60M"),
+        normalized_snapshot("sol_observer_rolling", "SOL OBSERVER 13EX ROLLING 60M"),
+        normalized_snapshot("sol_coinalyze_rolling", "SOL COINALYZE ROLLING 60M"),
         normalized_snapshot("xau_observer_normal", "XAU OBSERVER 13EX", xau_observer_fallback),
         normalized_snapshot("xau_coinalyze_normal", "XAU COINALYZE"),
         normalized_snapshot("xau_observer_rolling", "XAU OBSERVER 13EX ROLLING 60M"),
