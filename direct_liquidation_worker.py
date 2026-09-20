@@ -8,7 +8,7 @@ import requests
 import websockets
 
 # ============================================================
-# DIRECT BTC + XAU LIQUIDATION WORKER
+# DIRECT BTC + ETH + SOL + XAU LIQUIDATION WORKER
 #
 # BTC direct sources:
 #   Bitget + Aster + CoinEx + Lighter
@@ -49,11 +49,13 @@ COINEX_POLL_SECONDS = 5
 COINEX_LOOKBACK_MS = 60_000
 SEEN_LIMIT = 40_000
 
-ASSETS = ("BTC", "XAU")
+ASSETS = ("BTC", "ETH", "SOL", "XAU")
 EXCHANGES = ("bitget", "aster", "coinex", "lighter")
 
 totals = {
     "BTC": {"long": 0.0, "short": 0.0},
+    "ETH": {"long": 0.0, "short": 0.0},
+    "SOL": {"long": 0.0, "short": 0.0},
     "XAU": {"long": 0.0, "short": 0.0},
 }
 
@@ -72,6 +74,8 @@ seen_set = set()
 
 coinex_markets = {
     "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT",
     "XAU": None,
 }
 coinex_all_markets = []
@@ -300,6 +304,10 @@ def classify_symbol(symbol):
 
     if s == "BTCUSDT" or s.startswith("BTCUSDT"):
         return "BTC"
+    if s == "ETHUSDT" or s.startswith("ETHUSDT"):
+        return "ETH"
+    if s == "SOLUSDT" or s.startswith("SOLUSDT"):
+        return "SOL"
 
     # XAU only. We deliberately do NOT classify XAUTUSDT as XAU.
     if s.startswith("XAUT"):
@@ -750,16 +758,16 @@ def _lighter_market_id_for_asset(payload, asset):
         if market_type and "spot" in market_type:
             continue
 
-        if asset == "BTC":
+        if asset in ("BTC", "ETH", "SOL"):
             matched = (
                 symbol in {
-                    "BTC",
-                    "BTC-USD",
-                    "BTCUSD",
-                    "BTC-PERP",
+                    asset,
+                    f"{asset}-USD",
+                    f"{asset}USD",
+                    f"{asset}-PERP",
                 }
                 or (
-                    symbol.startswith("BTC")
+                    symbol.startswith(asset)
                     and "/" not in symbol
                 )
             )
@@ -1096,7 +1104,7 @@ async def status_loop():
 
 async def main():
     print(
-        "DIRECT BTC + XAU + ALL CRYPTO LIQUIDATION WORKER STARTING",
+        "DIRECT BTC + ETH + SOL + XAU + ALL CRYPTO LIQUIDATION WORKER STARTING",
         flush=True,
     )
 
@@ -1110,7 +1118,7 @@ async def main():
     )
 
     print(
-        "BTC Sources: Bitget + Aster + CoinEx + Lighter",
+        "BTC/ETH/SOL Sources: Bitget + Aster + CoinEx + Lighter",
         flush=True,
     )
 
@@ -1128,6 +1136,8 @@ async def main():
         aster_loop(),
         coinex_loop(),
         lighter_asset_loop("BTC"),
+        lighter_asset_loop("ETH"),
+        lighter_asset_loop("SOL"),
         lighter_asset_loop("XAU"),
         lighter_all_crypto_loop(),
         status_loop(),
