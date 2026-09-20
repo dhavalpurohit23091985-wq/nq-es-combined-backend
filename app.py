@@ -2540,6 +2540,28 @@ def _load_runtime_state():
                     'short': float(totals.get('short', 0.0) or 0.0),
                     'hit_5m_ts': hit_ts,
                 }
+        # One-time migration for installs where the unusual ledger was added
+        # after accepted ALL-CRYPTO events already existed.  Use only the
+        # persisted accepted rolling rows; after this bootstrap the ledger
+        # remains independent/no-reset and is persisted normally.
+        if not all_crypto_unusual_by_symbol and all_crypto_rolling_events:
+            for _row in all_crypto_rolling_events:
+                try:
+                    _ts = float(_row[0])
+                    _side = str(_row[1]).lower().strip()
+                    _amount = float(_row[2])
+                    _symbol = str(_row[3] if len(_row) > 3 else "UNKNOWN").upper().strip() or "UNKNOWN"
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if _side not in ('long', 'short') or _amount <= 0:
+                    continue
+                _bucket = all_crypto_unusual_by_symbol.setdefault(
+                    _symbol, {'long': 0.0, 'short': 0.0, 'hit_5m_ts': None}
+                )
+                _bucket[_side] += _amount
+                _signed = _bucket['long'] - _bucket['short']
+                if _bucket['hit_5m_ts'] is None and abs(_signed) >= ALL_CRYPTO_UNUSUAL_GAP_THRESHOLD:
+                    _bucket['hit_5m_ts'] = _ts
         all_crypto_last_poll_ts = allc.get('last_poll_ts')
         all_crypto_crypto_symbols = set(str(x).upper() for x in (allc.get('crypto_symbols') or []) if x)
         all_crypto_crypto_symbols_refreshed_ts = float(allc.get('crypto_symbols_refreshed_ts', 0.0) or 0.0)
@@ -8530,24 +8552,38 @@ def gap_check():
             ALL_CRYPTO_ROLLING_GAP_THRESHOLD,
         )
 
-    # BTC Observer 13EX cumulative/reset cycle.
-    with _combined_liq_lock:
+    # BTC rolling rows: use the SAME exact trailing-60m event deques/state
+    # that generate the user-facing BTC rolling alerts.
+    with _btc_rolling_lock:
+        btc_cutoff = now_ts - BTC_ROLLING_WINDOW_SECONDS
+
+        observer_rows = [
+            row for row in btc_observer_rolling_events
+            if float(row[0]) > btc_cutoff
+        ]
+        observer_long = sum(float(row[2]) for row in observer_rows if row[1] == "long")
+        observer_short = sum(float(row[2]) for row in observer_rows if row[1] == "short")
         btc_observer = snapshot(
-            "BTC OBSERVER 13EX",
-            btc_observer_long_cumulative,
-            btc_observer_short_cumulative,
-            btc_observer_gap_state,
-            BTC_GAP_THRESHOLD,
+            "BTC OBSERVER 13EX ROLLING 60M",
+            observer_long,
+            observer_short,
+            btc_observer_rolling_state,
+            BTC_ROLLING_GAP_THRESHOLD,
         )
 
-    # BTC Coinalyze cumulative GAP cycle.
-    btc_coinalyze = snapshot(
-        "BTC COINALYZE",
-        btc_long_cumulative,
-        btc_short_cumulative,
-        btc_coinalyze_gap_state,
-        BTC_GAP_THRESHOLD,
-    )
+        coinalyze_rows = [
+            row for row in btc_coinalyze_rolling_events
+            if float(row[0]) > btc_cutoff
+        ]
+        coinalyze_long = sum(float(row[2]) for row in coinalyze_rows if row[1] == "long")
+        coinalyze_short = sum(float(row[2]) for row in coinalyze_rows if row[1] == "short")
+        btc_coinalyze = snapshot(
+            "BTC COINALYZE ROLLING 60M",
+            coinalyze_long,
+            coinalyze_short,
+            btc_coinalyze_rolling_state,
+            BTC_ROLLING_GAP_THRESHOLD,
+        )
 
     rows = [all_normal, all_rolling, btc_observer, btc_coinalyze]
 
