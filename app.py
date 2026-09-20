@@ -8443,12 +8443,28 @@ tfoot td{{font-weight:700;border-top:2px solid #111;border-bottom:0}} .long{{fon
 </style></head><body>
 <h2>ALL COINS — $5M+ LIQUIDATION GAP</h2>
 <div class="sub">13EX • NO RESET • NO ALERT • Largest GAP first • $5M HIT = first threshold-cross time (IST)</div>
+<div class="sub" id="last-checked">LAST CHECKED: NEVER</div>
 <div class="wrap"><table>
 <thead><tr><th>COIN</th><th>LONG</th><th>SHORT</th><th>GAP</th><th>SIDE</th><th>$5M HIT</th></tr></thead>
 <tbody>{body_rows}</tbody>
 <tfoot><tr><td>TOTAL</td><td>{money(total_long)}</td><td>{money(total_short)}</td><td>{money(total_signed_gap)}</td><td>{total_side}</td><td>—</td></tr></tfoot>
 </table></div>
 <div class="note">TOTAL includes only coins currently shown in the $5M+ table.</div>
+<script>
+(function() {{
+  const key = "unusual_liquidations_last_checked_ist";
+  const previous = localStorage.getItem(key);
+  document.getElementById("last-checked").textContent = "LAST CHECKED: " + (previous || "NEVER");
+  const now = new Date();
+  const current = new Intl.DateTimeFormat("en-GB", {{
+    timeZone: "Asia/Kolkata",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false
+  }}).format(now).replace(",", "") + " IST";
+  localStorage.setItem(key, current);
+}})();
+</script>
 </body></html>"""
     return app.response_class(response=html, status=200, mimetype="text/html")
 
