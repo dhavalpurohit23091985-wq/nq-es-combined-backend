@@ -8507,10 +8507,15 @@ tfoot td{{font-weight:700;border-top:2px solid #111;border-bottom:0}} .long{{fon
 
 @app.get("/gap-check")
 def gap_check():
-    """Read-only quick check for the four $5M GAP setups."""
+    """
+    Read-only combo view of the existing GAP alert setups.
+    IMPORTANT: this route does not create/evaluate a new alert state.
+    It only mirrors the same totals, rolling windows and direction states
+    already maintained by the individual alert setups.
+    """
     now_ts = time.time()
 
-    def snapshot(name, long_total, short_total, state, threshold=5_000_000.0, state_ts=None):
+    def snapshot(name, long_total, short_total, state, threshold, state_ts=None):
         long_total = float(long_total or 0.0)
         short_total = float(short_total or 0.0)
         signed_gap = long_total - short_total
@@ -8532,10 +8537,12 @@ def gap_check():
             "stronger": stronger,
             "state": state or "NONE",
             "state_ts": state_ts,
-            "hit_5m": abs_gap >= threshold,
+            "threshold": float(threshold),
+            "threshold_hit_now": abs_gap >= float(threshold),
         }
 
-    # ALL CRYPTO cumulative/reset cycle.
+    # 1) ALL CRYPTO NORMAL
+    # Exact existing cumulative/reset-cycle totals + direction state.
     with _all_crypto_lock:
         all_normal = snapshot(
             "ALL CRYPTO NORMAL",
@@ -8546,63 +8553,151 @@ def gap_check():
             all_crypto_gap_state_ts,
         )
 
-        # Read-only exact trailing 60m calculation: do not trim/mutate the deque here.
-        cutoff = now_ts - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
-        rolling_rows = [
+        # 2) ALL CRYPTO ROLLING 60M
+        # Exact trailing-60m view of the SAME event deque used by its alert.
+        all_cutoff = now_ts - ALL_CRYPTO_ROLLING_WINDOW_SECONDS
+        all_rolling_rows = [
             row for row in all_crypto_rolling_events
-            if float(row[0]) > cutoff
+            if float(row[0]) > all_cutoff
         ]
-        rolling_long = sum(
-            float(row[2]) for row in rolling_rows if row[1] == "long"
+        all_rolling_long = sum(
+            float(row[2]) for row in all_rolling_rows if row[1] == "long"
         )
-        rolling_short = sum(
-            float(row[2]) for row in rolling_rows if row[1] == "short"
+        all_rolling_short = sum(
+            float(row[2]) for row in all_rolling_rows if row[1] == "short"
         )
         all_rolling = snapshot(
             "ALL CRYPTO ROLLING 60M",
-            rolling_long,
-            rolling_short,
+            all_rolling_long,
+            all_rolling_short,
             all_crypto_rolling_state,
             ALL_CRYPTO_ROLLING_GAP_THRESHOLD,
             all_crypto_rolling_state_ts,
         )
 
-    # BTC rolling rows: use the SAME exact trailing-60m event deques/state
-    # that generate the user-facing BTC rolling alerts.
+    # 3 + 4) BTC OBSERVER / BTC COINALYZE ROLLING 60M
+    # Same rolling event deques and states used by the individual alerts.
     with _btc_rolling_lock:
         btc_cutoff = now_ts - BTC_ROLLING_WINDOW_SECONDS
 
-        observer_rows = [
+        btc_observer_rows = [
             row for row in btc_observer_rolling_events
             if float(row[0]) > btc_cutoff
         ]
-        observer_long = sum(float(row[2]) for row in observer_rows if row[1] == "long")
-        observer_short = sum(float(row[2]) for row in observer_rows if row[1] == "short")
+        btc_observer_long = sum(
+            float(row[2]) for row in btc_observer_rows if row[1] == "long"
+        )
+        btc_observer_short = sum(
+            float(row[2]) for row in btc_observer_rows if row[1] == "short"
+        )
         btc_observer = snapshot(
             "BTC OBSERVER 13EX ROLLING 60M",
-            observer_long,
-            observer_short,
+            btc_observer_long,
+            btc_observer_short,
             btc_observer_rolling_state,
             BTC_ROLLING_GAP_THRESHOLD,
             btc_observer_rolling_state_ts,
         )
 
-        coinalyze_rows = [
+        btc_coinalyze_rows = [
             row for row in btc_coinalyze_rolling_events
             if float(row[0]) > btc_cutoff
         ]
-        coinalyze_long = sum(float(row[2]) for row in coinalyze_rows if row[1] == "long")
-        coinalyze_short = sum(float(row[2]) for row in coinalyze_rows if row[1] == "short")
+        btc_coinalyze_long = sum(
+            float(row[2]) for row in btc_coinalyze_rows if row[1] == "long"
+        )
+        btc_coinalyze_short = sum(
+            float(row[2]) for row in btc_coinalyze_rows if row[1] == "short"
+        )
         btc_coinalyze = snapshot(
             "BTC COINALYZE ROLLING 60M",
-            coinalyze_long,
-            coinalyze_short,
+            btc_coinalyze_long,
+            btc_coinalyze_short,
             btc_coinalyze_rolling_state,
             BTC_ROLLING_GAP_THRESHOLD,
             btc_coinalyze_rolling_state_ts,
         )
 
-    rows = [all_normal, all_rolling, btc_observer, btc_coinalyze]
+    # 5) XAU OBSERVER 13EX NORMAL
+    # Mirrors the existing XAU Observer 13EX combined cycle.
+    with _combined_liq_lock:
+        xau_observer_normal = snapshot(
+            "XAU OBSERVER 13EX",
+            combined_liq["XAU"]["long"],
+            combined_liq["XAU"]["short"],
+            xau_observer_gap_state,
+            XAU_GAP_THRESHOLD,
+            (
+                combined_last_alert["XAU"].get("ts")
+                if isinstance(combined_last_alert.get("XAU"), dict)
+                else None
+            ),
+        )
+
+    # 6) XAU COINALYZE NORMAL
+    # Mirrors the existing XAU Coinalyze cumulative cycle.
+    xau_coinalyze_normal = snapshot(
+        "XAU COINALYZE",
+        xau_long_cumulative,
+        xau_short_cumulative,
+        xau_coinalyze_gap_state,
+        XAU_GAP_THRESHOLD,
+        None,
+    )
+
+    # 7 + 8) XAU OBSERVER / XAU COINALYZE ROLLING 60M
+    # Same rolling event deques and states used by the individual XAU alerts.
+    with _xau_rolling_lock:
+        xau_cutoff = now_ts - XAU_ROLLING_WINDOW_SECONDS
+
+        xau_observer_rows = [
+            row for row in xau_observer_rolling_events
+            if float(row[0]) > xau_cutoff
+        ]
+        xau_observer_long = sum(
+            float(row[2]) for row in xau_observer_rows if row[1] == "long"
+        )
+        xau_observer_short = sum(
+            float(row[2]) for row in xau_observer_rows if row[1] == "short"
+        )
+        xau_observer_rolling = snapshot(
+            "XAU OBSERVER 13EX ROLLING 60M",
+            xau_observer_long,
+            xau_observer_short,
+            xau_observer_rolling_state,
+            XAU_ROLLING_GAP_THRESHOLD,
+            xau_observer_rolling_state_ts,
+        )
+
+        xau_coinalyze_rows = [
+            row for row in xau_coinalyze_rolling_events
+            if float(row[0]) > xau_cutoff
+        ]
+        xau_coinalyze_long = sum(
+            float(row[2]) for row in xau_coinalyze_rows if row[1] == "long"
+        )
+        xau_coinalyze_short = sum(
+            float(row[2]) for row in xau_coinalyze_rows if row[1] == "short"
+        )
+        xau_coinalyze_rolling = snapshot(
+            "XAU COINALYZE ROLLING 60M",
+            xau_coinalyze_long,
+            xau_coinalyze_short,
+            xau_coinalyze_rolling_state,
+            XAU_ROLLING_GAP_THRESHOLD,
+            xau_coinalyze_rolling_state_ts,
+        )
+
+    rows = [
+        all_normal,
+        all_rolling,
+        btc_observer,
+        btc_coinalyze,
+        xau_observer_normal,
+        xau_coinalyze_normal,
+        xau_observer_rolling,
+        xau_coinalyze_rolling,
+    ]
 
     def money(value):
         return "$" + _usd_m(abs(float(value or 0.0)))
@@ -8617,16 +8712,26 @@ def gap_check():
         except (TypeError, ValueError, OSError):
             return "NA"
 
-    lines = ["5M GAP CHECK", ""]
+    def threshold_label(value):
+        value = float(value)
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:g}M"
+        if value >= 1_000:
+            return f"{value / 1_000:g}K"
+        return f"{value:g}"
+
+    lines = ["GAP ALERT COMBO CHECK", ""]
+
     for row in rows:
         sign = "+" if row["signed_gap"] > 0 else "-" if row["signed_gap"] < 0 else ""
+        threshold_text = threshold_label(row["threshold"])
         lines.extend([
             row["name"],
             f"L: {money(row['long'])} | S: {money(row['short'])}",
             f"GAP: {sign}{money(row['signed_gap'])} {row['stronger']}",
-            f"STATE: {'RESET' if row['state'] == 'NONE' else row['state']}",
-            f"LAST 5M CHANGE: {state_time_ist(row['state_ts'])}",
-            f"5M: {'YES' if row['hit_5m'] else 'NO'}",
+            f"STATE: {'NONE' if row['state'] == 'NONE' else row['state']}",
+            f"LAST {threshold_text} CHANGE: {state_time_ist(row['state_ts'])}",
+            f"{threshold_text} NOW: {'YES' if row['threshold_hit_now'] else 'NO'}",
             "",
         ])
 
@@ -8635,6 +8740,7 @@ def gap_check():
         status=200,
         mimetype="text/plain",
     )
+
 
 @app.get("/all-crypto-poll-now")
 def all_crypto_poll_now():
