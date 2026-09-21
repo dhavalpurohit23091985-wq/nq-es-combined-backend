@@ -4460,35 +4460,45 @@ def _compact_qqq_weighted_audit_for_pushover(title, message):
     if "NASDAQ 10-STOCK" not in title_u or "QQQ WEIGHTED" not in title_u:
         return text
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
     stock_names = {"NVDA", "AAPL", "MSFT", "MU", "AMZN", "AMD", "GOOGL", "META", "GOOG", "TSLA"}
     output = []
 
-    # Keep the most useful trigger-level metadata.
+    # Pine's jsonSafe() flattens newlines into " | " before the webhook is sent.
+    # Parse BOTH real newlines and that flattened pipe stream. This is display-only;
+    # no Pine calculation, trigger, state, threshold or trade logic is changed.
+    normalized = text.replace("\r", "").replace("\n", " | ")
+    tokens = [part.strip() for part in normalized.split("|") if part.strip()]
+
+    # Keep the most useful trigger-level metadata even when Pine flattened lines.
     wanted_prefixes = (
         "TRIGGER #",
         "TRIGGER BASE:",
         "WEIGHTED BASKET NET:",
         "STATE:",
     )
-    for line in lines:
-        if line.upper().startswith(wanted_prefixes):
-            output.append(line)
+    for token in tokens:
+        if token.upper().startswith(wanted_prefixes):
+            output.append(token)
 
-    output.append("AUDIT: O=OPEN | T=TRIGGER | R=RAW | W=WEIGHT | C=CONTR")
+    output.append("AUDIT: O=OPEN | T=LIVE | R=RAW | W=WEIGHT | C=CONTR")
 
-    # Pine sends lines like:
-    # NVDA | OPEN 220.88 | LIVE 219 | RAW -0.853% | W 8.41% | CONTR -0.072%
-    # Compact labels only; values are preserved exactly as received.
-    for line in lines:
-        parts = [p.strip() for p in line.split("|")]
-        if not parts or parts[0].upper() not in stock_names:
+    # Read stock blocks from the flattened token stream:
+    # NVDA | OPEN ... | LIVE ... | RAW ... | W ... | CONTR ... | AAPL | ...
+    i = 0
+    while i < len(tokens):
+        symbol = tokens[i].upper()
+        if symbol not in stock_names:
+            i += 1
             continue
 
-        symbol = parts[0].upper()
         vals = {}
-        for p in parts[1:]:
+        j = i + 1
+        while j < len(tokens) and tokens[j].upper() not in stock_names:
+            p = tokens[j]
             up = p.upper()
+
+            # Stop once this stock's contribution is complete. This prevents
+            # later metadata from being accidentally absorbed into the row.
             if up.startswith("OPEN "):
                 vals["O"] = p[5:].strip()
             elif up.startswith("LIVE "):
@@ -4501,8 +4511,10 @@ def _compact_qqq_weighted_audit_for_pushover(title, message):
                 vals["W"] = p[2:].strip()
             elif up.startswith("CONTR "):
                 vals["C"] = p[6:].strip()
+                j += 1
+                break
+            j += 1
 
-        # Only emit a stock row when OPEN and trigger/live are both present.
         if "O" in vals and "T" in vals:
             row = f"{symbol} | O {vals['O']} | T {vals['T']}"
             if "R" in vals:
@@ -4513,19 +4525,18 @@ def _compact_qqq_weighted_audit_for_pushover(title, message):
                 row += f" | C {vals['C']}"
             output.append(row)
 
-    # Keep final basket/NQ values when present.
-    for line in lines:
-        u = line.upper()
+        i = max(j, i + 1)
+
+    # Keep final basket/NQ values when present in either normal or flattened form.
+    for token in tokens:
+        u = token.upper()
         if u.startswith("WEIGHTED NET =") or u.startswith("NQ AT TRIGGER:"):
-            if line not in output:
-                output.append(line)
+            if token not in output:
+                output.append(token)
 
     compact = "\n".join(output)
 
-    # Defensive fallback: never send a QQQ weighted message above Pushover's
-    # documented 1024 UTF-8-character message limit. The compact format is
-    # designed to fit; if an unusual future price format grows too large,
-    # retain the beginning without altering any trading state.
+    # Pushover message limit protection. Normally the compact 10-stock audit fits.
     if len(compact) > 1024:
         compact = compact[:1024]
 
