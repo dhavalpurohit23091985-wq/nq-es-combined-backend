@@ -1267,8 +1267,16 @@ def marginpad_get(
 
     last_error = None
 
-    with _marginpad_request_lock:
+    # Do not wait indefinitely behind another MarginPad request. A long retry
+    # chain in one poll must not hold a Gunicorn worker until its timeout.
+    lock_acquired = _marginpad_request_lock.acquire(timeout=2.0)
+    if not lock_acquired:
+        return None, {
+            "stage": stage,
+            "error": "marginpad request busy; retry on next poll"
+        }
 
+    try:
         for attempt in range(
             MARGINPAD_MAX_RETRIES + 1
         ):
@@ -1365,7 +1373,9 @@ def marginpad_get(
 
             time.sleep(delay)
 
-    return None, last_error
+        return None, last_error
+    finally:
+        _marginpad_request_lock.release()
 
 
 # ==================================================
@@ -5666,6 +5676,7 @@ def process_btc(
     global btc_cycle_ref_price
     global btc_last_processed_liq_ts
     global btc_last_alert_snapshot
+    global btc_coinalyze_gap_state
 
     btc_price, price_error = (
         get_btc_price()
