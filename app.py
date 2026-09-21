@@ -4687,6 +4687,72 @@ def _qqq_weighted_audit_pushover_parts(title, message):
     ]
 
 
+
+# ==================================================
+# NQ / NASDAQ LONG PUSHOVER SPLITTER
+# ==================================================
+# Display-only protection for long TradingView NQ/NASDAQ alerts.
+# Existing QQQ-weighted audit splitting remains unchanged.
+# If an NQ/NASDAQ TradingView message is too large for one Pushover message,
+# split it into exactly TWO messages at a line boundary.
+# No calculation, threshold, state, TradingView alert logic or MT5 logic changes.
+
+def _nq_long_pushover_parts(title, message):
+    title_text = str(title or "")
+    message_text = str(message or "")
+    title_u = title_text.upper()
+
+    # Only NQ/NASDAQ-family TradingView alerts are eligible.
+    if "NQ" not in title_u and "NASDAQ" not in title_u:
+        return [(title_text, message_text)]
+
+    # Short messages remain exactly one notification.
+    if len(message_text) <= 950:
+        return [(title_text, message_text)]
+
+    normalized = message_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+
+    # Choose a line-boundary split closest to the middle while keeping
+    # both parts comfortably below Pushover's 1024-character message limit.
+    best = None
+    for cut in range(1, len(lines)):
+        p1 = "\n".join(lines[:cut]).strip()
+        p2 = "\n".join(lines[cut:]).strip()
+        if len(p1) <= 950 and len(p2) <= 950:
+            score = abs(len(p1) - len(p2))
+            if best is None or score < best[0]:
+                best = (score, p1, p2)
+
+    if best is not None:
+        _, part1, part2 = best
+    else:
+        # Defensive fallback for a message containing very long single lines.
+        midpoint = len(normalized) // 2
+        left_break = normalized.rfind("\n", 0, midpoint + 1)
+        right_break = normalized.find("\n", midpoint)
+
+        if left_break > 0:
+            cut = left_break
+        elif right_break != -1:
+            cut = right_break
+        else:
+            cut = midpoint
+
+        part1 = normalized[:cut].strip()
+        part2 = normalized[cut:].strip()
+
+        # Final defensive cap only; normal structured TV messages should
+        # always split at line boundaries above without reaching this path.
+        part1 = part1[:1024]
+        part2 = part2[:1024]
+
+    return [
+        (f"{title_text} | PART 1/2", part1),
+        (f"{title_text} | PART 2/2", part2),
+    ]
+
+
 # ==================================================
 # TRADINGVIEW WEBHOOK
 # ==================================================
@@ -4747,6 +4813,15 @@ def webhook():
             tv_title,
             tv_message
         )
+
+        # QQQ weighted audit already has its own exact 5+5 stock split.
+        # For every other long NQ/NASDAQ TradingView message, apply the
+        # generic two-part display splitter so the full alert reaches Pushover.
+        if len(pushover_parts) == 1:
+            pushover_parts = _nq_long_pushover_parts(
+                tv_title,
+                tv_message
+            )
 
         pushover_results = []
         for part_title, part_message in pushover_parts:
