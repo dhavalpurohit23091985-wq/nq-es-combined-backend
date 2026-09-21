@@ -502,6 +502,12 @@ def send_pushover(title, message):
     if "ROLLING 60M" in title_upper or "ROLLING 60MIN" in title_upper:
         print(f"[ROLLING 60M PUSHOVER SILENT] {title}", flush=True)
         return False
+
+    # ALL CRYPTO PUSHOVER FILTER:
+    # Keep calculations, state tracking, logs and /gap-check active; silence phone alerts.
+    if "ALL CRYPTO 13EX" in title_upper:
+        print(f"[ALL CRYPTO PUSHOVER SILENT] {title}", flush=True)
+        return False
     if "COINALYZE" in title_upper and "XAU" not in title_upper:
         print(
             f"[COINALYZE PUSHOVER SILENT - XAU/XAUT ONLY] {title}",
