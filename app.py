@@ -8991,3 +8991,10 @@ def gap_check():
         status=200,
         mimetype="text/plain",
     )
+# ==================================================
+# START ALL-CRYPTO BACKGROUND POLLER
+# ==================================================
+# Start only after every function/route in this module has been defined.
+# The poller's first successful MarginPad feed pass also performs the
+# read-only unusual-strength ledger bootstrap when that ledger is empty.
+_start_all_crypto_poller_once()
