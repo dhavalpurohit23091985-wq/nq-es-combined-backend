@@ -4515,45 +4515,47 @@ def home():
 
 
 # ==================================================
-# NASDAQ QQQ-WEIGHTED PUSHOVER AUDIT COMPACTOR
+# NASDAQ QQQ-WEIGHTED PUSHOVER AUDIT SPLITTER
 # ==================================================
 # TradingView can send a longer audit than Pushover's 1024-character
-# message limit. For the QQQ-weighted LAST-4 alert only, keep every stock's
-# OPEN/LIVE/RAW/WEIGHT/CONTRIBUTION values but compact the labels so the
-# complete 10-stock audit fits in one Pushover message. All strategy logic
-# remains in Pine and is untouched here.
+# message limit. For the QQQ-weighted LAST-4 alert only, preserve the
+# complete 10-stock audit and split it into TWO Pushover messages:
+#   PART 1/2 = trigger metadata + first 5 stock rows
+#   PART 2/2 = remaining 5 stock rows + final basket/NQ summary
+# All Pine calculations, trigger logic, state, threshold and trading logic
+# remain untouched here. This is display-only.
 
-def _compact_qqq_weighted_audit_for_pushover(title, message):
+def _qqq_weighted_audit_pushover_parts(title, message):
     title_u = str(title or "").upper()
     text = str(message or "")
 
+    # Every other TradingView alert remains exactly one message.
     if "NASDAQ 10-STOCK" not in title_u or "QQQ WEIGHTED" not in title_u:
-        return text
+        return [(str(title or ""), text)]
 
-    stock_names = {"NVDA", "AAPL", "MSFT", "MU", "AMZN", "AMD", "GOOGL", "META", "GOOG", "TSLA"}
-    output = []
+    stock_names = {
+        "NVDA", "AAPL", "MSFT", "MU", "AMZN",
+        "AMD", "GOOGL", "META", "GOOG", "TSLA"
+    }
 
-    # Pine's jsonSafe() flattens newlines into " | " before the webhook is sent.
-    # Parse BOTH real newlines and that flattened pipe stream. This is display-only;
-    # no Pine calculation, trigger, state, threshold or trade logic is changed.
     normalized = text.replace("\r", "").replace("\n", " | ")
     tokens = [part.strip() for part in normalized.split("|") if part.strip()]
 
-    # Keep the most useful trigger-level metadata even when Pine flattened lines.
+    metadata = []
     wanted_prefixes = (
         "TRIGGER #",
         "TRIGGER BASE:",
         "WEIGHTED BASKET NET:",
         "STATE:",
+        "BASE 15:30 ENTRY CACHE:",
+        "POSITION AFTER ALERT:",
     )
     for token in tokens:
         if token.upper().startswith(wanted_prefixes):
-            output.append(token)
+            if token not in metadata:
+                metadata.append(token)
 
-    output.append("AUDIT: O=OPEN | T=LIVE | R=RAW | W=WEIGHT | C=CONTR")
-
-    # Read stock blocks from the flattened token stream:
-    # NVDA | OPEN ... | LIVE ... | RAW ... | W ... | CONTR ... | AAPL | ...
+    stock_rows = []
     i = 0
     while i < len(tokens):
         symbol = tokens[i].upper()
@@ -4567,8 +4569,6 @@ def _compact_qqq_weighted_audit_for_pushover(title, message):
             p = tokens[j]
             up = p.upper()
 
-            # Stop once this stock's contribution is complete. This prevents
-            # later metadata from being accidentally absorbed into the row.
             if up.startswith("OPEN "):
                 vals["O"] = p[5:].strip()
             elif up.startswith("LIVE "):
@@ -4593,24 +4593,49 @@ def _compact_qqq_weighted_audit_for_pushover(title, message):
                 row += f" | W {vals['W']}"
             if "C" in vals:
                 row += f" | C {vals['C']}"
-            output.append(row)
+            stock_rows.append(row)
 
         i = max(j, i + 1)
 
-    # Keep final basket/NQ values when present in either normal or flattened form.
+    summary = []
     for token in tokens:
         u = token.upper()
-        if u.startswith("WEIGHTED NET =") or u.startswith("NQ AT TRIGGER:"):
-            if token not in output:
-                output.append(token)
+        if (
+            u.startswith("WEIGHTED NET =")
+            or u.startswith("NQ AT TRIGGER:")
+        ):
+            if token not in summary:
+                summary.append(token)
 
-    compact = "\n".join(output)
+    # Preserve source order exactly; only split after row 5.
+    first_rows = stock_rows[:5]
+    second_rows = stock_rows[5:]
 
-    # Pushover message limit protection. Normally the compact 10-stock audit fits.
-    if len(compact) > 1024:
-        compact = compact[:1024]
+    part1_lines = []
+    part1_lines.extend(metadata)
+    part1_lines.append("AUDIT 1/2: O=OPEN | T=LIVE | R=RAW | W=WEIGHT | C=CONTR")
+    part1_lines.extend(first_rows)
 
-    return compact or text
+    part2_lines = [
+        "AUDIT 2/2: O=OPEN | T=LIVE | R=RAW | W=WEIGHT | C=CONTR"
+    ]
+    part2_lines.extend(second_rows)
+    part2_lines.extend(summary)
+
+    part1 = "\n".join(part1_lines).strip()
+    part2 = "\n".join(part2_lines).strip()
+
+    # Defensive protection only. With 5 rows per part both messages should
+    # normally be comfortably below Pushover's 1024-character message limit.
+    if len(part1) > 1024:
+        part1 = part1[:1024]
+    if len(part2) > 1024:
+        part2 = part2[:1024]
+
+    return [
+        (f"{title} | PART 1/2", part1 or text),
+        (f"{title} | PART 2/2", part2 or text),
+    ]
 
 
 # ==================================================
@@ -4667,17 +4692,23 @@ def webhook():
         )
 
         # Keep normal TradingView alerts unchanged. For the QQQ-weighted
-        # LAST-4 audit only, compact labels so OPEN + TRIGGER + RAW + WEIGHT
-        # + CONTRIBUTION for all 10 stocks fit inside Pushover's 1024-char limit.
-        pushover_message = _compact_qqq_weighted_audit_for_pushover(
+        # LAST-4 audit only, split the complete 10-stock audit into two
+        # Pushover messages so no stock row is lost to the 1024-char limit.
+        pushover_parts = _qqq_weighted_audit_pushover_parts(
             tv_title,
             tv_message
         )
 
-        ok = send_pushover(
-            tv_title,
-            pushover_message
-        )
+        pushover_results = []
+        for part_title, part_message in pushover_parts:
+            pushover_results.append(
+                send_pushover(
+                    part_title,
+                    part_message
+                )
+            )
+
+        ok = all(pushover_results)
 
         # Separately consume only NASDAQ TOP5/BOTTOM5 final alerts.
         # This is confirmation/Pushover only; MT5 is intentionally untouched.
