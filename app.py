@@ -6427,6 +6427,53 @@ def process_marginpad_all_crypto_feed(seed_only=False):
         accepted = 0
         seeded = 0
         with _all_crypto_lock:
+            # Repair/bootstrap for the read-only unusual-strength ledger.
+            # Older deployments could mark the current MarginPad feed as SEEN
+            # before those events were ever copied into all_crypto_unusual_by_symbol.
+            # If the ledger is completely empty, rebuild it ONCE from the current
+            # valid MarginPad 9-exchange feed.  This does NOT touch the normal
+            # ALL-CRYPTO cumulative totals, rolling-60m state, alerts or seen cache.
+            if not all_crypto_unusual_by_symbol:
+                unusual_seeded = 0
+                unusual_seed_seen = set()
+                for seed_ts_ms, seed_event in normalized:
+                    seed_fp = _all_crypto_event_fingerprint(seed_event)
+                    if seed_fp in unusual_seed_seen:
+                        continue
+                    unusual_seed_seen.add(seed_fp)
+
+                    seed_exchange = _btc_exchange_key(seed_event.get("exchange", ""))
+                    if seed_exchange not in ALL_CRYPTO_MARGINPAD_EXCHANGES:
+                        continue
+
+                    seed_symbol = str(seed_event.get("symbol", "")).upper().strip()
+                    if seed_symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+                        continue
+
+                    try:
+                        seed_notional = abs(float(seed_event.get("notional", 0.0) or 0.0))
+                    except (TypeError, ValueError):
+                        continue
+
+                    seed_side_raw = str(seed_event.get("side", "")).lower().strip()
+                    if seed_notional <= 0 or seed_side_raw not in ("long_liquidated", "short_liquidated"):
+                        continue
+
+                    seed_side = "long" if seed_side_raw == "long_liquidated" else "short"
+                    _all_crypto_unusual_add(
+                        seed_symbol or "UNKNOWN",
+                        seed_side,
+                        seed_notional,
+                        seed_ts_ms / 1000.0,
+                    )
+                    unusual_seeded += 1
+
+                print(
+                    f"[ALL CRYPTO UNUSUAL BOOTSTRAP] events={unusual_seeded} | "
+                    f"symbols={len(all_crypto_unusual_by_symbol)}",
+                    flush=True,
+                )
+
             for ts_ms, event in normalized:
                 fp = _all_crypto_event_fingerprint(event)
                 if fp in all_crypto_seen_set:
