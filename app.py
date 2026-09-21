@@ -496,6 +496,12 @@ def send_pushover(title, message):
     # Keep ONLY the XAU/XAUT gold-family Coinalyze Pushover alerts.
     # Other Coinalyze calculations/state may continue silently.
     title_upper = str(title or "").upper()
+
+    # ROLLING 60M PUSHOVER FILTER:
+    # Calculations, state tracking and logs remain active; phone alerts are silent.
+    if "ROLLING 60M" in title_upper or "ROLLING 60MIN" in title_upper:
+        print(f"[ROLLING 60M PUSHOVER SILENT] {title}", flush=True)
+        return False
     if "COINALYZE" in title_upper and "XAU" not in title_upper:
         print(
             f"[COINALYZE PUSHOVER SILENT - XAU/XAUT ONLY] {title}",
