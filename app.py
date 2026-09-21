@@ -492,6 +492,18 @@ future_markets_cache = None
 
 def send_pushover(title, message):
 
+    # COINALYZE ALERT FILTER:
+    # Keep ONLY XAU Coinalyze Pushover alerts.
+    # BTC / ETH / SOL / NVDA / any other Coinalyze notifications are silent.
+    # Their calculations/state can continue normally in the background.
+    title_upper = str(title or "").upper()
+    if "COINALYZE" in title_upper and "XAU" not in title_upper:
+        print(
+            f"[COINALYZE PUSHOVER SILENT - XAU ONLY] {title}",
+            flush=True,
+        )
+        return False
+
     if not PUSHOVER_TOKEN or not PUSHOVER_USER:
         return False
 
