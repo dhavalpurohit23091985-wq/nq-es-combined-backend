@@ -308,6 +308,20 @@ all_crypto_crypto_symbols_refreshed_ts = 0.0
 all_crypto_first_poll_seeded = False
 _all_crypto_lock = threading.RLock()
 _all_crypto_poller_started = False
+
+# ETH / SOL 13EX NORMAL GAP observers.
+# Same reverse-only +/-$5M GAP behavior as the dedicated BTC Observer,
+# fed from the same accepted MarginPad-9 + Direct-4 crypto events.
+ALT_GAP_ASSETS = ("ETH", "SOL")
+alt_gap_observer = {
+    asset: {
+        "long": 0.0,
+        "short": 0.0,
+        "state": None,
+        "by_exchange": {ex: {"long": 0.0, "short": 0.0} for ex in ALL_CRYPTO_OBSERVER_EXCHANGES},
+    }
+    for asset in ALT_GAP_ASSETS
+}
 # Hourly discovery report: exact trailing 60m, sent on each IST clock-hour.
 # Independent from GAP/rolling trigger state; never resets liquidation data.
 ALL_CRYPTO_HOURLY_TOP_N = 12
@@ -2561,6 +2575,13 @@ def _runtime_state_payload():
             'marginpad_seen_queue': list(alt_rolling[a]['marginpad_seen_queue']), 'direct_seen_queue': list(alt_rolling[a]['direct_seen_queue']),
         } for a in ALT_ROLLING_ASSETS},
 
+        'alt_gap_observer': {a: {
+            'long': alt_gap_observer[a]['long'],
+            'short': alt_gap_observer[a]['short'],
+            'state': alt_gap_observer[a]['state'],
+            'by_exchange': alt_gap_observer[a]['by_exchange'],
+        } for a in ALT_GAP_ASSETS},
+
         'all_crypto_marginpad': {
             'long_cumulative': all_crypto_long_cumulative,
             'short_cumulative': all_crypto_short_cumulative,
@@ -2820,6 +2841,22 @@ def _load_runtime_state():
             _st['coinalyze_events']=_restore_roll(_src.get('coinalyze_events')); _st['observer_events']=_restore_roll(_src.get('observer_events'))
             _seen=list(_src.get('marginpad_seen_queue') or [])[-MARGINPAD_SEEN_MAX:]; _st['marginpad_seen_queue']=deque(_seen); _st['marginpad_seen_set']=set(_seen)
             _dseen=list(_src.get('direct_seen_queue') or [])[-COMBINED_DIRECT_SEEN_MAX:]; _st['direct_seen_queue']=deque(_dseen); _st['direct_seen_set']=set(_dseen)
+
+        _alt_gap_saved = data.get('alt_gap_observer') or {}
+        for _asset in ALT_GAP_ASSETS:
+            _src = _alt_gap_saved.get(_asset) or {}
+            _st = alt_gap_observer[_asset]
+            _st['long'] = float(_src.get('long', 0.0) or 0.0)
+            _st['short'] = float(_src.get('short', 0.0) or 0.0)
+            _st['state'] = _src.get('state') if _src.get('state') in ('LONG', 'SHORT') else None
+            _st['by_exchange'] = {ex: {'long': 0.0, 'short': 0.0} for ex in ALL_CRYPTO_OBSERVER_EXCHANGES}
+            for _ex, _totals in (_src.get('by_exchange') or {}).items():
+                _key = _btc_exchange_key(_ex)
+                if _key in _st['by_exchange'] and isinstance(_totals, dict):
+                    _st['by_exchange'][_key] = {
+                        'long': float(_totals.get('long', 0.0) or 0.0),
+                        'short': float(_totals.get('short', 0.0) or 0.0),
+                    }
 
         allc = data.get('all_crypto_marginpad') or {}
         all_crypto_long_cumulative = float(allc.get('long_cumulative', 0.0) or 0.0)
@@ -6451,6 +6488,66 @@ def _all_crypto_send_rolling_if_flip(now_ts=None):
     return False
 
 
+def _alt_gap_observer_add(asset, exchange, side, amount):
+    """ETH/SOL dedicated 13EX cumulative GAP observer; reverse-only, reset after alert."""
+    asset = str(asset or "").upper().strip()
+    exchange = _btc_exchange_key(exchange)
+    side = str(side or "").lower().strip()
+    if asset not in ALT_GAP_ASSETS or exchange not in ALL_CRYPTO_OBSERVER_EXCHANGES or side not in ("long", "short"):
+        return False
+    try:
+        amount = abs(float(amount or 0.0))
+    except (TypeError, ValueError):
+        return False
+    if amount <= 0:
+        return False
+
+    st = alt_gap_observer[asset]
+    st[side] += amount
+    bucket = st["by_exchange"].setdefault(exchange, {"long": 0.0, "short": 0.0})
+    bucket[side] += amount
+
+    signed_gap = st["long"] - st["short"]
+    old_state = st["state"]
+    new_state = old_state
+    if signed_gap >= BTC_GAP_THRESHOLD and old_state != "LONG":
+        new_state = "LONG"
+    elif signed_gap <= -BTC_GAP_THRESHOLD and old_state != "SHORT":
+        new_state = "SHORT"
+    if new_state == old_state:
+        return False
+
+    gap = abs(signed_gap)
+    ranked = []
+    for ex in ALL_CRYPTO_OBSERVER_EXCHANGES:
+        totals = st["by_exchange"].get(ex, {"long": 0.0, "short": 0.0})
+        ex_long = float(totals.get("long", 0.0) or 0.0)
+        ex_short = float(totals.get("short", 0.0) or 0.0)
+        ranked.append((max(ex_long, ex_short), ex, ex_long, ex_short))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    lines = [
+        f"{_btc_exchange_label(ex)}: LONG ${_usd_m(ex_long)} | SHORT ${_usd_m(ex_short)}"
+        for _, ex, ex_long, ex_short in ranked
+    ]
+    title = f"{asset} OBSERVER {new_state} WINS | +5M GAP"
+    message = (
+        "\n".join(lines)
+        + f"\nTOTAL SHORT: ${_usd_m(st['short'])}"
+        + f"\nTOTAL LONG: ${_usd_m(st['long'])}"
+        + f"\nGAP: ${_usd_m(gap)}"
+        + f"\nSTATE: {old_state or 'NONE'} -> {new_state}"
+    )
+    sent = send_pushover(title, message)
+    print(f"[{asset} OBSERVER ALERT] {title} L=${_usd_m(st['long'])} S=${_usd_m(st['short'])} sent={sent}", flush=True)
+
+    # Same behavior as BTC Observer: preserve direction state, reset only cumulative cycle totals.
+    st["state"] = new_state
+    st["long"] = 0.0
+    st["short"] = 0.0
+    st["by_exchange"] = {ex: {"long": 0.0, "short": 0.0} for ex in ALL_CRYPTO_OBSERVER_EXCHANGES}
+    return bool(sent)
+
+
 def _all_crypto_unusual_add(symbol, side, amount, event_ts):
     """No-reset, no-alert per-symbol ledger fed only by accepted 13EX events."""
     symbol = str(symbol or "UNKNOWN").upper().strip() or "UNKNOWN"
@@ -6653,6 +6750,8 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                 bucket = all_crypto_by_symbol.setdefault(symbol or "UNKNOWN", {"long": 0.0, "short": 0.0})
                 bucket[side] += notional
                 _all_crypto_unusual_add(symbol or "UNKNOWN", side, notional, ts_sec)
+                if symbol in ALT_GAP_ASSETS:
+                    _alt_gap_observer_add(symbol, exchange_key, side, notional)
                 all_crypto_rolling_events.append((ts_sec, side, notional, symbol, exchange_key))
                 accepted += 1
                 print(
@@ -6770,6 +6869,8 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
         bucket = all_crypto_by_symbol.setdefault(symbol, {"long": 0.0, "short": 0.0})
         bucket[side] += amount
         _all_crypto_unusual_add(symbol, side, amount, ts_sec)
+        if symbol in ALT_GAP_ASSETS:
+            _alt_gap_observer_add(symbol, exchange, side, amount)
         all_crypto_rolling_events.append((ts_sec, side, amount, symbol, exchange))
         if len(all_crypto_rolling_events) > 1 and ts_sec < float(all_crypto_rolling_events[-2][0]):
             all_crypto_rolling_events = deque(sorted(all_crypto_rolling_events, key=lambda r: r[0]))
