@@ -11,12 +11,11 @@ import websockets
 # DIRECT BTC + ETH + SOL + XAU LIQUIDATION WORKER
 #
 # BTC direct sources:
-#   Bitget + Aster + CoinEx + Lighter
+#   Bitget + Aster + Lighter
 #
 # XAU direct sources:
 #   Bitget XAUUSDT when available
 #   Aster XAU/GOLD symbols from all-market forceOrder stream
-#   CoinEx ONLY if a true XAU/GOLD futures market exists
 #   Lighter XAU/GOLD market when available
 #
 # IMPORTANT:
@@ -39,18 +38,14 @@ BITGET_WS = "wss://ws.bitget.com/v3/ws/public"
 # Aster all-market force liquidation stream.
 ASTER_WS = "wss://fstream.asterdex.com/ws/!forceOrder@arr"
 
-COINEX_LIQ_URL = "https://api.coinex.com/v2/futures/liquidation-history"
-COINEX_MARKETS_URL = "https://api.coinex.com/v2/futures/market"
 
 LIGHTER_WS = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
 LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
 
-COINEX_POLL_SECONDS = 5
-COINEX_LOOKBACK_MS = 60_000
 SEEN_LIMIT = 40_000
 
 ASSETS = ("BTC", "ETH", "SOL", "XAU")
-EXCHANGES = ("bitget", "aster", "coinex", "lighter")
+EXCHANGES = ("bitget", "aster", "lighter")
 
 totals = {
     "BTC": {"long": 0.0, "short": 0.0},
@@ -72,13 +67,6 @@ lock = asyncio.Lock()
 seen_queue = deque(maxlen=SEEN_LIMIT)
 seen_set = set()
 
-coinex_markets = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "SOL": "SOLUSDT",
-    "XAU": None,
-}
-coinex_all_markets = []
 
 
 # ============================================================
@@ -238,7 +226,7 @@ async def add_all_crypto_liquidation(symbol, exchange, side, notional_usd, event
         symbol=base,
         ts_ms=ts_ms,
         price=price,
-        verified_crypto=(exchange in {"bitget", "aster", "coinex", "lighter"}),
+        verified_crypto=(exchange in {"bitget", "aster", "lighter"}),
     )
 
 
@@ -542,184 +530,6 @@ async def aster_loop():
                 flush=True,
             )
             await asyncio.sleep(5)
-
-
-# ============================================================
-# COINEX MARKET DISCOVERY
-# ============================================================
-
-def discover_coinex_markets():
-    global coinex_all_markets
-    """
-    BTCUSDT is used for BTC.
-
-    For XAU, only a true base currency XAU/GOLD market is accepted.
-    XAUTUSDT is Tether Gold token and is deliberately excluded.
-    """
-    try:
-        r = requests.get(
-            COINEX_MARKETS_URL,
-            timeout=20,
-        )
-        r.raise_for_status()
-        payload = r.json()
-
-        if payload.get("code") != 0:
-            raise RuntimeError(payload)
-
-        btc_market = None
-        xau_market = None
-        all_markets = []
-
-        for item in payload.get("data") or []:
-            if not isinstance(item, dict):
-                continue
-
-            market = str(item.get("market") or "").upper()
-            base = str(item.get("base_ccy") or "").upper()
-            quote = str(item.get("quote_ccy") or "").upper()
-            available = item.get("is_market_available")
-
-            if available is False:
-                continue
-
-            if quote == "USDT" and market:
-                all_markets.append((base or crypto_base_symbol(market), market))
-
-            if market == "BTCUSDT":
-                btc_market = market
-
-            if (
-                quote == "USDT"
-                and base in {"XAU", "GOLD"}
-                and not market.startswith("XAUT")
-            ):
-                xau_market = market
-
-        coinex_markets["BTC"] = btc_market or "BTCUSDT"
-        coinex_markets["XAU"] = xau_market
-        coinex_all_markets = all_markets
-
-        print(
-            f"[COINEX] BTC market={coinex_markets['BTC']} | "
-            f"XAU market={coinex_markets['XAU'] or 'NOT FOUND / SKIPPED'} | ALL crypto markets={len(coinex_all_markets)}",
-            flush=True,
-        )
-
-    except Exception as e:
-        print(
-            f"[COINEX MARKET ERROR] {type(e).__name__}: {e}",
-            flush=True,
-        )
-
-
-async def coinex_poll_market(session, asset, market):
-    now_ms = int(time.time() * 1000)
-
-    params = {
-        "market": market,
-        "start_time": now_ms - COINEX_LOOKBACK_MS,
-        "end_time": now_ms,
-        "page": 1,
-        "limit": 100,
-    }
-
-    r = await asyncio.to_thread(
-        session.get,
-        COINEX_LIQ_URL,
-        params=params,
-        timeout=20,
-    )
-
-    r.raise_for_status()
-    payload = r.json()
-
-    if payload.get("code") != 0:
-        raise RuntimeError(
-            f"CoinEx {asset} response: {payload}"
-        )
-
-    for event in payload.get("data") or []:
-        if str(event.get("market") or "").upper() != market:
-            continue
-
-        side = str(event.get("side") or "").lower()
-
-        if side not in ("long", "short"):
-            continue
-
-        price = float(event.get("liq_price") or 0)
-        amount = float(event.get("liq_amount") or 0)
-
-        # CoinEx linear USDT futures amount is base-asset quantity.
-        notional = price * amount
-
-        ts = str(event.get("created_at") or "")
-        bkr = str(event.get("bkr_price") or "")
-
-        key = (
-            f"coinex|{asset}|{market}|{ts}|{side}|"
-            f"{price}|{amount}|{bkr}"
-        )
-
-        await add_all_crypto_liquidation(
-            market, "coinex", side, notional, key, ts_ms=ts, price=price
-        )
-        canonical_asset = classify_symbol(market)
-        if canonical_asset:
-            await add_liquidation(
-                canonical_asset,
-                "coinex",
-                side,
-                notional,
-                key,
-            )
-
-
-async def coinex_loop():
-    session = requests.Session()
-
-    await asyncio.to_thread(discover_coinex_markets)
-
-    refresh_counter = 0
-
-    while True:
-        try:
-            # CoinEx requires a market on liquidation-history, so scan every
-            # available USDT futures market. The endpoint is public and the
-            # event-key dedupe prevents overlap from the rolling lookback.
-            for base, market in list(coinex_all_markets):
-                # One unsupported/invalid CoinEx market must NOT abort the
-                # complete ALL-Crypto scan. Skip only that market and keep
-                # polling the rest of the discovered futures universe.
-                try:
-                    await coinex_poll_market(
-                        session,
-                        base or crypto_base_symbol(market),
-                        market,
-                    )
-                except Exception as market_error:
-                    print(
-                        f"[COINEX MARKET SKIP] market={market} "
-                        f"{type(market_error).__name__}: {market_error}",
-                        flush=True,
-                    )
-                    continue
-
-        except Exception as e:
-            print(
-                f"[COINEX ERROR] {type(e).__name__}: {e}",
-                flush=True,
-            )
-
-        refresh_counter += 1
-
-        # Refresh the full CoinEx futures universe periodically.
-        if refresh_counter >= 720:
-            refresh_counter = 0
-            await asyncio.to_thread(discover_coinex_markets)
-
-        await asyncio.sleep(COINEX_POLL_SECONDS)
 
 
 # ============================================================
@@ -1088,9 +898,6 @@ async def status_loop():
                     f"Aster("
                     f"L={usd(by_exchange[asset]['aster']['long'])},"
                     f"S={usd(by_exchange[asset]['aster']['short'])}) "
-                    f"CoinEx("
-                    f"L={usd(by_exchange[asset]['coinex']['long'])},"
-                    f"S={usd(by_exchange[asset]['coinex']['short'])}) "
                     f"Lighter("
                     f"L={usd(by_exchange[asset]['lighter']['long'])},"
                     f"S={usd(by_exchange[asset]['lighter']['short'])})",
@@ -1118,7 +925,7 @@ async def main():
     )
 
     print(
-        "BTC/ETH/SOL Sources: Bitget + Aster + CoinEx + Lighter",
+        "BTC/ETH/SOL Sources: Bitget + Aster + Lighter",
         flush=True,
     )
 
@@ -1127,14 +934,13 @@ async def main():
         flush=True,
     )
     print(
-        "ALL Crypto Direct Sources: Bitget + Aster + CoinEx + Lighter",
+        "ALL Crypto Direct Sources: Bitget + Aster + Lighter",
         flush=True,
     )
 
     await asyncio.gather(
         bitget_loop(),
         aster_loop(),
-        coinex_loop(),
         lighter_asset_loop("BTC"),
         lighter_asset_loop("ETH"),
         lighter_asset_loop("SOL"),
