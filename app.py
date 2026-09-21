@@ -493,13 +493,12 @@ future_markets_cache = None
 def send_pushover(title, message):
 
     # COINALYZE ALERT FILTER:
-    # Keep ONLY XAU Coinalyze Pushover alerts.
-    # BTC / ETH / SOL / NVDA / any other Coinalyze notifications are silent.
-    # Their calculations/state can continue normally in the background.
+    # Keep ONLY the XAU/XAUT gold-family Coinalyze Pushover alerts.
+    # Other Coinalyze calculations/state may continue silently.
     title_upper = str(title or "").upper()
     if "COINALYZE" in title_upper and "XAU" not in title_upper:
         print(
-            f"[COINALYZE PUSHOVER SILENT - XAU ONLY] {title}",
+            f"[COINALYZE PUSHOVER SILENT - XAU/XAUT ONLY] {title}",
             flush=True,
         )
         return False
@@ -1821,35 +1820,64 @@ def get_marginpad_fresh_xau_liquidations(
     previous_through_ms,
     closed_minute_ts
 ):
+    # GOLD FAMILY: combine MarginPad XAU + XAUT when each symbol is available.
+    # A failure/unsupported response for one symbol does not discard the other.
+    events = []
+    source_errors = []
 
-    payload, error = marginpad_get(
-        "/api/v1/liquidations/live",
-        params={
-            "symbol": "XAU",
-            "limit": MARGINPAD_LIVE_LIMIT
-        },
-        timeout=12,
-        stage="marginpad-xau-liquidations"
-    )
+    for requested_symbol in ("XAU", "XAUT"):
+        payload, error = marginpad_get(
+            "/api/v1/liquidations/live",
+            params={
+                "symbol": requested_symbol,
+                "limit": MARGINPAD_LIVE_LIMIT
+            },
+            timeout=12,
+            stage=f"marginpad-{requested_symbol.lower()}-liquidations"
+        )
 
-    if error:
-        return None, error
+        if error:
+            source_errors.append({
+                "symbol": requested_symbol,
+                "error": error,
+            })
+            print(
+                f"[MARGINPAD GOLD SOURCE SKIP] {requested_symbol} | {error}",
+                flush=True,
+            )
+            continue
 
-    events = extract_marginpad_events(
-        payload
-    )
+        symbol_events = extract_marginpad_events(payload)
 
-    # The live XAU response can also be flat:
-    # {"symbol":"XAU","events":[...]}.
-    if not events and isinstance(payload, dict):
-        value = payload.get("events")
-        if isinstance(value, list):
-            events = value
+        # Some MarginPad responses can also be flat:
+        # {"symbol":"XAU","events":[...]} / {"symbol":"XAUT","events":[...]}.
+        if not symbol_events and isinstance(payload, dict):
+            value = payload.get("events")
+            if isinstance(value, list):
+                symbol_events = value
 
-    if not isinstance(events, list):
+        if not isinstance(symbol_events, list):
+            source_errors.append({
+                "symbol": requested_symbol,
+                "error": "events payload is not a list",
+            })
+            continue
+
+        # If an upstream row omits symbol, stamp the requested symbol so
+        # XAU and XAUT remain independently fingerprinted/auditable.
+        for raw_event in symbol_events:
+            if not isinstance(raw_event, dict):
+                continue
+            event = dict(raw_event)
+            if not str(event.get("symbol", "")).strip():
+                event["symbol"] = requested_symbol
+            events.append(event)
+
+    if not events and len(source_errors) >= 2:
         return None, {
-            "stage": "marginpad-xau-liquidations",
-            "error": "events payload is not a list"
+            "stage": "marginpad-xau-xaut-liquidations",
+            "error": "both XAU and XAUT sources unavailable",
+            "sources": source_errors,
         }
 
     closed_end_ms = (
@@ -1874,7 +1902,6 @@ def get_marginpad_fresh_xau_liquidations(
     accepted_events = 0
     newest_event_ms = None
     exchanges = set()
-    # XAU 13EX audit buckets for the approved MarginPad 9.
     fresh_by_exchange = {
         ex: {"long": 0.0, "short": 0.0}
         for ex in XAU_MARGINPAD_EXCHANGES
@@ -1883,17 +1910,15 @@ def get_marginpad_fresh_xau_liquidations(
     normalized_events = []
 
     for event in events:
-
         if not isinstance(event, dict):
             continue
 
-        # Extra guard so a malformed mixed payload can never leak BTC
-        # events into the XAU accumulator.
         event_symbol = str(
             event.get("symbol", "")
         ).strip().upper()
 
-        if event_symbol and event_symbol != "XAU":
+        # GOLD FAMILY only.
+        if event_symbol and event_symbol not in ("XAU", "XAUT"):
             continue
 
         event_ts_ms = normalize_marginpad_ts_ms(
@@ -1912,7 +1937,6 @@ def get_marginpad_fresh_xau_liquidations(
     )
 
     for event_ts_ms, event in normalized_events:
-
         if event_ts_ms > closed_end_ms:
             continue
 
@@ -1952,12 +1976,9 @@ def get_marginpad_fresh_xau_liquidations(
         ).strip()
         exchange_key = _btc_exchange_key(exchange)
 
-        # Exact BTC-style XAU 13EX architecture:
-        # MarginPad contributes only the approved 9 exchanges.
-        # Direct Bitget/Aster/CoinEx/Lighter arrive through the direct endpoint.
         if exchange_key not in XAU_MARGINPAD_EXCHANGES:
             print(
-                "[XAU 13EX EXCHANGE REJECT] "
+                "[XAU/XAUT 13EX EXCHANGE REJECT] "
                 f"exchange={exchange or '-'} | "
                 f"normalized={exchange_key or '-'} | "
                 f"side={side} | "
@@ -1995,7 +2016,7 @@ def get_marginpad_fresh_xau_liquidations(
             newest_event_ms = event_ts_ms
 
     print(
-        "MARGINPAD XAU | "
+        "MARGINPAD XAU+XAUT | "
         f"events_returned={len(events)} | "
         f"events_accepted={accepted_events} | "
         f"exchanges={len(exchanges)}"
@@ -2020,7 +2041,9 @@ def get_marginpad_fresh_xau_liquidations(
         },
         "newest_event_ts_ms": newest_event_ms,
         "rolling_events": rolling_events,
-        "closed_end_ms": closed_end_ms
+        "closed_end_ms": closed_end_ms,
+        "gold_symbols": ["XAU", "XAUT"],
+        "source_errors": source_errors,
     }, None
 
 
@@ -4939,8 +4962,16 @@ def get_perpetual_symbols(asset):
             )
         ).upper()
 
-        if (
+        asset_match = (
             base_asset == asset
+            or (
+                asset == "XAU"
+                and base_asset == "XAUT"
+            )
+        )
+
+        if (
+            asset_match
             and
             market.get(
                 "is_perpetual"
@@ -4965,6 +4996,8 @@ def get_perpetual_symbols(asset):
 
             if (
                 asset == "XAU"
+                and
+                base_asset == "XAU"
                 and
                 price_symbol is None
                 and
@@ -6470,7 +6503,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                         continue
 
                     seed_symbol = str(seed_event.get("symbol", "")).upper().strip()
-                    if seed_symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+                    if seed_symbol in {"XAU", "XAUT", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
                         continue
 
                     try:
@@ -6511,7 +6544,7 @@ def process_marginpad_all_crypto_feed(seed_only=False):
                     continue
                 symbol = str(event.get("symbol", "")).upper().strip()
                 # Hard reject known non-crypto instruments; then require crypto universe membership.
-                if symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+                if symbol in {"XAU", "XAUT", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
                     _all_crypto_remember(fp)
                     continue
                 # /api/v1/feed is MarginPad's market-wide crypto liquidation feed.
@@ -6595,7 +6628,7 @@ def add_all_crypto_direct_event(exchange, symbol, side, amount, event_key, event
 
     if exchange not in ALL_CRYPTO_DIRECT_EXCHANGES:
         return {"ok": False, "error": "invalid_all_crypto_exchange"}
-    if not symbol or symbol in {"XAU", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
+    if not symbol or symbol in {"XAU", "XAUT", "XAG", "GOLD", "SILVER", "NQ", "ES", "SPX", "SP500"}:
         return {"ok": False, "error": "invalid_all_crypto_symbol"}
 
     # CRYPTO-ONLY SAFETY GATE:
@@ -8372,6 +8405,8 @@ def direct_liquidation_event():
 
     data = request.get_json(silent=True) or {}
     asset = str(data.get("asset", "")).upper().strip()
+    if asset == "XAUT":
+        asset = "XAU"
     exchange = str(data.get("exchange", "")).lower().strip()
     side = str(data.get("side", "")).lower().strip()
     event_key = str(data.get("event_key") or data.get("event_id") or "").strip()
