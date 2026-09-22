@@ -4868,14 +4868,26 @@ def webhook():
                 tv_message
             )
 
-        pushover_results = []
-        for part_title, part_message in pushover_parts:
-            pushover_results.append(
-                send_pushover(
-                    part_title,
-                    part_message
+        def _send_pushover_parts_background(parts):
+            try:
+                for part_title, part_message in parts:
+                    send_pushover(
+                        part_title,
+                        part_message
+                    )
+            except Exception as e:
+                print(
+                    f"[PUSHOVER BACKGROUND ERROR] {e}",
+                    flush=True
                 )
-            )
+
+        threading.Thread(
+            target=_send_pushover_parts_background,
+            args=(list(pushover_parts),),
+            daemon=True
+        ).start()
+
+        pushover_results = ["queued"] * len(pushover_parts)
 
         ok = all(pushover_results)
 
