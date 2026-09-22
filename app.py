@@ -69,6 +69,20 @@ _marginpad_request_lock = threading.Lock()
 
 
 # ==================================================
+# NASDAQ / NQ GENERATION SWITCHES
+# ==================================================
+# CURRENT setup kept ON:
+#   NASDAQ 10-STOCK | QQQ WEIGHTED | ROLLING LAST-4 | +/-0.100%
+#
+# OLD setups disabled:
+#   - NQ + ES combined-delta +/-1000 engine
+#   - NASDAQ TOP5/BOTTOM5 combined confirmation engine
+LATEST_QQQ_LAST4_ENABLED = True
+OLD_NQ_ES_DELTA_ENABLED = False
+OLD_NASDAQ_TOP5_BOTTOM5_ENABLED = False
+
+
+# ==================================================
 # NQ / ES LIVE DATA
 # ==================================================
 
@@ -4834,16 +4848,19 @@ def webhook():
 
         ok = all(pushover_results)
 
-        # Separately consume only NASDAQ TOP5/BOTTOM5 final alerts.
-        # This is confirmation/Pushover only; MT5 is intentionally untouched.
-        nasdaq_result = _nasdaq_combined_process(
-            tv_title,
-            tv_message
-        )
+        # OLD NASDAQ TOP5/BOTTOM5 combined confirmation is disabled.
+        # The current QQQ-weighted Rolling Last-4 TradingView alert above
+        # still goes directly to Pushover, including its existing 5+5 split.
+        nasdaq_result = {
+            "handled": False,
+            "disabled": True,
+            "reason": "old_nasdaq_top5_bottom5_off"
+        }
 
         return jsonify({
             "ok": ok,
             "mode": "direct_pushover",
+            "latest_qqq_last4_enabled": LATEST_QQQ_LAST4_ENABLED,
             "nasdaq_combined": nasdaq_result
         }), 200 if ok else 500
 
@@ -4853,6 +4870,21 @@ def webhook():
             ""
         )
     ).upper()
+
+    if (
+        not OLD_NQ_ES_DELTA_ENABLED
+        and symbol in ("NQ", "ES", "JPN")
+    ):
+        print(
+            f"[OLD NQ+ES OFF] ignored structured webhook | symbol={symbol}",
+            flush=True
+        )
+        return jsonify({
+            "ok": True,
+            "ignored": True,
+            "reason": "old_nq_es_delta_off",
+            "symbol": symbol
+        }), 200
 
     try:
         price = float(
