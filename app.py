@@ -825,78 +825,6 @@ def _combined_reset_asset(asset, reset_price=None):
 
 
 
-XAU_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".xau_normal_direction"
-
-
-def _claim_xau_normal_direction(direction):
-    """Atomically claim a new XAU normal-observer direction across Gunicorn workers.
-
-    Returns True only when direction differs from the last successfully claimed
-    LONG/SHORT direction. Same-side repeats are rejected even when another
-    worker/process has stale in-memory globals.
-    """
-    direction = str(direction or "").upper().strip()
-    if direction not in ("LONG", "SHORT"):
-        return False
-
-    os.makedirs(os.path.dirname(XAU_NORMAL_DIRECTION_FILE), exist_ok=True)
-    lock_path = XAU_NORMAL_DIRECTION_FILE + ".lock"
-
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            previous = None
-            try:
-                with open(XAU_NORMAL_DIRECTION_FILE, "r", encoding="utf-8") as f:
-                    previous = str(f.read() or "").strip().upper()
-            except FileNotFoundError:
-                previous = None
-            except Exception as exc:
-                print(f"[XAU NORMAL LOCK READ ERROR] {exc}", flush=True)
-
-            if previous == direction:
-                return False
-
-            tmp = (
-                XAU_NORMAL_DIRECTION_FILE
-                + f".{os.getpid()}.{threading.get_ident()}.tmp"
-            )
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(direction)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, XAU_NORMAL_DIRECTION_FILE)
-            finally:
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except OSError:
-                    pass
-
-            print(
-                f"[XAU NORMAL DIRECTION CLAIM] {previous or 'NONE'}->{direction}",
-                flush=True,
-            )
-            return True
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _clear_xau_normal_direction_claim():
-    """Clear only the dedicated XAU normal-observer claim during migration."""
-    lock_path = XAU_NORMAL_DIRECTION_FILE + ".lock"
-    os.makedirs(os.path.dirname(XAU_NORMAL_DIRECTION_FILE), exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            try:
-                os.remove(XAU_NORMAL_DIRECTION_FILE)
-            except FileNotFoundError:
-                pass
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
 
 def add_combined_liquidation_batch(
     asset,
@@ -2636,6 +2564,80 @@ def process_alt_marginpad(asset,closed_minute_ts):
 # state across Render deploys/restarts using the existing /var/data disk.
 
 RUNTIME_STATE_FILE = os.path.join('/var/data', 'backend_runtime_state.json')
+
+XAU_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".xau_normal_direction"
+
+
+def _claim_xau_normal_direction(direction):
+    """Atomically claim a new XAU normal-observer direction across Gunicorn workers.
+
+    Returns True only when direction differs from the last successfully claimed
+    LONG/SHORT direction. Same-side repeats are rejected even when another
+    worker/process has stale in-memory globals.
+    """
+    direction = str(direction or "").upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    os.makedirs(os.path.dirname(XAU_NORMAL_DIRECTION_FILE), exist_ok=True)
+    lock_path = XAU_NORMAL_DIRECTION_FILE + ".lock"
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = None
+            try:
+                with open(XAU_NORMAL_DIRECTION_FILE, "r", encoding="utf-8") as f:
+                    previous = str(f.read() or "").strip().upper()
+            except FileNotFoundError:
+                previous = None
+            except Exception as exc:
+                print(f"[XAU NORMAL LOCK READ ERROR] {exc}", flush=True)
+
+            if previous == direction:
+                return False
+
+            tmp = (
+                XAU_NORMAL_DIRECTION_FILE
+                + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(direction)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, XAU_NORMAL_DIRECTION_FILE)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+
+            print(
+                f"[XAU NORMAL DIRECTION CLAIM] {previous or 'NONE'}->{direction}",
+                flush=True,
+            )
+            return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _clear_xau_normal_direction_claim():
+    """Clear only the dedicated XAU normal-observer claim during migration."""
+    lock_path = XAU_NORMAL_DIRECTION_FILE + ".lock"
+    os.makedirs(os.path.dirname(XAU_NORMAL_DIRECTION_FILE), exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                os.remove(XAU_NORMAL_DIRECTION_FILE)
+            except FileNotFoundError:
+                pass
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 _runtime_state_lock = threading.Lock()
 
 
