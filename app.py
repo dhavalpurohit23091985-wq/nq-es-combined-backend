@@ -7660,22 +7660,53 @@ def _btc_observer_add(exchange_breakdown, price=None):
                 f"{_btc_exchange_label(ex_name)}: LONG ${_usd_m(ex_long)} | SHORT ${_usd_m(ex_short)}"
                 for _, ex_name, ex_long, ex_short in observer_ranked
             ]
-            alert_snapshot = {
-                "asset": "BTC",
-                "winner": winner,
-                "title": title,
-                "long": cycle_long,
-                "short": cycle_short,
-                "gap": gap,
-                "price": current_price,
-                "move": move,
-                "exchanges": exchange_lines,
-                "ts": int(time.time()),
+            # Build an exact per-exchange fingerprint for this completed cycle.
+            # If the upstream source replays the same already-counted batch after
+            # our reset, do NOT send the same alert again. A genuinely fresh
+            # cycle will have a different 13-exchange fingerprint.
+            exchange_totals_snapshot = {
+                ex_name: {
+                    "long": round(float(btc_observer_by_exchange.get(ex_name, {}).get("long", 0.0) or 0.0), 2),
+                    "short": round(float(btc_observer_by_exchange.get(ex_name, {}).get("short", 0.0) or 0.0), 2),
+                }
+                for ex_name in BTC_OBSERVER_EXCHANGES
             }
-            btc_observer_last_alert_snapshot = dict(alert_snapshot)
+
+            previous_exchange_totals = (
+                btc_observer_last_alert_snapshot.get("exchange_totals")
+                if isinstance(btc_observer_last_alert_snapshot, dict)
+                else None
+            )
+            duplicate_completed_cycle = (
+                isinstance(previous_exchange_totals, dict)
+                and exchange_totals_snapshot == previous_exchange_totals
+            )
+
+            if duplicate_completed_cycle:
+                print(
+                    f"[BTC OBSERVER DUPLICATE SUPPRESSED] {title} "
+                    f"L=${_usd_m(cycle_long)} S=${_usd_m(cycle_short)}",
+                    flush=True,
+                )
+            else:
+                alert_snapshot = {
+                    "asset": "BTC",
+                    "winner": winner,
+                    "title": title,
+                    "long": cycle_long,
+                    "short": cycle_short,
+                    "gap": gap,
+                    "price": current_price,
+                    "move": move,
+                    "exchanges": exchange_lines,
+                    "exchange_totals": exchange_totals_snapshot,
+                    "ts": int(time.time()),
+                }
+                btc_observer_last_alert_snapshot = dict(alert_snapshot)
 
             # Observer has its own cycle/reset only. Existing MarginPad, direct
-            # liquidator, Coinalyze and MT5 states are untouched.
+            # liquidator, Coinalyze and MT5 states are untouched. Reset even when
+            # an upstream replay is suppressed so replayed totals cannot linger.
             btc_observer_long_cumulative = 0.0
             btc_observer_short_cumulative = 0.0
             btc_observer_by_exchange = {
