@@ -8310,11 +8310,6 @@ def process_xau(
             xau_price
         )
 
-        _gap_check_capture(
-            "xau_coinalyze_normal", _xau_previous_gap_state, cycle_winner,
-            cycle_long, cycle_short, XAU_GAP_THRESHOLD, time.time(), alert_title
-        )
-
         xau_long_cumulative = 0.0
         xau_short_cumulative = 0.0
         xau_coinalyze_by_exchange = {}
