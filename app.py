@@ -7616,8 +7616,14 @@ def _btc_observer_add(exchange_breakdown, price=None):
         )
 
         signed_gap = cycle_long - cycle_short
-        long_hit = signed_gap >= BTC_GAP_THRESHOLD and btc_observer_gap_state != "LONG"
-        short_hit = signed_gap <= -BTC_GAP_THRESHOLD and btc_observer_gap_state != "SHORT"
+
+        # BTC OBSERVER 13EX NORMAL GAP:
+        # Alert whenever the current fresh observer cycle reaches +/-$5M GAP.
+        # The observer resets its own LONG/SHORT totals after each valid alert,
+        # so the next alert is based on a new accumulation cycle.
+        # No rolling-60m state is used for this normal GAP trigger.
+        long_hit = signed_gap >= BTC_OBSERVER_THRESHOLD
+        short_hit = signed_gap <= -BTC_OBSERVER_THRESHOLD
 
         if long_hit or short_hit:
             if long_hit:
