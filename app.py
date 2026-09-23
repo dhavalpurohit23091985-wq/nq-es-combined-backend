@@ -1,4 +1,5 @@
 import os
+import fcntl
 import time
 import threading
 import json
@@ -229,7 +230,7 @@ XAU_ROLLING_WINDOW_SECONDS = 3600
 XAU_ROLLING_GAP_THRESHOLD = 100_000.0
 xau_coinalyze_gap_state = None
 xau_observer_gap_state = None
-XAU_NORMAL_OBSERVER_STATE_EPOCH = 2  # one-time stale-lock migration
+XAU_NORMAL_OBSERVER_STATE_EPOCH = 3  # cross-process single-direction lock migration
 xau_coinalyze_rolling_events = deque()
 xau_observer_rolling_events = deque()
 xau_coinalyze_rolling_state = None
@@ -823,6 +824,80 @@ def _combined_reset_asset(asset, reset_price=None):
         marginpad_xau_cycle_ref_price = reset_price
 
 
+
+XAU_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".xau_normal_direction"
+
+
+def _claim_xau_normal_direction(direction):
+    """Atomically claim a new XAU normal-observer direction across Gunicorn workers.
+
+    Returns True only when direction differs from the last successfully claimed
+    LONG/SHORT direction. Same-side repeats are rejected even when another
+    worker/process has stale in-memory globals.
+    """
+    direction = str(direction or "").upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    os.makedirs(os.path.dirname(XAU_NORMAL_DIRECTION_FILE), exist_ok=True)
+    lock_path = XAU_NORMAL_DIRECTION_FILE + ".lock"
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = None
+            try:
+                with open(XAU_NORMAL_DIRECTION_FILE, "r", encoding="utf-8") as f:
+                    previous = str(f.read() or "").strip().upper()
+            except FileNotFoundError:
+                previous = None
+            except Exception as exc:
+                print(f"[XAU NORMAL LOCK READ ERROR] {exc}", flush=True)
+
+            if previous == direction:
+                return False
+
+            tmp = (
+                XAU_NORMAL_DIRECTION_FILE
+                + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(direction)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, XAU_NORMAL_DIRECTION_FILE)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+
+            print(
+                f"[XAU NORMAL DIRECTION CLAIM] {previous or 'NONE'}->{direction}",
+                flush=True,
+            )
+            return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _clear_xau_normal_direction_claim():
+    """Clear only the dedicated XAU normal-observer claim during migration."""
+    lock_path = XAU_NORMAL_DIRECTION_FILE + ".lock"
+    os.makedirs(os.path.dirname(XAU_NORMAL_DIRECTION_FILE), exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                os.remove(XAU_NORMAL_DIRECTION_FILE)
+            except FileNotFoundError:
+                pass
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def add_combined_liquidation_batch(
     asset,
     source,
@@ -976,7 +1051,24 @@ def add_combined_liquidation_batch(
 
         if long_hit or short_hit:
             if asset == "XAU":
-                if long_hit:
+                _candidate_winner = "LONG" if long_hit else "SHORT"
+
+                # FINAL SAME-SIDE DEDUPE:
+                # This is authoritative across all Gunicorn workers/processes.
+                # Only a true LONG<->SHORT direction change can claim a new alert.
+                if not _claim_xau_normal_direction(_candidate_winner):
+                    xau_observer_gap_state = _candidate_winner
+                    return {
+                        "ok": True,
+                        "duplicate": True,
+                        "asset": asset,
+                        "source": source_key,
+                        "combined_long_usd": round(cycle_long, 2),
+                        "combined_short_usd": round(cycle_short, 2),
+                        "alert_sent": False,
+                        "dedupe": "same_xau_direction_cross_process",
+                    }
+                elif _candidate_winner == "LONG":
                     winner = "LONG"
                     xau_observer_gap_state = "LONG"
                     title = "XAU OBSERVER 13EX LONG WINS | 100K GAP"
@@ -984,6 +1076,7 @@ def add_combined_liquidation_batch(
                     winner = "SHORT"
                     xau_observer_gap_state = "SHORT"
                     title = "XAU OBSERVER 13EX SHORT WINS | 100K GAP"
+
             elif long_hit and short_hit:
                 winner = "BOTH HIT SAME CYCLE"
                 title = f"{asset} COMBINED BOTH HIT +{threshold/1_000_000:g}M"
@@ -3150,6 +3243,7 @@ def _load_runtime_state():
         if _saved_xau_observer_state_epoch < XAU_NORMAL_OBSERVER_STATE_EPOCH:
             xau_observer_gap_state = None
             combined_last_alert["XAU"] = None
+            _clear_xau_normal_direction_claim()
             print(
                 f"[XAU NORMAL STATE MIGRATION] epoch "
                 f"{_saved_xau_observer_state_epoch}->{XAU_NORMAL_OBSERVER_STATE_EPOCH} "
