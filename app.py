@@ -7622,8 +7622,18 @@ def _btc_observer_add(exchange_breakdown, price=None):
         # The observer resets its own LONG/SHORT totals after each valid alert,
         # so the next alert is based on a new accumulation cycle.
         # No rolling-60m state is used for this normal GAP trigger.
-        long_hit = signed_gap >= BTC_OBSERVER_THRESHOLD
-        short_hit = signed_gap <= -BTC_OBSERVER_THRESHOLD
+        # Reverse-only normal GAP trigger:
+        # one LONG alert remains active until a valid SHORT reversal,
+        # and one SHORT alert remains active until a valid LONG reversal.
+        # This prevents the same-side snapshot/cycle from alerting repeatedly.
+        long_hit = (
+            signed_gap >= BTC_OBSERVER_THRESHOLD
+            and btc_observer_gap_state != "LONG"
+        )
+        short_hit = (
+            signed_gap <= -BTC_OBSERVER_THRESHOLD
+            and btc_observer_gap_state != "SHORT"
+        )
 
         if long_hit or short_hit:
             if long_hit:
@@ -7714,6 +7724,11 @@ def _btc_observer_add(exchange_breakdown, price=None):
                 for ex in BTC_OBSERVER_EXCHANGES
             }
             btc_observer_cycle_ref_price = current_price
+
+    # Persist observer direction + reset state so a restart/reload keeps the
+    # same-side lock. This does not change the $5M GAP calculation.
+    if long_hit or short_hit:
+        _save_runtime_state()
 
     if alert_snapshot:
         breakdown = "\n".join(alert_snapshot["exchanges"])
