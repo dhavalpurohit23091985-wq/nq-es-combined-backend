@@ -229,6 +229,7 @@ XAU_ROLLING_WINDOW_SECONDS = 3600
 XAU_ROLLING_GAP_THRESHOLD = 100_000.0
 xau_coinalyze_gap_state = None
 xau_observer_gap_state = None
+XAU_NORMAL_OBSERVER_STATE_EPOCH = 2  # one-time stale-lock migration
 xau_coinalyze_rolling_events = deque()
 xau_observer_rolling_events = deque()
 xau_coinalyze_rolling_state = None
@@ -2656,6 +2657,7 @@ def _runtime_state_payload():
         'xau_gap_direction_states': {
             'coinalyze': xau_coinalyze_gap_state,
             'observer': xau_observer_gap_state,
+            'observer_state_epoch': XAU_NORMAL_OBSERVER_STATE_EPOCH,
         },
         'xau_rolling_60m': {
             'coinalyze_state': xau_coinalyze_rolling_state,
@@ -3000,6 +3002,10 @@ def _load_runtime_state():
         xgap = data.get('xau_gap_direction_states') or {}
         xau_coinalyze_gap_state = xgap.get('coinalyze') if xgap.get('coinalyze') in ('LONG','SHORT') else None
         xau_observer_gap_state = xgap.get('observer') if xgap.get('observer') in ('LONG','SHORT') else None
+        try:
+            _saved_xau_observer_state_epoch = int(xgap.get('observer_state_epoch', 0) or 0)
+        except (TypeError, ValueError):
+            _saved_xau_observer_state_epoch = 0
         xroll = data.get('xau_rolling_60m') or {}
         xau_coinalyze_rolling_state = xroll.get('coinalyze_state') if xroll.get('coinalyze_state') in ('LONG','SHORT') else None
         xau_observer_rolling_state = xroll.get('observer_state') if xroll.get('observer_state') in ('LONG','SHORT') else None
@@ -3135,6 +3141,21 @@ def _load_runtime_state():
             combined_cycle_ref_price[asset] = saved_ref.get(asset)
             combined_latest_price[asset] = saved_latest.get(asset)
             combined_last_alert[asset] = saved_last_alert.get(asset)
+
+        # One-time XAU normal-observer migration:
+        # old deployments could preserve a stale LONG/SHORT dedupe lock forever.
+        # Clear ONLY that normal XAU lock once. Totals, 13EX audit, rolling-60m,
+        # BTC and NQ state are untouched. After the first new normal XAU alert,
+        # reverse-only dedupe works normally and the epoch prevents future resets.
+        if _saved_xau_observer_state_epoch < XAU_NORMAL_OBSERVER_STATE_EPOCH:
+            xau_observer_gap_state = None
+            combined_last_alert["XAU"] = None
+            print(
+                f"[XAU NORMAL STATE MIGRATION] epoch "
+                f"{_saved_xau_observer_state_epoch}->{XAU_NORMAL_OBSERVER_STATE_EPOCH} "
+                "| cleared stale normal XAU direction lock only",
+                flush=True,
+            )
 
         direct_seen = list(comb.get('direct_seen_queue') or [])[-COMBINED_DIRECT_SEEN_MAX:]
         combined_direct_seen_queue = deque(direct_seen)
