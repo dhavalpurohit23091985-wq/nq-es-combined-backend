@@ -8141,34 +8141,39 @@ def process_marginpad_xau(
     global marginpad_xau_cycle_ref_price
     global marginpad_xau_processed_through_ms
 
+    # XAU price is display/reference data only. Do NOT block liquidation
+    # ingestion when the shared MarginPad request lock is temporarily busy.
     xau_price, price_error = get_marginpad_xau_price()
 
     if price_error:
-        return {
-            "ok": False,
-            "asset": "XAU",
-            "source": "MarginPad",
-            "alert_sent": False,
-            "error": price_error
-        }
+        with _combined_liq_lock:
+            cached_xau_price = combined_latest_price.get("XAU")
+        if cached_xau_price is not None:
+            xau_price = cached_xau_price
+            print(f"[MARGINPAD XAU PRICE FALLBACK] cached={xau_price} | error={price_error}", flush=True)
+        else:
+            xau_price = None
+            print(f"[MARGINPAD XAU PRICE SKIP] ingestion continues | error={price_error}", flush=True)
 
     closed_end_ms = (closed_minute_ts + 59) * 1000 + 999
 
     if marginpad_xau_processed_through_ms is None:
         marginpad_xau_processed_through_ms = closed_end_ms
-        marginpad_xau_cycle_ref_price = xau_price
+        if xau_price is not None:
+            marginpad_xau_cycle_ref_price = xau_price
 
         with _combined_liq_lock:
-            combined_latest_price["XAU"] = xau_price
-            if combined_cycle_ref_price["XAU"] is None:
-                combined_cycle_ref_price["XAU"] = xau_price
+            if xau_price is not None:
+                combined_latest_price["XAU"] = xau_price
+                if combined_cycle_ref_price["XAU"] is None:
+                    combined_cycle_ref_price["XAU"] = xau_price
 
         return {
             "ok": True,
             "asset": "XAU",
             "source": "MarginPad",
             "initialized": True,
-            "xau_price": round(xau_price, 2),
+            "xau_price": round(xau_price, 2) if xau_price is not None else None,
             "combined_long_usd": round(combined_liq["XAU"]["long"], 2),
             "combined_short_usd": round(combined_liq["XAU"]["short"], 2),
             "cycle_reference_price": combined_cycle_ref_price["XAU"],
@@ -8177,14 +8182,15 @@ def process_marginpad_xau(
 
     if closed_end_ms <= marginpad_xau_processed_through_ms:
         with _combined_liq_lock:
-            combined_latest_price["XAU"] = xau_price
+            if xau_price is not None:
+                combined_latest_price["XAU"] = xau_price
 
         return {
             "ok": True,
             "asset": "XAU",
             "source": "MarginPad",
             "new_closed_minute": False,
-            "xau_price": round(xau_price, 2),
+            "xau_price": round(xau_price, 2) if xau_price is not None else None,
             "combined_long_usd": round(combined_liq["XAU"]["long"], 2),
             "combined_short_usd": round(combined_liq["XAU"]["short"], 2),
             "cycle_reference_price": combined_cycle_ref_price["XAU"],
@@ -8237,7 +8243,7 @@ def process_marginpad_xau(
         "asset": "XAU",
         "source": "MarginPad",
         "initialized": False,
-        "price": round(xau_price, 2),
+        "price": round(xau_price, 2) if xau_price is not None else None,
         "events_returned": fresh["events_returned"],
         "events_accepted": fresh["events_accepted"],
         "exchanges_seen": fresh["exchanges_seen"],
