@@ -200,6 +200,9 @@ btc_observer_by_exchange = {
 
 # BTC GAP + ROLLING 60M STATE
 BTC_GAP_THRESHOLD = 5_000_000.0
+# FINAL: BTC/XAU Observer uses NORMAL cumulative GAP only.
+# Rolling 60M calculations/alerts are disabled without deleting legacy code.
+BTC_XAU_ROLLING_60M_ENABLED = False
 BTC_ROLLING_WINDOW_SECONDS = 3600
 BTC_ROLLING_GAP_THRESHOLD = 5_000_000.0
 btc_coinalyze_gap_state = None
@@ -7608,11 +7611,11 @@ def _btc_observer_add(exchange_breakdown, price=None):
             if long_hit:
                 winner = "LONG"
                 btc_observer_gap_state = "LONG"
-                title = "BTC OBSERVER LONG WINS | +5M GAP"
+                title = "BTC OBSERVER 13EX LONG WINS | +5M GAP"
             else:
                 winner = "SHORT"
                 btc_observer_gap_state = "SHORT"
-                title = "BTC OBSERVER SHORT WINS | +5M GAP"
+                title = "BTC OBSERVER 13EX SHORT WINS | +5M GAP"
 
             gap = abs(signed_gap)
             move = (
@@ -7853,8 +7856,9 @@ def process_marginpad_btc(closed_minute_ts):
     # Feed only this newly accepted MarginPad batch into the independent
     # 13-exchange observer. MarginPad's own cycle above remains unchanged.
     _btc_observer_add(fresh_by_exchange, price=btc_price)
-    for revent in fresh.get("rolling_events", []):
-        _btc_rolling_add("observer", revent.get("side"), revent.get("notional"), revent.get("ts_ms"), exchange=revent.get("exchange"), price=btc_price)
+    if BTC_XAU_ROLLING_60M_ENABLED:
+        for revent in fresh.get("rolling_events", []):
+            _btc_rolling_add("observer", revent.get("side"), revent.get("notional"), revent.get("ts_ms"), exchange=revent.get("exchange"), price=btc_price)
 
     sent = False
     if alert_snapshot:
@@ -8023,7 +8027,8 @@ def add_direct_btc_liquidation_event(exchange, side, amount, event_key, price=No
     # Event is already de-duplicated/accepted by the direct liquidator. Feed
     # the same contribution into the independent observer only once.
     _btc_observer_add_direct(exchange, side, amount, price=current_price)
-    _btc_rolling_add("observer", side, amount, event_ts, exchange=exchange, price=current_price)
+    if BTC_XAU_ROLLING_60M_ENABLED:
+        _btc_rolling_add("observer", side, amount, event_ts, exchange=exchange, price=current_price)
 
     if alert_snapshot:
         breakdown = "\n".join(alert_snapshot["exchanges"]) or "No exchange breakdown"
@@ -8147,12 +8152,13 @@ def process_marginpad_xau(
     # Advance only after a successful MarginPad fetch/parse.
     marginpad_xau_processed_through_ms = closed_end_ms
 
-    for revent in fresh.get("rolling_events", []):
-        _xau_rolling_add(
-            "observer", revent.get("side"), revent.get("notional"),
-            revent.get("ts_ms"), exchange=revent.get("exchange"), price=xau_price
-        )
-    _xau_rolling_evaluate("observer", price=xau_price)
+    if BTC_XAU_ROLLING_60M_ENABLED:
+        for revent in fresh.get("rolling_events", []):
+            _xau_rolling_add(
+                "observer", revent.get("side"), revent.get("notional"),
+                revent.get("ts_ms"), exchange=revent.get("exchange"), price=xau_price
+            )
+        _xau_rolling_evaluate("observer", price=xau_price)
 
     combined_result = add_combined_liquidation_batch(
         asset="XAU",
@@ -8805,7 +8811,7 @@ def direct_liquidation_event():
             event_key=event_key,
             price=data.get("price"),
         )
-        if not result.get("duplicate"):
+        if not result.get("duplicate") and BTC_XAU_ROLLING_60M_ENABLED:
             _xau_rolling_add(
                 "observer", side, amount, event_ts, exchange=exchange, price=data.get("price")
             )
