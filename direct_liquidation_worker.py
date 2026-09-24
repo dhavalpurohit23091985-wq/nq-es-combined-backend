@@ -7,86 +7,148 @@ from collections import deque
 import requests
 import websockets
 
+
 # ============================================================
-# DIRECT BTC + ETH + SOL + XAU LIQUIDATION WORKER
+# DIRECT BTC + XAU LIQUIDATION WORKER
 #
-# BTC direct sources:
+# Sources:
 #   Bitget + Aster + CoinEx + Lighter
 #
-# XAU direct sources:
-#   Bitget XAUUSDT when available
-#   Aster XAU/GOLD symbols from all-market forceOrder stream
-#   CoinEx ONLY if a true XAU/GOLD futures market exists
-#   Lighter XAU/GOLD market when available
-#
 # IMPORTANT:
-# - XAU and XAUT (Tether Gold) are intentionally combined into one GOLD/XAU bucket.
-# - Unsupported gold-family markets are skipped instead of guessed.
+# - ONLY BTC + XAU are processed/forwarded.
+# - XAU / XAUT / GOLD are combined into canonical XAU.
+# - No ETH.
+# - No SOL.
+# - No ALL-CRYPTO forwarding.
+# - Backend owns thresholding, alerts and cycle resets.
 # ============================================================
 
-# Combined backend owns thresholding, alerting, and cycle resets.
+
 COMBINED_BACKEND_URL = os.getenv(
     "COMBINED_BACKEND_URL",
     "https://nq-es-combined-backend.onrender.com",
 ).rstrip("/")
-DIRECT_LIQ_SECRET = os.getenv("DIRECT_LIQ_SECRET", "").strip()
-DIRECT_EVENT_URL = f"{COMBINED_BACKEND_URL}/direct-liquidation-event"
-FORWARD_RETRIES = int(os.getenv("DIRECT_FORWARD_RETRIES", "3"))
-FORWARD_TIMEOUT_SECONDS = float(os.getenv("DIRECT_FORWARD_TIMEOUT_SECONDS", "20"))
+
+DIRECT_LIQ_SECRET = os.getenv(
+    "DIRECT_LIQ_SECRET",
+    "",
+).strip()
+
+DIRECT_EVENT_URL = (
+    f"{COMBINED_BACKEND_URL}/direct-liquidation-event"
+)
+
+FORWARD_RETRIES = int(
+    os.getenv("DIRECT_FORWARD_RETRIES", "3")
+)
+
+FORWARD_TIMEOUT_SECONDS = float(
+    os.getenv("DIRECT_FORWARD_TIMEOUT_SECONDS", "20")
+)
+
+
+# ============================================================
+# EXCHANGE ENDPOINTS
+# ============================================================
 
 BITGET_WS = "wss://ws.bitget.com/v3/ws/public"
 
-# Aster all-market force liquidation stream.
-ASTER_WS = "wss://fstream.asterdex.com/ws/!forceOrder@arr"
+ASTER_WS = (
+    "wss://fstream.asterdex.com/ws/"
+    "!forceOrder@arr"
+)
 
-COINEX_LIQ_URL = "https://api.coinex.com/v2/futures/liquidation-history"
-COINEX_MARKETS_URL = "https://api.coinex.com/v2/futures/market"
+COINEX_LIQ_URL = (
+    "https://api.coinex.com/v2/"
+    "futures/liquidation-history"
+)
 
-LIGHTER_WS = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
-LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
+COINEX_MARKETS_URL = (
+    "https://api.coinex.com/v2/"
+    "futures/market"
+)
+
+LIGHTER_WS = (
+    "wss://mainnet.zklighter.elliot.ai/"
+    "stream?readonly=true"
+)
+
+LIGHTER_ORDERBOOKS_URL = (
+    "https://mainnet.zklighter.elliot.ai/"
+    "api/v1/orderBooks"
+)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 COINEX_POLL_SECONDS = 5
 COINEX_LOOKBACK_MS = 60_000
+
 SEEN_LIMIT = 40_000
 
-ASSETS = ("BTC", "ETH", "SOL", "XAU")
-EXCHANGES = ("bitget", "aster", "coinex", "lighter")
+ASSETS = (
+    "BTC",
+    "XAU",
+)
+
+EXCHANGES = (
+    "bitget",
+    "aster",
+    "coinex",
+    "lighter",
+)
+
+
+# ============================================================
+# LOCAL STATUS
+# ============================================================
 
 totals = {
-    "BTC": {"long": 0.0, "short": 0.0},
-    "ETH": {"long": 0.0, "short": 0.0},
-    "SOL": {"long": 0.0, "short": 0.0},
-    "XAU": {"long": 0.0, "short": 0.0},
+    "BTC": {
+        "long": 0.0,
+        "short": 0.0,
+    },
+    "XAU": {
+        "long": 0.0,
+        "short": 0.0,
+    },
 }
 
 by_exchange = {
     asset: {
-        ex: {"long": 0.0, "short": 0.0}
-        for ex in EXCHANGES
+        exchange: {
+            "long": 0.0,
+            "short": 0.0,
+        }
+        for exchange in EXCHANGES
     }
     for asset in ASSETS
 }
 
 lock = asyncio.Lock()
 
-seen_queue = deque(maxlen=SEEN_LIMIT)
+seen_queue = deque(
+    maxlen=SEEN_LIMIT
+)
+
 seen_set = set()
 
-coinex_markets = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "SOL": "SOLUSDT",
-    "XAU": None,
-}
-coinex_all_markets = []
+
+# CoinEx:
+# BTC is one market.
+# Gold can have XAU / XAUT / GOLD family markets.
+coinex_btc_market = "BTCUSDT"
+coinex_gold_markets = []
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def usd(x):
-    return f"${x:,.2f}"
+def usd(value):
+    return f"${value:,.2f}"
 
 
 def remember_event(key):
@@ -99,47 +161,58 @@ def remember_event(key):
 
     seen_queue.append(key)
     seen_set.add(key)
+
     return True
 
 
-def crypto_base_symbol(symbol):
-    """Normalize a futures pair to a base crypto symbol for ALL Crypto."""
-    s = str(symbol or "").upper().strip().replace("-", "").replace("_", "").replace("/", "")
-    for suffix in ("USDT", "USDC", "USD", "PERP"):
-        if s.endswith(suffix) and len(s) > len(suffix):
-            s = s[:-len(suffix)]
-            break
-    return s.strip()
+def classify_symbol(symbol):
+    """
+    ONLY BTC and gold-family symbols are accepted.
+    Everything else returns None.
+    """
+
+    s = (
+        str(symbol or "")
+        .upper()
+        .strip()
+        .replace("-", "")
+        .replace("_", "")
+        .replace("/", "")
+    )
+
+    if (
+        s == "BTC"
+        or s.startswith("BTCUSDT")
+        or s.startswith("BTCUSD")
+        or s.startswith("BTCPERP")
+    ):
+        return "BTC"
+
+    if (
+        s.startswith("XAUT")
+        or s.startswith("XAU")
+        or s.startswith("GOLD")
+    ):
+        return "XAU"
+
+    return None
 
 
-def is_all_crypto_symbol(symbol):
-    base = crypto_base_symbol(symbol)
-    if not base:
-        return False
+# ============================================================
+# BACKEND FORWARDING
+# ============================================================
 
-    # Worker-side first filter only. app.py applies the authoritative MarginPad
-    # crypto-universe whitelist before any Direct-4 amount reaches ALL Crypto.
-    # Keep obvious traditional markets from generating unnecessary HTTP traffic.
-    noncrypto = {
-        # Metals / energy / indices
-        "XAU", "XAUT", "GOLD", "XAG", "SILVER", "NQ", "ES", "SPX", "SP500",
-        "DOW", "DJI", "NDX", "NASDAQ", "WTI", "BRENT", "CL", "NG",
-        # Fiat currencies and common FX pair bases after quote stripping
-        "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
-        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD",
-        "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY",
-        # Known tokenized/traditional-equity symbols seen on multi-asset venues
-        "CRCL",
-    }
-    if base in noncrypto:
-        return False
-    return True
-
-
-def forward_direct_event(asset, exchange, side, notional_usd, event_key, *, symbol=None, ts_ms=None, price=None, verified_crypto=None):
+def forward_direct_event(
+    asset,
+    exchange,
+    side,
+    notional_usd,
+    event_key,
+):
     if not DIRECT_LIQ_SECRET:
         print(
-            "[FORWARD ERROR] DIRECT_LIQ_SECRET is missing",
+            "[FORWARD ERROR] "
+            "DIRECT_LIQ_SECRET is missing",
             flush=True,
         )
         return False
@@ -148,120 +221,133 @@ def forward_direct_event(asset, exchange, side, notional_usd, event_key, *, symb
         "asset": asset,
         "exchange": exchange,
         "side": side,
-        "notional_usd": float(notional_usd),
-        "event_key": str(event_key),
-    }
-    if symbol is not None:
-        payload["symbol"] = str(symbol)
-    if ts_ms is not None:
-        payload["ts_ms"] = ts_ms
-    if price is not None:
-        payload["price"] = price
-    if verified_crypto is not None:
-        payload["verified_crypto"] = bool(verified_crypto)
-    headers = {
-        "X-Direct-Liq-Secret": DIRECT_LIQ_SECRET,
-        "Content-Type": "application/json",
+        "notional_usd": float(
+            notional_usd
+        ),
+        "event_key": str(
+            event_key
+        ),
     }
 
-    attempts = max(1, FORWARD_RETRIES)
-    for attempt in range(1, attempts + 1):
+    headers = {
+        "X-Direct-Liq-Secret":
+            DIRECT_LIQ_SECRET,
+        "Content-Type":
+            "application/json",
+    }
+
+    attempts = max(
+        1,
+        FORWARD_RETRIES,
+    )
+
+    for attempt in range(
+        1,
+        attempts + 1,
+    ):
         try:
-            r = requests.post(
+            response = requests.post(
                 DIRECT_EVENT_URL,
                 json=payload,
                 headers=headers,
                 timeout=FORWARD_TIMEOUT_SECONDS,
             )
 
-            if r.ok:
+            if response.ok:
                 try:
-                    body = r.json()
+                    body = response.json()
                 except Exception:
                     body = {}
 
-                duplicate = bool(body.get("duplicate"))
+                duplicate = bool(
+                    body.get("duplicate")
+                )
+
                 print(
-                    f"[FORWARDED] {asset} {exchange.upper()} {side.upper()} "
-                    f"{usd(notional_usd)} | status={r.status_code}"
-                    + (" | backend_duplicate" if duplicate else ""),
+                    f"[FORWARDED] "
+                    f"{asset} "
+                    f"{exchange.upper()} "
+                    f"{side.upper()} "
+                    f"{usd(notional_usd)} | "
+                    f"status={response.status_code}"
+                    + (
+                        " | backend_duplicate"
+                        if duplicate
+                        else ""
+                    ),
                     flush=True,
                 )
+
                 return True
 
             print(
-                f"[FORWARD ERROR] {asset} {exchange.upper()} "
-                f"attempt={attempt}/{attempts} status={r.status_code} "
-                f"body={r.text[:300]}",
+                f"[FORWARD ERROR] "
+                f"{asset} "
+                f"{exchange.upper()} "
+                f"attempt={attempt}/{attempts} "
+                f"status={response.status_code} "
+                f"body={response.text[:300]}",
                 flush=True,
             )
 
-            # Authentication/validation errors will not improve with retry.
-            if 400 <= r.status_code < 500:
+            # Validation/authentication errors
+            # will not improve with retry.
+            if 400 <= response.status_code < 500:
                 return False
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"[FORWARD ERROR] {asset} {exchange.upper()} "
+                f"[FORWARD ERROR] "
+                f"{asset} "
+                f"{exchange.upper()} "
                 f"attempt={attempt}/{attempts} "
-                f"{type(e).__name__}: {e}",
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 flush=True,
             )
 
         if attempt < attempts:
-            time.sleep(min(2 ** (attempt - 1), 5))
+            time.sleep(
+                min(
+                    2 ** (attempt - 1),
+                    5,
+                )
+            )
 
     return False
 
 
-async def add_all_crypto_liquidation(symbol, exchange, side, notional_usd, event_key, *, ts_ms=None, price=None):
-    """Forward one crypto liquidation to app.py's independent ALL Crypto 13EX state."""
-    if exchange not in EXCHANGES or side not in ("long", "short"):
-        return
-    if not is_all_crypto_symbol(symbol):
-        return
-    try:
-        notional_usd = float(notional_usd)
-    except Exception:
-        return
-    if notional_usd <= 0:
-        return
-    base = crypto_base_symbol(symbol)
-    all_key = f"all|{event_key}"
-    await asyncio.to_thread(
-        forward_direct_event,
-        "ALL",
-        exchange,
-        side,
-        notional_usd,
-        all_key,
-        symbol=base,
-        ts_ms=ts_ms,
-        price=price,
-        verified_crypto=(exchange in {"bitget", "aster", "coinex", "lighter"}),
-    )
-
-
-async def add_liquidation(asset, exchange, side, notional_usd, event_key):
+async def add_liquidation(
+    asset,
+    exchange,
+    side,
+    notional_usd,
+    event_key,
+):
     if asset not in ASSETS:
         return
 
     if exchange not in EXCHANGES:
         return
 
-    if side not in ("long", "short"):
+    if side not in (
+        "long",
+        "short",
+    ):
         return
 
     try:
-        notional_usd = float(notional_usd)
+        notional_usd = float(
+            notional_usd
+        )
     except Exception:
         return
 
     if notional_usd <= 0:
         return
 
-    # Avoid local duplicate traffic. The app.py endpoint also keeps its own
-    # persistent dedupe, so HTTP retries/restarts cannot double-count.
+    # Local duplicate protection.
+    # Backend also owns persistent dedupe.
     if event_key in seen_set:
         return
 
@@ -275,49 +361,34 @@ async def add_liquidation(asset, exchange, side, notional_usd, event_key):
     )
 
     if not ok:
-        # Do not mark failed forwards as seen. Polling/stream replay can retry.
+        # Failed forwards are deliberately
+        # NOT marked seen so replay/polling
+        # can retry them.
         return
 
     if not remember_event(event_key):
         return
 
     async with lock:
-        # Local totals are STATUS ONLY (forwarded since worker start).
-        # They never trigger alerts or resets. app.py is the canonical state.
-        totals[asset][side] += notional_usd
-        by_exchange[asset][exchange][side] += notional_usd
+        totals[asset][side] += (
+            notional_usd
+        )
+
+        by_exchange[
+            asset
+        ][
+            exchange
+        ][
+            side
+        ] += notional_usd
 
         print(
-            f"[LOCAL FORWARDED TOTAL] {asset} "
+            f"[LOCAL FORWARDED TOTAL] "
+            f"{asset} "
             f"L={usd(totals[asset]['long'])} "
             f"S={usd(totals[asset]['short'])}",
             flush=True,
         )
-
-
-# ============================================================
-# SYMBOL CLASSIFICATION
-# ============================================================
-
-def classify_symbol(symbol):
-    s = str(symbol or "").upper().replace("-", "").replace("_", "")
-
-    if s == "BTCUSDT" or s.startswith("BTCUSDT"):
-        return "BTC"
-    if s == "ETHUSDT" or s.startswith("ETHUSDT"):
-        return "ETH"
-    if s == "SOLUSDT" or s.startswith("SOLUSDT"):
-        return "SOL"
-
-    # GOLD FAMILY: XAU + XAUT (Tether Gold) share the XAU observer bucket.
-    if (
-        s.startswith("XAUT")
-        or s.startswith("XAUUSDT")
-        or s.startswith("GOLDUSDT")
-    ):
-        return "XAU"
-
-    return None
 
 
 # ============================================================
@@ -327,6 +398,7 @@ def classify_symbol(symbol):
 async def bitget_heartbeat(ws):
     while True:
         await asyncio.sleep(25)
+
         try:
             await ws.send("ping")
         except Exception:
@@ -338,15 +410,20 @@ async def bitget_loop():
         "op": "subscribe",
         "args": [
             {
-                "instType": "usdt-futures",
-                "topic": "liquidation",
+                "instType":
+                    "usdt-futures",
+                "topic":
+                    "liquidation",
             }
         ],
     }
 
     while True:
         try:
-            print("[BITGET] connecting...", flush=True)
+            print(
+                "[BITGET] connecting...",
+                flush=True,
+            )
 
             async with websockets.connect(
                 BITGET_WS,
@@ -355,14 +432,21 @@ async def bitget_loop():
                 ping_interval=None,
                 max_size=4_000_000,
             ) as ws:
-                await ws.send(json.dumps(subscribe))
+
+                await ws.send(
+                    json.dumps(subscribe)
+                )
+
                 print(
-                    "[BITGET] subscribed liquidation/usdt-futures "
-                    "(ALL crypto + BTC/XAU canonical paths)",
+                    "[BITGET] subscribed "
+                    "liquidation/usdt-futures | "
+                    "processing BTC/XAU only",
                     flush=True,
                 )
 
-                hb = asyncio.create_task(bitget_heartbeat(ws))
+                hb = asyncio.create_task(
+                    bitget_heartbeat(ws)
+                )
 
                 try:
                     async for raw in ws:
@@ -374,15 +458,38 @@ async def bitget_loop():
                         except Exception:
                             continue
 
-                        for event in msg.get("data") or []:
-                            symbol = str(event.get("symbol") or "").upper()
-                            asset = classify_symbol(symbol)
+                        for event in (
+                            msg.get("data")
+                            or []
+                        ):
+                            symbol = str(
+                                event.get(
+                                    "symbol"
+                                )
+                                or ""
+                            ).upper()
 
-                            raw_side = str(event.get("side") or "").lower()
+                            asset = (
+                                classify_symbol(
+                                    symbol
+                                )
+                            )
 
-                            # Official Bitget liquidation channel:
-                            # buy  = long position liquidation
-                            # sell = short position liquidation
+                            # Ignore everything
+                            # except BTC/XAU.
+                            if asset is None:
+                                continue
+
+                            raw_side = str(
+                                event.get(
+                                    "side"
+                                )
+                                or ""
+                            ).lower()
+
+                            # Existing mapping preserved:
+                            # buy = long liquidation
+                            # sell = short liquidation
                             side = (
                                 "long"
                                 if raw_side == "buy"
@@ -394,38 +501,58 @@ async def bitget_loop():
                             if not side:
                                 continue
 
-                            # Bitget documents amount in quote coin.
-                            # BTCUSDT / XAUUSDT quote coin is USDT,
-                            # therefore amount is directly USD-like notional.
-                            amount = float(event.get("amount") or 0)
+                            try:
+                                amount = float(
+                                    event.get(
+                                        "amount"
+                                    )
+                                    or 0
+                                )
+                            except Exception:
+                                continue
 
-                            ts = str(event.get("ts") or "")
-                            price = str(event.get("price") or "")
+                            if amount <= 0:
+                                continue
+
+                            ts = str(
+                                event.get("ts")
+                                or ""
+                            )
+
+                            price = str(
+                                event.get("price")
+                                or ""
+                            )
 
                             key = (
-                                f"bitget|{asset}|{symbol}|{ts}|"
-                                f"{side}|{price}|{amount}"
+                                f"bitget|"
+                                f"{asset}|"
+                                f"{symbol}|"
+                                f"{ts}|"
+                                f"{side}|"
+                                f"{price}|"
+                                f"{amount}"
                             )
 
-                            await add_all_crypto_liquidation(
-                                symbol, "bitget", side, amount, key, ts_ms=ts, price=price
+                            await add_liquidation(
+                                asset,
+                                "bitget",
+                                side,
+                                amount,
+                                key,
                             )
-                            if asset:
-                                await add_liquidation(
-                                    asset,
-                                    "bitget",
-                                    side,
-                                    amount,
-                                    key,
-                                )
+
                 finally:
                     hb.cancel()
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"[BITGET ERROR] {type(e).__name__}: {e}",
+                f"[BITGET ERROR] "
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 flush=True,
             )
+
             await asyncio.sleep(5)
 
 
@@ -434,17 +561,14 @@ async def bitget_loop():
 # ============================================================
 
 def iter_aster_force_orders(msg):
-    """
-    Aster all-market forceOrder stream may arrive as:
-    - list of forceOrder payloads
-    - one forceOrder payload
-    - wrapper containing order 'o'
-    This helper accepts all common shapes.
-    """
     if isinstance(msg, list):
         for item in msg:
-            if isinstance(item, dict):
+            if isinstance(
+                item,
+                dict,
+            ):
                 yield item
+
         return
 
     if isinstance(msg, dict):
@@ -454,7 +578,12 @@ def iter_aster_force_orders(msg):
 async def aster_loop():
     while True:
         try:
-            print("[ASTER] connecting all-market forceOrder...", flush=True)
+            print(
+                "[ASTER] connecting "
+                "all-market forceOrder | "
+                "processing BTC/XAU only...",
+                flush=True,
+            )
 
             async with websockets.connect(
                 ASTER_WS,
@@ -464,9 +593,11 @@ async def aster_loop():
                 ping_timeout=30,
                 max_size=4_000_000,
             ) as ws:
+
                 print(
-                    "[ASTER] subscribed !forceOrder@arr "
-                    "(ALL crypto + BTC/XAU canonical paths)",
+                    "[ASTER] subscribed "
+                    "!forceOrder@arr | "
+                    "BTC/XAU filter active",
                     flush=True,
                 )
 
@@ -476,43 +607,97 @@ async def aster_loop():
                     except Exception:
                         continue
 
-                    for item in iter_aster_force_orders(msg):
-                        order = item.get("o") or item
+                    for item in (
+                        iter_aster_force_orders(
+                            msg
+                        )
+                    ):
+                        order = (
+                            item.get("o")
+                            or item
+                        )
 
-                        symbol = str(order.get("s") or "").upper()
-                        asset = classify_symbol(symbol)
+                        symbol = str(
+                            order.get("s")
+                            or ""
+                        ).upper()
 
-                        forced_side = str(order.get("S") or "").upper()
+                        asset = (
+                            classify_symbol(
+                                symbol
+                            )
+                        )
 
-                        # Forced SELL closes a long.
-                        # Forced BUY closes a short.
+                        # Ignore ETH/SOL/all others.
+                        if asset is None:
+                            continue
+
+                        forced_side = str(
+                            order.get("S")
+                            or ""
+                        ).upper()
+
+                        # Existing mapping preserved:
+                        # forced SELL closes long
+                        # forced BUY closes short
                         side = (
                             "long"
-                            if forced_side == "SELL"
+                            if forced_side
+                            == "SELL"
                             else "short"
-                            if forced_side == "BUY"
+                            if forced_side
+                            == "BUY"
                             else None
                         )
 
                         if not side:
                             continue
 
-                        avg_price = float(order.get("ap") or 0)
-                        price = (
-                            avg_price
-                            if avg_price > 0
-                            else float(order.get("p") or 0)
+                        try:
+                            avg_price = float(
+                                order.get("ap")
+                                or 0
+                            )
+
+                            price = (
+                                avg_price
+                                if avg_price > 0
+                                else float(
+                                    order.get("p")
+                                    or 0
+                                )
+                            )
+
+                            filled_qty = float(
+                                order.get("z")
+                                or 0
+                            )
+
+                            if filled_qty <= 0:
+                                filled_qty = float(
+                                    order.get("l")
+                                    or 0
+                                )
+
+                            if filled_qty <= 0:
+                                filled_qty = float(
+                                    order.get("q")
+                                    or 0
+                                )
+
+                        except Exception:
+                            continue
+
+                        if (
+                            price <= 0
+                            or filled_qty <= 0
+                        ):
+                            continue
+
+                        notional = (
+                            price
+                            * filled_qty
                         )
-
-                        filled_qty = float(order.get("z") or 0)
-
-                        if filled_qty <= 0:
-                            filled_qty = float(order.get("l") or 0)
-
-                        if filled_qty <= 0:
-                            filled_qty = float(order.get("q") or 0)
-
-                        notional = price * filled_qty
 
                         ts = str(
                             order.get("T")
@@ -521,212 +706,328 @@ async def aster_loop():
                         )
 
                         key = (
-                            f"aster|{asset}|{symbol}|{ts}|"
-                            f"{forced_side}|{price}|{filled_qty}"
+                            f"aster|"
+                            f"{asset}|"
+                            f"{symbol}|"
+                            f"{ts}|"
+                            f"{forced_side}|"
+                            f"{price}|"
+                            f"{filled_qty}"
                         )
 
-                        await add_all_crypto_liquidation(
-                            symbol, "aster", side, notional, key, ts_ms=ts, price=price
+                        await add_liquidation(
+                            asset,
+                            "aster",
+                            side,
+                            notional,
+                            key,
                         )
-                        if asset:
-                            await add_liquidation(
-                                asset,
-                                "aster",
-                                side,
-                                notional,
-                                key,
-                            )
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"[ASTER ERROR] {type(e).__name__}: {e}",
+                f"[ASTER ERROR] "
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 flush=True,
             )
+
             await asyncio.sleep(5)
 
 
 # ============================================================
-# COINEX MARKET DISCOVERY
+# COINEX DISCOVERY
 # ============================================================
 
 def discover_coinex_markets():
-    global coinex_all_markets
-    """
-    BTCUSDT is used for BTC.
+    global coinex_btc_market
+    global coinex_gold_markets
 
-    For the GOLD/XAU bucket, XAU, GOLD and XAUT futures markets are accepted.
-    """
     try:
-        r = requests.get(
+        response = requests.get(
             COINEX_MARKETS_URL,
             timeout=20,
         )
-        r.raise_for_status()
-        payload = r.json()
+
+        response.raise_for_status()
+
+        payload = response.json()
 
         if payload.get("code") != 0:
-            raise RuntimeError(payload)
+            raise RuntimeError(
+                payload
+            )
 
         btc_market = None
-        xau_market = None
-        all_markets = []
+        gold_markets = []
 
-        for item in payload.get("data") or []:
-            if not isinstance(item, dict):
+        for item in (
+            payload.get("data")
+            or []
+        ):
+            if not isinstance(
+                item,
+                dict,
+            ):
                 continue
 
-            market = str(item.get("market") or "").upper()
-            base = str(item.get("base_ccy") or "").upper()
-            quote = str(item.get("quote_ccy") or "").upper()
-            available = item.get("is_market_available")
+            market = str(
+                item.get("market")
+                or ""
+            ).upper()
+
+            base = str(
+                item.get("base_ccy")
+                or ""
+            ).upper()
+
+            quote = str(
+                item.get("quote_ccy")
+                or ""
+            ).upper()
+
+            available = item.get(
+                "is_market_available"
+            )
 
             if available is False:
                 continue
-
-            if quote == "USDT" and market:
-                all_markets.append((base or crypto_base_symbol(market), market))
 
             if market == "BTCUSDT":
                 btc_market = market
 
             if (
                 quote == "USDT"
-                and base in {"XAU", "GOLD", "XAUT"}
+                and base in {
+                    "XAU",
+                    "XAUT",
+                    "GOLD",
+                }
+                and market
             ):
-                # This legacy field is display/debug only; the main CoinEx loop
-                # scans every USDT futures market and classify_symbol() merges
-                # all XAU/XAUT/GOLD events into the canonical XAU bucket.
-                if xau_market is None:
-                    xau_market = market
+                gold_markets.append(
+                    market
+                )
 
-        coinex_markets["BTC"] = btc_market or "BTCUSDT"
-        coinex_markets["XAU"] = xau_market
-        coinex_all_markets = all_markets
+        coinex_btc_market = (
+            btc_market
+            or "BTCUSDT"
+        )
+
+        coinex_gold_markets = list(
+            dict.fromkeys(
+                gold_markets
+            )
+        )
 
         print(
-            f"[COINEX] BTC market={coinex_markets['BTC']} | "
-            f"XAU market={coinex_markets['XAU'] or 'NOT FOUND / SKIPPED'} | ALL crypto markets={len(coinex_all_markets)}",
+            "[COINEX] "
+            f"BTC={coinex_btc_market} | "
+            f"GOLD FAMILY="
+            f"{coinex_gold_markets or 'NOT FOUND / SKIPPED'}",
             flush=True,
         )
 
-    except Exception as e:
+    except Exception as exc:
         print(
-            f"[COINEX MARKET ERROR] {type(e).__name__}: {e}",
+            f"[COINEX MARKET ERROR] "
+            f"{type(exc).__name__}: "
+            f"{exc}",
             flush=True,
         )
 
 
-async def coinex_poll_market(session, asset, market):
-    now_ms = int(time.time() * 1000)
+async def coinex_poll_market(
+    session,
+    asset,
+    market,
+):
+    now_ms = int(
+        time.time() * 1000
+    )
 
     params = {
         "market": market,
-        "start_time": now_ms - COINEX_LOOKBACK_MS,
+        "start_time":
+            now_ms
+            - COINEX_LOOKBACK_MS,
         "end_time": now_ms,
         "page": 1,
         "limit": 100,
     }
 
-    r = await asyncio.to_thread(
+    response = await asyncio.to_thread(
         session.get,
         COINEX_LIQ_URL,
         params=params,
         timeout=20,
     )
 
-    r.raise_for_status()
-    payload = r.json()
+    response.raise_for_status()
+
+    payload = response.json()
 
     if payload.get("code") != 0:
         raise RuntimeError(
-            f"CoinEx {asset} response: {payload}"
+            f"CoinEx {asset} response: "
+            f"{payload}"
         )
 
-    for event in payload.get("data") or []:
-        if str(event.get("market") or "").upper() != market:
+    for event in (
+        payload.get("data")
+        or []
+    ):
+        if (
+            str(
+                event.get("market")
+                or ""
+            ).upper()
+            != market
+        ):
             continue
 
-        side = str(event.get("side") or "").lower()
+        side = str(
+            event.get("side")
+            or ""
+        ).lower()
 
-        if side not in ("long", "short"):
+        if side not in (
+            "long",
+            "short",
+        ):
             continue
 
-        price = float(event.get("liq_price") or 0)
-        amount = float(event.get("liq_amount") or 0)
+        try:
+            price = float(
+                event.get("liq_price")
+                or 0
+            )
 
-        # CoinEx linear USDT futures amount is base-asset quantity.
-        notional = price * amount
+            amount = float(
+                event.get("liq_amount")
+                or 0
+            )
 
-        ts = str(event.get("created_at") or "")
-        bkr = str(event.get("bkr_price") or "")
+        except Exception:
+            continue
+
+        if (
+            price <= 0
+            or amount <= 0
+        ):
+            continue
+
+        # Existing CoinEx calculation:
+        # notional = price * base qty
+        notional = (
+            price
+            * amount
+        )
+
+        ts = str(
+            event.get("created_at")
+            or ""
+        )
+
+        bkr = str(
+            event.get("bkr_price")
+            or ""
+        )
 
         key = (
-            f"coinex|{asset}|{market}|{ts}|{side}|"
-            f"{price}|{amount}|{bkr}"
+            f"coinex|"
+            f"{asset}|"
+            f"{market}|"
+            f"{ts}|"
+            f"{side}|"
+            f"{price}|"
+            f"{amount}|"
+            f"{bkr}"
         )
 
-        await add_all_crypto_liquidation(
-            market, "coinex", side, notional, key, ts_ms=ts, price=price
+        await add_liquidation(
+            asset,
+            "coinex",
+            side,
+            notional,
+            key,
         )
-        canonical_asset = classify_symbol(market)
-        if canonical_asset:
-            await add_liquidation(
-                canonical_asset,
-                "coinex",
-                side,
-                notional,
-                key,
-            )
 
 
 async def coinex_loop():
     session = requests.Session()
 
-    await asyncio.to_thread(discover_coinex_markets)
+    await asyncio.to_thread(
+        discover_coinex_markets
+    )
 
     refresh_counter = 0
 
     while True:
         try:
-            # CoinEx requires a market on liquidation-history, so scan every
-            # available USDT futures market. The endpoint is public and the
-            # event-key dedupe prevents overlap from the rolling lookback.
-            for base, market in list(coinex_all_markets):
-                # One unsupported/invalid CoinEx market must NOT abort the
-                # complete ALL-Crypto scan. Skip only that market and keep
-                # polling the rest of the discovered futures universe.
+            # BTC ONLY
+            if coinex_btc_market:
                 try:
                     await coinex_poll_market(
                         session,
-                        base or crypto_base_symbol(market),
-                        market,
+                        "BTC",
+                        coinex_btc_market,
                     )
-                except Exception as market_error:
+
+                except Exception as exc:
                     print(
-                        f"[COINEX MARKET SKIP] market={market} "
-                        f"{type(market_error).__name__}: {market_error}",
+                        "[COINEX MARKET SKIP] "
+                        f"BTC "
+                        f"{coinex_btc_market} | "
+                        f"{type(exc).__name__}: "
+                        f"{exc}",
                         flush=True,
                     )
-                    continue
 
-        except Exception as e:
+            # XAU/XAUT/GOLD ONLY
+            for market in list(
+                coinex_gold_markets
+            ):
+                try:
+                    await coinex_poll_market(
+                        session,
+                        "XAU",
+                        market,
+                    )
+
+                except Exception as exc:
+                    print(
+                        "[COINEX MARKET SKIP] "
+                        f"XAU {market} | "
+                        f"{type(exc).__name__}: "
+                        f"{exc}",
+                        flush=True,
+                    )
+
+        except Exception as exc:
             print(
-                f"[COINEX ERROR] {type(e).__name__}: {e}",
+                f"[COINEX ERROR] "
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 flush=True,
             )
 
         refresh_counter += 1
 
-        # Refresh the full CoinEx futures universe periodically.
+        # 720 × 5 sec ≈ 1 hour
         if refresh_counter >= 720:
             refresh_counter = 0
-            await asyncio.to_thread(discover_coinex_markets)
 
-        await asyncio.sleep(COINEX_POLL_SECONDS)
+            await asyncio.to_thread(
+                discover_coinex_markets
+            )
+
+        await asyncio.sleep(
+            COINEX_POLL_SECONDS
+        )
 
 
 # ============================================================
-# LIGHTER
+# LIGHTER HELPERS
 # ============================================================
 
 def _lighter_books(payload):
@@ -737,7 +1038,10 @@ def _lighter_books(payload):
         or []
     )
 
-    if isinstance(books, dict):
+    if isinstance(
+        books,
+        dict,
+    ):
         books = (
             books.get("order_books")
             or books.get("orderBooks")
@@ -745,76 +1049,142 @@ def _lighter_books(payload):
             or []
         )
 
-    return books if isinstance(books, list) else []
+    return (
+        books
+        if isinstance(books, list)
+        else []
+    )
 
 
-def _lighter_market_id_for_asset(payload, asset):
-    for item in _lighter_books(payload):
-        if not isinstance(item, dict):
+def _lighter_market_id_for_btc(
+    payload
+):
+    for item in _lighter_books(
+        payload
+    ):
+        if not isinstance(
+            item,
+            dict,
+        ):
             continue
 
-        symbol = str(item.get("symbol") or "").upper().strip()
         market_type = str(
-            item.get("market_type") or ""
+            item.get("market_type")
+            or ""
         ).lower().strip()
 
-        if market_type and "spot" in market_type:
+        if (
+            market_type
+            and "spot" in market_type
+        ):
             continue
 
-        if asset in ("BTC", "ETH", "SOL"):
-            matched = (
-                symbol in {
-                    asset,
-                    f"{asset}-USD",
-                    f"{asset}USD",
-                    f"{asset}-PERP",
-                }
-                or (
-                    symbol.startswith(asset)
-                    and "/" not in symbol
-                )
-            )
-        else:
-            # GOLD FAMILY: accept XAU, XAUT and GOLD markets.
-            matched = (
-                symbol.startswith("XAU")
-                or symbol.startswith("GOLD")
-            )
+        symbol = str(
+            item.get("symbol")
+            or ""
+        ).upper().strip()
 
-        if not matched:
+        compact = (
+            symbol
+            .replace("-", "")
+            .replace("_", "")
+            .replace("/", "")
+        )
+
+        if not (
+            compact == "BTC"
+            or compact.startswith(
+                "BTCUSD"
+            )
+            or compact.startswith(
+                "BTCPERP"
+            )
+        ):
             continue
 
-        market_id = item.get("market_id")
+        market_id = item.get(
+            "market_id"
+        )
 
         if market_id is None:
-            market_id = item.get("market_index")
+            market_id = item.get(
+                "market_index"
+            )
 
         if market_id is not None:
-            return int(market_id)
+            return int(
+                market_id
+            )
 
     return None
 
 
-async def lighter_get_gold_market_ids():
+async def lighter_get_btc_market_id():
     def fetch():
-        r = requests.get(
+        response = requests.get(
             LIGHTER_ORDERBOOKS_URL,
             timeout=20,
         )
-        r.raise_for_status()
-        payload = r.json()
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+        return (
+            _lighter_market_id_for_btc(
+                payload
+            )
+        )
+
+    return await asyncio.to_thread(
+        fetch
+    )
+
+
+async def lighter_get_gold_market_ids():
+    def fetch():
+        response = requests.get(
+            LIGHTER_ORDERBOOKS_URL,
+            timeout=20,
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
 
         ids = []
-        for item in _lighter_books(payload):
-            if not isinstance(item, dict):
+
+        for item in _lighter_books(
+            payload
+        ):
+            if not isinstance(
+                item,
+                dict,
+            ):
                 continue
 
-            market_type = str(item.get("market_type") or "").lower().strip()
-            if market_type and "spot" in market_type:
+            market_type = str(
+                item.get("market_type")
+                or ""
+            ).lower().strip()
+
+            if (
+                market_type
+                and "spot" in market_type
+            ):
                 continue
 
-            symbol = str(item.get("symbol") or "").upper().strip()
-            compact = symbol.replace("-", "").replace("_", "").replace("/", "")
+            symbol = str(
+                item.get("symbol")
+                or ""
+            ).upper().strip()
+
+            compact = (
+                symbol
+                .replace("-", "")
+                .replace("_", "")
+                .replace("/", "")
+            )
 
             if not (
                 compact.startswith("XAU")
@@ -823,69 +1193,69 @@ async def lighter_get_gold_market_ids():
             ):
                 continue
 
-            market_id = item.get("market_id")
+            market_id = item.get(
+                "market_id"
+            )
+
             if market_id is None:
-                market_id = item.get("market_index")
+                market_id = item.get(
+                    "market_index"
+                )
 
             if market_id is not None:
-                ids.append(int(market_id))
+                ids.append(
+                    int(market_id)
+                )
 
-        return list(dict.fromkeys(ids))
-
-    return await asyncio.to_thread(fetch)
-
-
-async def lighter_get_market_ids():
-    def fetch():
-        r = requests.get(
-            LIGHTER_ORDERBOOKS_URL,
-            timeout=20,
+        return list(
+            dict.fromkeys(ids)
         )
-        r.raise_for_status()
-        payload = r.json()
 
-        return {
-            "BTC": _lighter_market_id_for_asset(
-                payload,
-                "BTC",
-            ),
-            "XAU": _lighter_market_id_for_asset(
-                payload,
-                "XAU",
-            ),
-        }
-
-    return await asyncio.to_thread(fetch)
+    return await asyncio.to_thread(
+        fetch
+    )
 
 
 async def lighter_heartbeat(ws):
     while True:
         await asyncio.sleep(60)
+
         try:
             await ws.send(
-                json.dumps({"type": "ping"})
+                json.dumps(
+                    {"type": "ping"}
+                )
             )
+
         except Exception:
             return
 
 
-async def lighter_asset_loop(asset):
+# ============================================================
+# LIGHTER BTC
+# ============================================================
+
+async def lighter_btc_loop():
     while True:
         try:
-            ids = await lighter_get_market_ids()
-            market_id = ids.get(asset)
+            market_id = (
+                await lighter_get_btc_market_id()
+            )
 
             if market_id is None:
                 print(
-                    f"[LIGHTER] {asset} market not found; "
-                    f"skipping and rechecking later",
+                    "[LIGHTER] "
+                    "BTC market not found; "
+                    "rechecking later",
                     flush=True,
                 )
+
                 await asyncio.sleep(300)
                 continue
 
             print(
-                f"[LIGHTER] {asset} market_id={market_id}",
+                f"[LIGHTER] BTC "
+                f"market_id={market_id}",
                 flush=True,
             )
 
@@ -896,17 +1266,21 @@ async def lighter_asset_loop(asset):
                 ping_interval=None,
                 max_size=4_000_000,
             ) as ws:
+
                 await ws.send(
                     json.dumps(
                         {
-                            "type": "subscribe",
-                            "channel": f"trade/{market_id}",
+                            "type":
+                                "subscribe",
+                            "channel":
+                                f"trade/{market_id}",
                         }
                     )
                 )
 
                 print(
-                    f"[LIGHTER] {asset} subscribed "
+                    "[LIGHTER] "
+                    f"BTC subscribed "
                     f"trade/{market_id}",
                     flush=True,
                 )
@@ -918,18 +1292,28 @@ async def lighter_asset_loop(asset):
                 try:
                     async for raw in ws:
                         try:
-                            msg = json.loads(raw)
+                            msg = json.loads(
+                                raw
+                            )
                         except Exception:
                             continue
 
-                        if msg.get("type") == "pong":
+                        if (
+                            msg.get("type")
+                            == "pong"
+                        ):
                             continue
 
                         for trade in (
-                            msg.get("liquidation_trades")
+                            msg.get(
+                                "liquidation_trades"
+                            )
                             or []
                         ):
-                            if not isinstance(trade, dict):
+                            if not isinstance(
+                                trade,
+                                dict,
+                            ):
                                 continue
 
                             try:
@@ -942,99 +1326,135 @@ async def lighter_asset_loop(asset):
                             except Exception:
                                 continue
 
-                            if event_market_id != market_id:
+                            if (
+                                event_market_id
+                                != market_id
+                            ):
                                 continue
 
-                            notional = float(
-                                trade.get("usd_amount")
-                                or 0
-                            )
+                            try:
+                                notional = float(
+                                    trade.get(
+                                        "usd_amount"
+                                    )
+                                    or 0
+                                )
+                            except Exception:
+                                continue
 
                             if notional <= 0:
                                 continue
 
-                            before_raw = trade.get(
-                                "taker_position_size_before"
+                            before_raw = (
+                                trade.get(
+                                    "taker_position_size_before"
+                                )
                             )
 
                             try:
-                                before = float(before_raw)
-                            except (TypeError, ValueError):
+                                before = float(
+                                    before_raw
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                            ):
                                 before = 0.0
 
                             if before > 0:
                                 side = "long"
+
                             elif before < 0:
                                 side = "short"
+
                             else:
-                                print(
-                                    f"[LIGHTER SIDE UNRESOLVED] "
-                                    f"{asset} "
-                                    f"trade_id="
-                                    f"{trade.get('trade_id_str') or trade.get('trade_id')} "
-                                    f"usd={usd(notional)} "
-                                    f"taker_position_size_before={before_raw}",
-                                    flush=True,
-                                )
                                 continue
 
                             trade_id = str(
-                                trade.get("trade_id_str")
-                                or trade.get("trade_id")
+                                trade.get(
+                                    "trade_id_str"
+                                )
+                                or trade.get(
+                                    "trade_id"
+                                )
                                 or ""
                             )
 
                             ts = str(
-                                trade.get("timestamp")
+                                trade.get(
+                                    "timestamp"
+                                )
                                 or ""
                             )
 
                             tx_hash = str(
-                                trade.get("tx_hash")
+                                trade.get(
+                                    "tx_hash"
+                                )
                                 or ""
                             )
 
                             key = (
-                                f"lighter|{asset}|{market_id}|"
-                                f"{trade_id}|{ts}|{tx_hash}"
+                                f"lighter|BTC|"
+                                f"{market_id}|"
+                                f"{trade_id}|"
+                                f"{ts}|"
+                                f"{tx_hash}"
                             )
 
                             await add_liquidation(
-                                asset,
+                                "BTC",
                                 "lighter",
                                 side,
                                 notional,
                                 key,
                             )
+
                 finally:
                     hb.cancel()
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"[LIGHTER {asset} ERROR] "
-                f"{type(e).__name__}: {e}",
+                f"[LIGHTER BTC ERROR] "
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 flush=True,
             )
+
             await asyncio.sleep(5)
 
 
+# ============================================================
+# LIGHTER XAU / XAUT / GOLD
+# ============================================================
+
 async def lighter_gold_family_loop():
-    """Subscribe to every Lighter XAU/XAUT/GOLD market and merge into XAU."""
     while True:
         try:
-            market_ids = await lighter_get_gold_market_ids()
+            market_ids = (
+                await lighter_get_gold_market_ids()
+            )
 
             if not market_ids:
                 print(
-                    "[LIGHTER] XAU/XAUT/GOLD markets not found; rechecking later",
+                    "[LIGHTER] "
+                    "XAU/XAUT/GOLD markets "
+                    "not found; "
+                    "rechecking later",
                     flush=True,
                 )
+
                 await asyncio.sleep(300)
                 continue
 
-            market_id_set = set(market_ids)
+            market_id_set = set(
+                market_ids
+            )
+
             print(
-                f"[LIGHTER] GOLD FAMILY market_ids={market_ids}",
+                "[LIGHTER] "
+                f"GOLD FAMILY "
+                f"market_ids={market_ids}",
                 flush=True,
             )
 
@@ -1045,73 +1465,141 @@ async def lighter_gold_family_loop():
                 ping_interval=None,
                 max_size=4_000_000,
             ) as ws:
+
                 for market_id in market_ids:
                     await ws.send(
                         json.dumps(
                             {
-                                "type": "subscribe",
-                                "channel": f"trade/{market_id}",
+                                "type":
+                                    "subscribe",
+                                "channel":
+                                    f"trade/{market_id}",
                             }
                         )
                     )
 
                 print(
-                    f"[LIGHTER] GOLD FAMILY subscribed markets={market_ids}",
+                    "[LIGHTER] "
+                    "GOLD FAMILY subscribed "
+                    f"markets={market_ids}",
                     flush=True,
                 )
 
-                hb = asyncio.create_task(lighter_heartbeat(ws))
+                hb = asyncio.create_task(
+                    lighter_heartbeat(ws)
+                )
 
                 try:
                     async for raw in ws:
                         try:
-                            msg = json.loads(raw)
+                            msg = json.loads(
+                                raw
+                            )
                         except Exception:
                             continue
 
-                        if msg.get("type") == "pong":
+                        if (
+                            msg.get("type")
+                            == "pong"
+                        ):
                             continue
 
-                        for trade in (msg.get("liquidation_trades") or []):
-                            if not isinstance(trade, dict):
+                        for trade in (
+                            msg.get(
+                                "liquidation_trades"
+                            )
+                            or []
+                        ):
+                            if not isinstance(
+                                trade,
+                                dict,
+                            ):
                                 continue
 
                             try:
-                                event_market_id = int(trade.get("market_id"))
+                                event_market_id = int(
+                                    trade.get(
+                                        "market_id"
+                                    )
+                                )
                             except Exception:
                                 continue
 
-                            if event_market_id not in market_id_set:
+                            if (
+                                event_market_id
+                                not in market_id_set
+                            ):
                                 continue
 
-                            notional = float(trade.get("usd_amount") or 0)
+                            try:
+                                notional = float(
+                                    trade.get(
+                                        "usd_amount"
+                                    )
+                                    or 0
+                                )
+                            except Exception:
+                                continue
+
                             if notional <= 0:
                                 continue
 
-                            before_raw = trade.get("taker_position_size_before")
+                            before_raw = (
+                                trade.get(
+                                    "taker_position_size_before"
+                                )
+                            )
+
                             try:
-                                before = float(before_raw)
-                            except (TypeError, ValueError):
+                                before = float(
+                                    before_raw
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                            ):
                                 before = 0.0
 
                             if before > 0:
                                 side = "long"
+
                             elif before < 0:
                                 side = "short"
+
                             else:
                                 continue
 
                             trade_id = str(
-                                trade.get("trade_id_str")
-                                or trade.get("trade_id")
+                                trade.get(
+                                    "trade_id_str"
+                                )
+                                or trade.get(
+                                    "trade_id"
+                                )
                                 or ""
                             )
-                            ts = str(trade.get("timestamp") or "")
-                            tx_hash = str(trade.get("tx_hash") or "")
+
+                            ts = str(
+                                trade.get(
+                                    "timestamp"
+                                )
+                                or ""
+                            )
+
+                            tx_hash = str(
+                                trade.get(
+                                    "tx_hash"
+                                )
+                                or ""
+                            )
 
                             key = (
-                                f"lighter|XAU_GOLD_FAMILY|{event_market_id}|"
-                                f"{trade_id}|{ts}|{tx_hash}"
+                                f"lighter|"
+                                f"XAU_GOLD_FAMILY|"
+                                f"{event_market_id}|"
+                                f"{trade_id}|"
+                                f"{ts}|"
+                                f"{tx_hash}"
                             )
 
                             await add_liquidation(
@@ -1121,104 +1609,18 @@ async def lighter_gold_family_loop():
                                 notional,
                                 key,
                             )
+
                 finally:
                     hb.cancel()
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"[LIGHTER GOLD FAMILY ERROR] {type(e).__name__}: {e}",
+                "[LIGHTER GOLD FAMILY ERROR] "
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 flush=True,
             )
-            await asyncio.sleep(5)
 
-
-async def lighter_get_all_crypto_markets():
-    def fetch():
-        r = requests.get(LIGHTER_ORDERBOOKS_URL, timeout=20)
-        r.raise_for_status()
-        payload = r.json()
-        result = {}
-        for item in _lighter_books(payload):
-            if not isinstance(item, dict):
-                continue
-            market_type = str(item.get("market_type") or "").lower().strip()
-            if market_type and "spot" in market_type:
-                continue
-            symbol = str(item.get("symbol") or "").upper().strip()
-            if not is_all_crypto_symbol(symbol):
-                continue
-            market_id = item.get("market_id")
-            if market_id is None:
-                market_id = item.get("market_index")
-            if market_id is None:
-                continue
-            result[int(market_id)] = crypto_base_symbol(symbol)
-        return result
-    return await asyncio.to_thread(fetch)
-
-
-async def lighter_all_crypto_loop():
-    while True:
-        try:
-            market_map = await lighter_get_all_crypto_markets()
-            if not market_map:
-                print("[LIGHTER ALL] no crypto markets found; rechecking", flush=True)
-                await asyncio.sleep(300)
-                continue
-            print(f"[LIGHTER ALL] crypto markets={len(market_map)}", flush=True)
-            async with websockets.connect(
-                LIGHTER_WS,
-                open_timeout=20,
-                close_timeout=10,
-                ping_interval=None,
-                max_size=8_000_000,
-            ) as ws:
-                for market_id in market_map:
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"trade/{market_id}"}))
-                    await asyncio.sleep(0.02)
-                hb = asyncio.create_task(lighter_heartbeat(ws))
-                try:
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-                        if msg.get("type") == "pong":
-                            continue
-                        for trade in (msg.get("liquidation_trades") or []):
-                            if not isinstance(trade, dict):
-                                continue
-                            try:
-                                market_id = int(trade.get("market_id"))
-                            except Exception:
-                                continue
-                            symbol = market_map.get(market_id)
-                            if not symbol:
-                                continue
-                            try:
-                                notional = float(trade.get("usd_amount") or 0)
-                            except Exception:
-                                continue
-                            if notional <= 0:
-                                continue
-                            try:
-                                before = float(trade.get("taker_position_size_before") or 0)
-                            except Exception:
-                                before = 0.0
-                            side = "long" if before > 0 else "short" if before < 0 else None
-                            if not side:
-                                continue
-                            trade_id = str(trade.get("trade_id_str") or trade.get("trade_id") or "")
-                            ts = str(trade.get("timestamp") or "")
-                            tx_hash = str(trade.get("tx_hash") or "")
-                            key = f"lighter|ALL|{market_id}|{trade_id}|{ts}|{tx_hash}"
-                            await add_all_crypto_liquidation(
-                                symbol, "lighter", side, notional, key, ts_ms=ts
-                            )
-                finally:
-                    hb.cancel()
-        except Exception as e:
-            print(f"[LIGHTER ALL ERROR] {type(e).__name__}: {e}", flush=True)
             await asyncio.sleep(5)
 
 
@@ -1233,21 +1635,33 @@ async def status_loop():
         async with lock:
             for asset in ASSETS:
                 print(
-                    f"[STATUS] {asset} FORWARDED-SINCE-START "
-                    f"LONG={usd(totals[asset]['long'])} "
-                    f"SHORT={usd(totals[asset]['short'])} | "
+                    f"[STATUS] "
+                    f"{asset} "
+                    f"FORWARDED-SINCE-START "
+                    f"LONG="
+                    f"{usd(totals[asset]['long'])} "
+                    f"SHORT="
+                    f"{usd(totals[asset]['short'])} | "
                     f"Bitget("
-                    f"L={usd(by_exchange[asset]['bitget']['long'])},"
-                    f"S={usd(by_exchange[asset]['bitget']['short'])}) "
+                    f"L="
+                    f"{usd(by_exchange[asset]['bitget']['long'])},"
+                    f"S="
+                    f"{usd(by_exchange[asset]['bitget']['short'])}) "
                     f"Aster("
-                    f"L={usd(by_exchange[asset]['aster']['long'])},"
-                    f"S={usd(by_exchange[asset]['aster']['short'])}) "
+                    f"L="
+                    f"{usd(by_exchange[asset]['aster']['long'])},"
+                    f"S="
+                    f"{usd(by_exchange[asset]['aster']['short'])}) "
                     f"CoinEx("
-                    f"L={usd(by_exchange[asset]['coinex']['long'])},"
-                    f"S={usd(by_exchange[asset]['coinex']['short'])}) "
+                    f"L="
+                    f"{usd(by_exchange[asset]['coinex']['long'])},"
+                    f"S="
+                    f"{usd(by_exchange[asset]['coinex']['short'])}) "
                     f"Lighter("
-                    f"L={usd(by_exchange[asset]['lighter']['long'])},"
-                    f"S={usd(by_exchange[asset]['lighter']['short'])})",
+                    f"L="
+                    f"{usd(by_exchange[asset]['lighter']['long'])},"
+                    f"S="
+                    f"{usd(by_exchange[asset]['lighter']['short'])})",
                     flush=True,
                 )
 
@@ -1258,30 +1672,47 @@ async def status_loop():
 
 async def main():
     print(
-        "DIRECT BTC + ETH + SOL + XAU + ALL CRYPTO LIQUIDATION WORKER STARTING",
+        "DIRECT BTC + XAU "
+        "LIQUIDATION WORKER STARTING",
         flush=True,
     )
 
     print(
-        f"Combined backend: {DIRECT_EVENT_URL}",
-        flush=True,
-    )
-    print(
-        "Thresholds/alerts/resets are owned by app.py combined accumulator",
+        f"Combined backend: "
+        f"{DIRECT_EVENT_URL}",
         flush=True,
     )
 
     print(
-        "BTC/ETH/SOL Sources: Bitget + Aster + CoinEx + Lighter",
+        "MODE: BTC + XAU ONLY",
         flush=True,
     )
 
     print(
-        "XAU Sources: exchange-by-exchange auto-detect; unsupported markets skipped",
+        "Sources: "
+        "Bitget + Aster + "
+        "CoinEx + Lighter",
         flush=True,
     )
+
     print(
-        "ALL Crypto Direct Sources: Bitget + Aster + CoinEx + Lighter",
+        "XAU family: "
+        "XAU + XAUT + GOLD "
+        "-> canonical XAU",
+        flush=True,
+    )
+
+    print(
+        "ETH: OFF | "
+        "SOL: OFF | "
+        "ALL CRYPTO: OFF",
+        flush=True,
+    )
+
+    print(
+        "Thresholds/alerts/resets "
+        "remain owned by app.py "
+        "combined accumulator",
         flush=True,
     )
 
@@ -1289,11 +1720,8 @@ async def main():
         bitget_loop(),
         aster_loop(),
         coinex_loop(),
-        lighter_asset_loop("BTC"),
-        lighter_asset_loop("ETH"),
-        lighter_asset_loop("SOL"),
+        lighter_btc_loop(),
         lighter_gold_family_loop(),
-        lighter_all_crypto_loop(),
         status_loop(),
     )
 
