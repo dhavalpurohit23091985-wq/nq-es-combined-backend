@@ -1,3 +1,4 @@
+# CLEANED RUNTIME: BTC + XAU direct intake only; ALL-CRYPTO poller OFF; ETH/SOL processing OFF; MT5 publication OFF.
 import os
 import fcntl
 import time
@@ -1125,7 +1126,7 @@ def add_combined_liquidation_batch(
 
             # Publish a read-only MT5 demo bridge signal from the same canonical
             # combined threshold event. BOTH remains alert-only.
-            _publish_mt5_live_signal(alert_snapshot)
+            # MT5 publication removed from cleaned runtime
 
             if asset == "BTC":
                 marginpad_btc_last_alert_snapshot = {
@@ -8027,7 +8028,7 @@ def process_marginpad_btc(closed_minute_ts):
 
             # MarginPad BTC is the standalone execution source. The 4-exchange
             # BTC liquidator below is observation/alert only and cannot publish MT5.
-            _publish_mt5_live_signal(alert_snapshot)
+            # MT5 publication removed from cleaned runtime
 
             marginpad_btc_long_cumulative = 0.0
             marginpad_btc_short_cumulative = 0.0
@@ -8926,7 +8927,7 @@ def direct_liquidation_event():
     side = str(data.get("side", "")).lower().strip()
     event_key = str(data.get("event_key") or data.get("event_id") or "").strip()
 
-    if asset not in ("BTC", "ETH", "SOL", "XAU", "ALL"):
+    if asset not in ("BTC", "XAU"):
         return jsonify({"ok": False, "error": "invalid_asset"}), 400
 
     if exchange not in COMBINED_DIRECT_EXCHANGES:
@@ -8946,54 +8947,19 @@ def direct_liquidation_event():
     if amount <= 0:
         return jsonify({"ok": False, "error": "invalid_notional"}), 400
 
-    if asset == "ALL":
-        symbol = str(data.get("symbol", "")).upper().strip()
-        if not symbol:
-            return jsonify({"ok": False, "error": "missing_symbol"}), 400
-        result = add_all_crypto_direct_event(
-            exchange=exchange,
-            symbol=symbol,
-            side=side,
-            amount=amount,
-            event_key=event_key,
-            event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
-            verified_crypto=bool(data.get("verified_crypto", False)),
-        )
-    elif asset == "BTC":
+    if asset == "BTC":
         result = add_direct_btc_liquidation_event(
-            exchange=exchange,
-            side=side,
-            amount=amount,
-            event_key=event_key,
+            exchange=exchange, side=side, amount=amount, event_key=event_key,
             price=data.get("price"),
             event_ts=(data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp")),
         )
-    elif asset in ("ETH", "SOL"):
-        event_ts = (data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp"))
-        _st = alt_rolling[asset]
-        if event_key in _st["direct_seen_set"]:
-            result = {"ok": True, "duplicate": True, "asset": asset, "source": "direct", "exchange": exchange, "rolling_observer": True}
-        else:
-            _st["direct_seen_set"].add(event_key); _st["direct_seen_queue"].append(event_key)
-            while len(_st["direct_seen_queue"]) > COMBINED_DIRECT_SEEN_MAX:
-                _st["direct_seen_set"].discard(_st["direct_seen_queue"].popleft())
-            _alt_add(asset, "observer", side, amount, event_ts, exchange=exchange, price=data.get("price"))
-            result = {"ok": True, "duplicate": False, "asset": asset, "source": "direct", "exchange": exchange, "rolling_observer": True}
     else:
-        event_ts = (data.get("ts_ms") or data.get("timestamp_ms") or data.get("ts") or data.get("timestamp"))
         result = add_combined_liquidation_batch(
-            asset=asset,
-            source="direct",
-            exchange=exchange,
+            asset="XAU", source="direct", exchange=exchange,
             long_usd=amount if side == "long" else 0.0,
             short_usd=amount if side == "short" else 0.0,
-            event_key=event_key,
-            price=data.get("price"),
+            event_key=event_key, price=data.get("price"),
         )
-        if not result.get("duplicate"):
-            _xau_rolling_add(
-                "observer", side, amount, event_ts, exchange=exchange, price=data.get("price")
-            )
 
     return jsonify(result), 200
 
@@ -9140,9 +9106,6 @@ def marginpad_btc_minute_alert():
             )
         )
 
-        eth_result = process_alt_marginpad("ETH", closed_minute_ts)
-        sol_result = process_alt_marginpad("SOL", closed_minute_ts)
-
         if not btc_result.get(
             "ok",
             False
@@ -9169,9 +9132,7 @@ def marginpad_btc_minute_alert():
             "closed_minute_ts":
                 closed_minute_ts,
 
-            "marginpad_btc": btc_result,
-            "marginpad_eth": eth_result,
-            "marginpad_sol": sol_result
+            "marginpad_btc": btc_result
         }), 200
 
     except Exception as e:
