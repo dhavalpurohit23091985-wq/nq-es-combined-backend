@@ -4385,6 +4385,60 @@ def _nq_long_pushover_parts(title, message):
     ]
 
 
+
+# ==================================================
+# NIFTY / BANKNIFTY LONG PUSHOVER SPLITTER
+# ==================================================
+# Display-only: split long NIFTY/BANKNIFTY TradingView payloads into exactly
+# TWO Pushover messages. Calculation, threshold, state and Pine logic untouched.
+def _india_weighted_pushover_parts(title, message):
+    title_text = str(title or "")
+    message_text = str(message or "")
+    title_u = title_text.upper()
+
+    is_nifty = "NIFTY 10-STOCK" in title_u and "NIFTY WEIGHTED" in title_u
+    is_banknifty = "BANKNIFTY TOP-5" in title_u and "WEIGHTED" in title_u
+
+    if not (is_nifty or is_banknifty) or len(message_text) <= 950:
+        return [(title_text, message_text)]
+
+    # TradingView audit is pipe-delimited. Turn each field into a line so the
+    # split happens only at a clean audit-field boundary.
+    normalized = message_text.replace("\r", "").replace("\n", " | ")
+    fields = [field.strip() for field in normalized.split("|") if field.strip()]
+
+    best = None
+    for cut in range(1, len(fields)):
+        p1 = " | ".join(fields[:cut]).strip()
+        p2 = " | ".join(fields[cut:]).strip()
+        if len(p1) <= 950 and len(p2) <= 950:
+            score = abs(len(p1) - len(p2))
+            if best is None or score < best[0]:
+                best = (score, p1, p2)
+
+    if best is None:
+        # Defensive fallback: keep two parts and prefer a pipe boundary nearest
+        # the middle. This should not be needed for the current NIFTY/BANKNIFTY
+        # payload sizes.
+        midpoint = len(normalized) // 2
+        left = normalized.rfind(" | ", 0, midpoint + 1)
+        right = normalized.find(" | ", midpoint)
+        if left > 0:
+            cut = left
+        elif right != -1:
+            cut = right
+        else:
+            cut = midpoint
+        part1 = normalized[:cut].strip()
+        part2 = normalized[cut:].strip()
+    else:
+        _, part1, part2 = best
+
+    return [
+        (f"{title_text} | PART 1/2", part1),
+        (f"{title_text} | PART 2/2", part2),
+    ]
+
 # ==================================================
 # TRADINGVIEW WEBHOOK
 # ==================================================
@@ -4451,6 +4505,14 @@ def webhook():
         # generic two-part display splitter so the full alert reaches Pushover.
         if len(pushover_parts) == 1:
             pushover_parts = _nq_long_pushover_parts(
+                tv_title,
+                tv_message
+            )
+
+        # NIFTY 10-stock and BANKNIFTY top-5 can also exceed Pushover's
+        # single-message limit. Split only their display payload into 2 parts.
+        if len(pushover_parts) == 1:
+            pushover_parts = _india_weighted_pushover_parts(
                 tv_title,
                 tv_message
             )
