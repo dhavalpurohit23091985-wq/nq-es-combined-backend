@@ -2427,6 +2427,9 @@ def process_alt_marginpad(asset,closed_minute_ts):
 RUNTIME_STATE_FILE = os.path.join('/var/data', 'backend_runtime_state.json')
 
 XAU_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".xau_normal_direction"
+# Cross-process authoritative direction lock for BTC Observer 13EX normal GAP.
+# Prevents stale Gunicorn workers/restarts from re-sending the same LONG/SHORT trend.
+BTC_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".btc_normal_direction"
 
 # Persistent authoritative sequence for NASDAQ QQQ WEIGHTED LAST-4 alerts.
 # Pine may restart/recreate and reset its local TRIGGER #, but this disk-backed
@@ -2703,6 +2706,80 @@ def _nq_persistent_trigger_number(title, message):
                 flush=True,
             )
             return rewritten, serial, duplicate
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _claim_btc_normal_direction(direction):
+    """Atomically claim a new BTC normal-observer direction across Gunicorn workers.
+
+    True only for a real LONG<->SHORT change. Same-side repeats are rejected even
+    if a worker has stale in-memory btc_observer_gap_state.
+    """
+    direction = str(direction or "").upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        return False
+
+    os.makedirs(os.path.dirname(BTC_NORMAL_DIRECTION_FILE), exist_ok=True)
+    lock_path = BTC_NORMAL_DIRECTION_FILE + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = None
+            try:
+                with open(BTC_NORMAL_DIRECTION_FILE, "r", encoding="utf-8") as f:
+                    previous = str(f.read() or "").strip().upper()
+            except FileNotFoundError:
+                previous = None
+            except Exception as exc:
+                print(f"[BTC NORMAL LOCK READ ERROR] {exc}", flush=True)
+
+            if previous == direction:
+                return False
+
+            tmp = BTC_NORMAL_DIRECTION_FILE + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(direction)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, BTC_NORMAL_DIRECTION_FILE)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+
+            print(f"[BTC NORMAL DIRECTION CLAIM] {previous or 'NONE'}->{direction}", flush=True)
+            return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _seed_btc_normal_direction_if_missing(direction):
+    """One-time migration seed from restored runtime state; never overwrites disk lock."""
+    direction = str(direction or "").upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        return
+    os.makedirs(os.path.dirname(BTC_NORMAL_DIRECTION_FILE), exist_ok=True)
+    lock_path = BTC_NORMAL_DIRECTION_FILE + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            existing = None
+            try:
+                with open(BTC_NORMAL_DIRECTION_FILE, "r", encoding="utf-8") as f:
+                    existing = str(f.read() or "").strip().upper()
+            except FileNotFoundError:
+                pass
+            if existing in ("LONG", "SHORT"):
+                return
+            tmp = BTC_NORMAL_DIRECTION_FILE + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(direction); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, BTC_NORMAL_DIRECTION_FILE)
+            print(f"[BTC NORMAL DIRECTION SEED] {direction}", flush=True)
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -3448,6 +3525,8 @@ def _load_runtime_state():
 
 
 _runtime_state_restored = _load_runtime_state()
+if _runtime_state_restored and btc_observer_gap_state in ("LONG", "SHORT"):
+    _seed_btc_normal_direction_if_missing(btc_observer_gap_state)
 
 
 @app.after_request
@@ -7576,14 +7655,24 @@ def _btc_observer_add(exchange_breakdown, price=None):
         )
 
         if long_hit or short_hit:
-            if long_hit:
-                winner = "LONG"
-                btc_observer_gap_state = "LONG"
-                title = "BTC OBSERVER 13EX LONG WINS | +5M GAP"
-            else:
-                winner = "SHORT"
-                btc_observer_gap_state = "SHORT"
-                title = "BTC OBSERVER 13EX SHORT WINS | +5M GAP"
+            winner = "LONG" if long_hit else "SHORT"
+
+            # FINAL SAME-SIDE DEDUPE: disk-backed + flock, authoritative across
+            # every Gunicorn worker. Only a true LONG<->SHORT reversal may alert.
+            if not _claim_btc_normal_direction(winner):
+                btc_observer_gap_state = winner
+                print(
+                    f"[BTC OBSERVER SAME-DIRECTION BLOCKED] {winner} "
+                    f"L=${_usd_m(cycle_long)} S=${_usd_m(cycle_short)}",
+                    flush=True,
+                )
+                # IMPORTANT: no cycle reset here. Same-trend accumulation stays
+                # intact until the opposite GAP reaches $5M and truly reverses.
+                _save_runtime_state()
+                return None
+
+            btc_observer_gap_state = winner
+            title = f"BTC OBSERVER 13EX {winner} WINS | +5M GAP"
 
             gap = abs(signed_gap)
             move = (
