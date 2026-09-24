@@ -2435,6 +2435,146 @@ XAU_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".xau_normal_direction"
 NQ_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".nq_trigger_serial.json"
 
 
+# Persistent authoritative sequences for Indian weighted LAST-4 alerts.
+# NIFTY and BANKNIFTY are independent and start a fresh backend cycle at
+# 09:15 IST each trading day. Pine calculations and Pine state are untouched.
+NIFTY_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".nifty_trigger_serial.json"
+BANKNIFTY_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".banknifty_trigger_serial.json"
+
+
+def _india_persistent_trigger_number(title, message):
+    title_text = str(title or "")
+    message_text = str(message or "")
+    title_u = title_text.upper()
+    message_u = message_text.upper()
+
+    is_nifty = (
+        "NIFTY 10-STOCK" in title_u
+        and "NIFTY WEIGHTED" in title_u
+        and ("LAST-4" in title_u or "LAST-4" in message_u)
+    )
+    is_banknifty = (
+        "BANKNIFTY TOP-5" in title_u
+        and "WEIGHTED" in title_u
+        and ("LAST-4" in title_u or "LAST-4" in message_u)
+    )
+
+    if is_banknifty:
+        asset = "BANKNIFTY"
+        serial_file = BANKNIFTY_TRIGGER_SERIAL_FILE
+    elif is_nifty:
+        asset = "NIFTY"
+        serial_file = NIFTY_TRIGGER_SERIAL_FILE
+    else:
+        return message_text, None, False
+
+    match = re.search(r"(?i)\bTRIGGER\s*#\s*(\d+)", message_text)
+    incoming_serial = int(match.group(1)) if match else None
+
+    # Ignore Pine's local serial when identifying an exact resend/retry.
+    fingerprint_message = re.sub(
+        r"(?i)\bTRIGGER\s*#\s*\d+",
+        "TRIGGER #",
+        message_text,
+        count=1,
+    )
+    fingerprint = title_text + "\n" + fingerprint_message
+
+    # Daily Indian-market backend cycle boundary: 09:15 IST.
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    boundary = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now_ist < boundary:
+        boundary -= timedelta(days=1)
+    reset_cycle = boundary.strftime("%Y-%m-%dT%H:%M%z")
+
+    os.makedirs(os.path.dirname(serial_file), exist_ok=True)
+    lock_path = serial_file + ".lock"
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            saved = {}
+            try:
+                with open(serial_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        saved = loaded
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                print(f"[{asset} TRIGGER DISK READ ERROR] {exc}", flush=True)
+
+            saved_cycle = str(saved.get("reset_cycle") or "")
+            daily_reset = bool(saved_cycle and saved_cycle != reset_cycle)
+
+            try:
+                previous_serial = max(0, int(saved.get("serial", 0) or 0))
+            except (TypeError, ValueError):
+                previous_serial = 0
+            previous_fingerprint = str(saved.get("last_fingerprint") or "")
+
+            if daily_reset:
+                previous_serial = 0
+                previous_fingerprint = ""
+                print(f"[{asset} TRIGGER DAILY RESET] cycle={reset_cycle}", flush=True)
+
+            duplicate = bool(
+                previous_fingerprint and previous_fingerprint == fingerprint
+            )
+            if duplicate:
+                serial = previous_serial
+            elif previous_serial <= 0:
+                # On a brand-new disk file, preserve today's Pine serial if present.
+                # After a detected 09:15 cycle change, start the new day at #1.
+                if daily_reset:
+                    serial = 1
+                else:
+                    serial = incoming_serial if incoming_serial and incoming_serial > 0 else 1
+            else:
+                serial = previous_serial + 1
+
+            if not duplicate:
+                payload = {
+                    "asset": asset,
+                    "serial": serial,
+                    "last_fingerprint": fingerprint,
+                    "reset_cycle": reset_cycle,
+                    "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                tmp = serial_file + f".{os.getpid()}.{threading.get_ident()}.tmp"
+                try:
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, serial_file)
+                finally:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+
+            if match:
+                rewritten = (
+                    message_text[:match.start()]
+                    + f"TRIGGER #{serial}"
+                    + message_text[match.end():]
+                )
+            else:
+                rewritten = f"TRIGGER #{serial} | {message_text}"
+
+            print(
+                f"[{asset} PERSISTENT TRIGGER] #{serial} "
+                f"| pine={incoming_serial if incoming_serial is not None else 'NA'} "
+                f"| duplicate={duplicate} | cycle={reset_cycle}",
+                flush=True,
+            )
+            return rewritten, serial, duplicate
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _nq_persistent_trigger_number(title, message):
     title_text = str(title or "")
     message_text = str(message or "")
@@ -4636,6 +4776,14 @@ def webhook():
         # threshold, base-selection or BUY/SELL logic is changed.
         tv_message, nq_persistent_trigger, nq_trigger_duplicate = (
             _nq_persistent_trigger_number(tv_title, tv_message)
+        )
+
+
+        # For NIFTY/BANKNIFTY weighted LAST-4 only, replace Pine's local
+        # TRIGGER # with a separate disk-backed daily sequence. The cycle
+        # boundary is 09:15 IST. Strategy calculations/state remain untouched.
+        tv_message, india_persistent_trigger, india_trigger_duplicate = (
+            _india_persistent_trigger_number(tv_title, tv_message)
         )
 
         # Keep normal TradingView alerts unchanged. For the QQQ-weighted
