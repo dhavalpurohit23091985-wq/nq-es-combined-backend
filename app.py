@@ -7299,14 +7299,11 @@ def _all_crypto_poller_loop():
 
 
 def _start_all_crypto_poller_once():
+    """ALL-CRYPTO MarginPad poller permanently disabled. BTC/XAU use their dedicated observers only."""
     global _all_crypto_poller_started
-    enabled = str(os.environ.get("ALL_CRYPTO_POLLER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
-    if not enabled or _all_crypto_poller_started:
-        return False
-    _all_crypto_poller_started = True
-    thread = threading.Thread(target=_all_crypto_poller_loop, name="all-crypto-marginpad-poller", daemon=True)
-    thread.start()
-    return True
+    _all_crypto_poller_started = False
+    print("[ALL CRYPTO POLLER] OFF | BTC + XAU ONLY", flush=True)
+    return False
 
 
 def _xau_rolling_trim(events, now_ts):
