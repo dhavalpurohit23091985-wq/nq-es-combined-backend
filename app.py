@@ -564,15 +564,41 @@ def send_pushover(title, message):
         and "100K GAP" in title_upper
     )
 
+    nifty_last4 = (
+        "NIFTY 10-STOCK" in title_upper
+        and (
+            "NIFTY WEIGHTED" in title_upper
+            or "NIFTY WEIGHTED" in message_upper
+        )
+        and (
+            "LAST-4" in title_upper
+            or "LAST-4" in message_upper
+        )
+    )
+
+    banknifty_last4 = (
+        "BANKNIFTY TOP-5" in title_upper
+        and (
+            "WEIGHTED" in title_upper
+            or "WEIGHTED" in message_upper
+        )
+        and (
+            "LAST-4" in title_upper
+            or "LAST-4" in message_upper
+        )
+    )
+
     allowed = (
         latest_qqq_last4
+        or nifty_last4
+        or banknifty_last4
         or btc_observer_13ex_normal
         or xau_observer_13ex_normal
     )
 
     if not allowed:
         print(
-            f"[PUSHOVER SILENT - NQ + BTC13EX + XAU13EX ONLY] {title}",
+            f"[PUSHOVER SILENT - NQ + NIFTY + BANKNIFTY + BTC13EX + XAU13EX ONLY] {title}",
             flush=True,
         )
         return False
