@@ -972,31 +972,17 @@ def add_combined_liquidation_batch(
         if asset == "XAU":
             signed_gap = cycle_long - cycle_short
 
-            # XAU 13EX NORMAL GAP: alert only on a true direction flip.
-            # Use BOTH the dedicated direction state and the persisted last-alert
-            # winner as a restart/reload-safe dedup guard. This prevents the same
-            # LONG (or SHORT) from being re-sent on every ~5 minute accumulation
-            # cycle if one state field is temporarily restored as None.
-            _xau_last_winner = None
-            _xau_last_alert = combined_last_alert.get("XAU")
-            if isinstance(_xau_last_alert, dict):
-                _candidate = str(_xau_last_alert.get("winner") or "").upper().strip()
-                if _candidate in ("LONG", "SHORT"):
-                    _xau_last_winner = _candidate
-
-            _xau_effective_state = (
-                xau_observer_gap_state
-                if xau_observer_gap_state in ("LONG", "SHORT")
-                else _xau_last_winner
-            )
-
+            # XAU 13EX NORMAL GAP — same reverse-only setup as BTC Observer.
+            # Threshold differs only: BTC=$5M, XAU=$100K.
+            # Same direction never alerts and never resets.
+            # Only a valid opposite +/-$100K GAP can alert and reset the cycle.
             long_hit = (
                 signed_gap >= XAU_GAP_THRESHOLD
-                and _xau_effective_state != "LONG"
+                and xau_observer_gap_state != "LONG"
             )
             short_hit = (
                 signed_gap <= -XAU_GAP_THRESHOLD
-                and _xau_effective_state != "SHORT"
+                and xau_observer_gap_state != "SHORT"
             )
         else:
             # Legacy combined BTC cycle stays available for background/MT5 state,
