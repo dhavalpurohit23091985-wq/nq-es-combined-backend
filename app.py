@@ -2481,11 +2481,39 @@ def _nq_persistent_trigger_number(title, message):
             except Exception as exc:
                 print(f"[NQ TRIGGER DISK READ ERROR] {exc}", flush=True)
 
+            # Weekly NQ trigger cycle (IST):
+            #   Saturday 02:30 -> reset
+            #   Monday 05:30 -> first valid alert starts again at TRIGGER #1.
+            # The LAST-4 Pine calculation itself is untouched; this is only the
+            # persistent backend display/sequence number.
+            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+            days_since_saturday = (now_ist.weekday() - 5) % 7
+            reset_date = (now_ist - timedelta(days=days_since_saturday)).date()
+            reset_ist = datetime.combine(
+                reset_date,
+                datetime.min.time(),
+                tzinfo=ZoneInfo("Asia/Kolkata"),
+            ).replace(hour=2, minute=30)
+            if now_ist < reset_ist:
+                reset_ist -= timedelta(days=7)
+            reset_cycle = reset_ist.strftime("%Y-%m-%dT%H:%M%z")
+
+            saved_cycle = str(saved.get("reset_cycle") or "")
+            weekly_reset = bool(saved_cycle and saved_cycle != reset_cycle)
+
             try:
                 previous_serial = max(0, int(saved.get("serial", 0) or 0))
             except (TypeError, ValueError):
                 previous_serial = 0
             previous_fingerprint = str(saved.get("last_fingerprint") or "")
+
+            if weekly_reset:
+                previous_serial = 0
+                previous_fingerprint = ""
+                print(
+                    f"[NQ TRIGGER WEEKLY RESET] cycle={reset_cycle}",
+                    flush=True,
+                )
 
             duplicate = bool(previous_fingerprint and previous_fingerprint == fingerprint)
             if duplicate:
@@ -2499,6 +2527,7 @@ def _nq_persistent_trigger_number(title, message):
                 payload = {
                     "serial": serial,
                     "last_fingerprint": fingerprint,
+                    "reset_cycle": reset_cycle,
                     "saved_at_utc": datetime.now(timezone.utc).isoformat(),
                 }
                 tmp = (
