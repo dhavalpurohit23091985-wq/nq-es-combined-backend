@@ -6,6 +6,7 @@ import threading
 import json
 import csv
 import io
+import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
@@ -2427,6 +2428,115 @@ RUNTIME_STATE_FILE = os.path.join('/var/data', 'backend_runtime_state.json')
 
 XAU_NORMAL_DIRECTION_FILE = RUNTIME_STATE_FILE + ".xau_normal_direction"
 
+# Persistent authoritative sequence for NASDAQ QQQ WEIGHTED LAST-4 alerts.
+# Pine may restart/recreate and reset its local TRIGGER #, but this disk-backed
+# counter continues across backend deploys/restarts. Exact webhook retries reuse
+# the same serial instead of creating a new trigger number.
+NQ_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".nq_trigger_serial.json"
+
+
+def _nq_persistent_trigger_number(title, message):
+    title_text = str(title or "")
+    message_text = str(message or "")
+    title_u = title_text.upper()
+    message_u = message_text.upper()
+
+    is_qqq_last4 = (
+        "NASDAQ 10-STOCK" in title_u
+        and "QQQ WEIGHTED" in title_u
+        and ("LAST-4" in title_u or "LAST-4" in message_u)
+    )
+    if not is_qqq_last4:
+        return message_text, None, False
+
+    # Pine serial is used only to seed the disk counter on the very first alert.
+    # After that, the backend disk serial is authoritative.
+    match = re.search(r"(?i)\bTRIGGER\s*#\s*(\d+)", message_text)
+    incoming_serial = int(match.group(1)) if match else None
+
+    # Fingerprint excludes Pine's local serial so a resend/retry of the same
+    # TradingView event cannot consume another backend trigger number.
+    fingerprint_message = re.sub(
+        r"(?i)\bTRIGGER\s*#\s*\d+",
+        "TRIGGER #",
+        message_text,
+        count=1,
+    )
+    fingerprint = title_text + "\n" + fingerprint_message
+
+    os.makedirs(os.path.dirname(NQ_TRIGGER_SERIAL_FILE), exist_ok=True)
+    lock_path = NQ_TRIGGER_SERIAL_FILE + ".lock"
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            saved = {}
+            try:
+                with open(NQ_TRIGGER_SERIAL_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        saved = loaded
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                print(f"[NQ TRIGGER DISK READ ERROR] {exc}", flush=True)
+
+            try:
+                previous_serial = max(0, int(saved.get("serial", 0) or 0))
+            except (TypeError, ValueError):
+                previous_serial = 0
+            previous_fingerprint = str(saved.get("last_fingerprint") or "")
+
+            duplicate = bool(previous_fingerprint and previous_fingerprint == fingerprint)
+            if duplicate:
+                serial = previous_serial
+            elif previous_serial <= 0:
+                serial = incoming_serial if incoming_serial and incoming_serial > 0 else 1
+            else:
+                serial = previous_serial + 1
+
+            if not duplicate:
+                payload = {
+                    "serial": serial,
+                    "last_fingerprint": fingerprint,
+                    "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                tmp = (
+                    NQ_TRIGGER_SERIAL_FILE
+                    + f".{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                try:
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, NQ_TRIGGER_SERIAL_FILE)
+                finally:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+
+            if match:
+                rewritten = (
+                    message_text[:match.start()]
+                    + f"TRIGGER #{serial}"
+                    + message_text[match.end():]
+                )
+            else:
+                rewritten = f"TRIGGER #{serial} | {message_text}"
+
+            print(
+                f"[NQ PERSISTENT TRIGGER] #{serial} "
+                f"| pine={incoming_serial if incoming_serial is not None else 'NA'} "
+                f"| duplicate={duplicate}",
+                flush=True,
+            )
+            return rewritten, serial, duplicate
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
 def _claim_xau_normal_direction(direction):
     """Atomically claim a new XAU normal-observer direction across Gunicorn workers.
@@ -4490,6 +4600,13 @@ def webhook():
                 "message",
                 ""
             )
+        )
+
+        # For NASDAQ QQQ WEIGHTED LAST-4 only, replace Pine's local TRIGGER #
+        # with the authoritative disk-backed backend sequence. No calculation,
+        # threshold, base-selection or BUY/SELL logic is changed.
+        tv_message, nq_persistent_trigger, nq_trigger_duplicate = (
+            _nq_persistent_trigger_number(tv_title, tv_message)
         )
 
         # Keep normal TradingView alerts unchanged. For the QQQ-weighted
