@@ -654,6 +654,148 @@ def _nq_persistent_trigger_number(title, message):
 
 
 # ============================================================
+# NQ DASHBOARD TRIGGER HISTORY
+# Uses the EXISTING persistent NQ trigger serial.
+# Does not change alert logic, threshold, or Pine trigger behavior.
+# ============================================================
+
+def _nq_dashboard_record_trigger(title, message, serial, duplicate=False):
+    if serial is None or duplicate:
+        return
+
+    title_u = str(title or "").upper()
+    text = str(message or "")
+
+    if not (
+        "NASDAQ 10-STOCK" in title_u
+        and "QQQ WEIGHTED" in title_u
+        and "LAST-4" in title_u
+    ):
+        return
+
+    base_match = re.search(
+        r"(?i)\bTRIGGER\s+BASE:\s*(?:\d{2}-\d{2}-\d{4}\s+)?(\d{1,2}:\d{2})",
+        text,
+    )
+
+    if not base_match:
+        print("[NQ DASHBOARD TRIGGER] Trigger base not found", flush=True)
+        return
+
+    base_time = base_match.group(1)
+
+    trigger_match = re.search(
+        r"(?i)\bTRIGGER:\s*([^|\n]+)",
+        text,
+    )
+
+    trigger_text = (
+        trigger_match.group(1).upper()
+        if trigger_match
+        else ""
+    )
+
+    # The new position/direction is the ENTRY side.
+    if "BUY ENTRY" in trigger_text:
+        direction = "BUY"
+    elif "SELL ENTRY" in trigger_text:
+        direction = "SELL"
+    else:
+        state_match = re.search(
+            r"(?i)\bPOSITION\s+AFTER\s+ALERT:\s*(BUY|SELL)",
+            text,
+        )
+        if state_match:
+            direction = state_match.group(1).upper()
+        elif " BUY" in (" " + title_u):
+            direction = "BUY"
+        elif " SELL" in (" " + title_u):
+            direction = "SELL"
+        else:
+            print("[NQ DASHBOARD TRIGGER] Direction not found", flush=True)
+            return
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    with NQ_DASHBOARD_LOCK:
+        try:
+            with open(
+                NQ_DASHBOARD_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                state = json.load(f)
+                if not isinstance(state, dict):
+                    state = {}
+        except FileNotFoundError:
+            state = {}
+        except Exception as exc:
+            print(f"[NQ DASHBOARD TRIGGER READ ERROR] {exc}", flush=True)
+            state = {}
+
+        history = state.get("trigger_history")
+        if not isinstance(history, list):
+            history = []
+
+        # Avoid adding the same backend serial twice.
+        if any(
+            isinstance(item, dict)
+            and int(item.get("serial", -1)) == int(serial)
+            for item in history
+            if str(item.get("serial", "")).isdigit()
+        ):
+            return
+
+        history.append({
+            "serial": int(serial),
+            "direction": direction,
+            "base_time": base_time,
+            "created_at_utc": now_utc.isoformat(),
+            "created_at_ist": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+        })
+
+        # Keep enough history for the current weekly cycle without
+        # letting the dashboard file grow forever.
+        history = history[-200:]
+        state["trigger_history"] = history
+
+        os.makedirs(
+            os.path.dirname(NQ_DASHBOARD_STATE_FILE),
+            exist_ok=True,
+        )
+
+        tmp = (
+            NQ_DASHBOARD_STATE_FILE
+            + f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    state,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp, NQ_DASHBOARD_STATE_FILE)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+    print(
+        f"[NQ DASHBOARD TRIGGER] #{serial} {direction} | BASE {base_time}",
+        flush=True,
+    )
+
+
+# ============================================================
 # QQQ WEIGHTED AUDIT PUSHOVER SPLITTER
 # ============================================================
 
@@ -1195,6 +1337,15 @@ def webhook():
         tv_message,
     )
 
+    # Mirror the already-created NQ trigger into the browser dashboard.
+    # This does NOT create a trigger and does NOT alter alert logic.
+    _nq_dashboard_record_trigger(
+        tv_title,
+        tv_message,
+        nq_serial,
+        nq_duplicate,
+    )
+
     (
         tv_message,
         india_serial,
@@ -1323,6 +1474,7 @@ def _dashboard_load():
         "updated_at_ist": None,
         "threshold": 0.100,
         "bases": [],
+        "trigger_history": [],
     }
 
 
@@ -1437,6 +1589,12 @@ def nq_dashboard_webhook():
         )
     )
 
+    # Preserve alert trigger history when live base values refresh.
+    previous_state = _dashboard_load()
+    trigger_history = previous_state.get("trigger_history", [])
+    if not isinstance(trigger_history, list):
+        trigger_history = []
+
     state = {
         "updated_at_utc": (
             now_utc.isoformat()
@@ -1448,6 +1606,7 @@ def nq_dashboard_webhook():
         ),
         "threshold": 0.100,
         "bases": bases,
+        "trigger_history": trigger_history,
     }
 
     try:
@@ -1591,6 +1750,20 @@ td {
     font-weight: bold;
 }
 
+.trigger-cell {
+    font-weight: bold;
+    font-size: 15px;
+    line-height: 1.6;
+}
+
+.trigger-buy {
+    color: #3fb950;
+}
+
+.trigger-sell {
+    color: #f85149;
+}
+
 .footer {
     margin-top: 18px;
     text-align: center;
@@ -1654,6 +1827,7 @@ td {
                     <th>TIME</th>
                     <th>CURRENT NET</th>
                     <th>STATE</th>
+                    <th>TRIGGER</th>
                 </tr>
 
             </thead>
@@ -1661,7 +1835,7 @@ td {
             <tbody id="rows">
 
                 <tr>
-                    <td colspan="4">
+                    <td colspan="5">
                         Waiting for TradingView data...
                     </td>
                 </tr>
@@ -1787,7 +1961,7 @@ async function refreshDashboard() {
 
             rows.innerHTML =
                 '<tr>'
-                + '<td colspan="4">'
+                + '<td colspan="5">'
                 + 'Waiting for TradingView data...'
                 + '</td>'
                 + '</tr>';
@@ -1798,6 +1972,21 @@ async function refreshDashboard() {
                 "No dashboard data received yet.";
 
             return;
+        }
+
+        const triggerMap = {};
+
+        if (Array.isArray(data.trigger_history)) {
+            for (const item of data.trigger_history) {
+                const key = String(item.base_time || "");
+                if (!key) {
+                    continue;
+                }
+                if (!triggerMap[key]) {
+                    triggerMap[key] = [];
+                }
+                triggerMap[key].push(item);
+            }
         }
 
         let html = "";
@@ -1843,6 +2032,23 @@ async function refreshDashboard() {
                 + escapeHtml(
                     base.state || "--"
                 )
+                + "</td>"
+
+                + '<td class="trigger-cell">'
+                + (() => {
+                    const items = triggerMap[String(base.time || "")] || [];
+                    if (items.length === 0) {
+                        return "--";
+                    }
+                    return items.map((item) => {
+                        const direction = String(item.direction || "").toUpperCase();
+                        const tcls = direction === "BUY" ? "trigger-buy" : "trigger-sell";
+                        return '<span class="' + tcls + '">#'
+                            + escapeHtml(item.serial)
+                            + ' ' + escapeHtml(direction)
+                            + '</span>';
+                    }).join("<br>");
+                })()
                 + "</td>"
 
                 + "</tr>";
