@@ -25,43 +25,92 @@ NQ_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".nq_trigger_serial.json"
 NIFTY_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".nifty_trigger_serial.json"
 BANKNIFTY_TRIGGER_SERIAL_FILE = RUNTIME_STATE_FILE + ".banknifty_trigger_serial.json"
 
+# ============================================================
+# NQ LIVE 4-BASE DASHBOARD STATE
+# ============================================================
+
+NQ_DASHBOARD_STATE_FILE = os.path.join(
+    "/var/data",
+    "nq_live_4base_dashboard.json"
+)
+
+NQ_DASHBOARD_LOCK = threading.Lock()
+
+
 def send_pushover(title, message):
     title_upper = str(title or "").upper()
     message_upper = str(message or "").upper()
 
     latest_qqq_last4 = (
         "NASDAQ" in title_upper
-        and ("QQQ WEIGHTED" in title_upper or "QQQ WEIGHTED" in message_upper
-             or "ROLLING LAST-4" in title_upper or "ROLLING LAST-4" in message_upper
-             or "LAST-4" in title_upper or "LAST-4" in message_upper)
+        and (
+            "QQQ WEIGHTED" in title_upper
+            or "QQQ WEIGHTED" in message_upper
+            or "ROLLING LAST-4" in title_upper
+            or "ROLLING LAST-4" in message_upper
+            or "LAST-4" in title_upper
+            or "LAST-4" in message_upper
+        )
     )
+
     nifty_last4 = (
         "NIFTY 10-STOCK" in title_upper
-        and ("NIFTY WEIGHTED" in title_upper or "NIFTY WEIGHTED" in message_upper)
-        and ("LAST-4" in title_upper or "LAST-4" in message_upper)
+        and (
+            "NIFTY WEIGHTED" in title_upper
+            or "NIFTY WEIGHTED" in message_upper
+        )
+        and (
+            "LAST-4" in title_upper
+            or "LAST-4" in message_upper
+        )
     )
+
     banknifty_last4 = (
         "BANKNIFTY TOP-5" in title_upper
-        and ("WEIGHTED" in title_upper or "WEIGHTED" in message_upper)
-        and ("LAST-4" in title_upper or "LAST-4" in message_upper)
+        and (
+            "WEIGHTED" in title_upper
+            or "WEIGHTED" in message_upper
+        )
+        and (
+            "LAST-4" in title_upper
+            or "LAST-4" in message_upper
+        )
     )
 
     if not (latest_qqq_last4 or nifty_last4 or banknifty_last4):
-        print(f"[PUSHOVER SILENT - NQ + NIFTY + BANKNIFTY ONLY] {title}", flush=True)
+        print(
+            f"[PUSHOVER SILENT - NQ + NIFTY + BANKNIFTY ONLY] {title}",
+            flush=True,
+        )
         return False
+
     if not PUSHOVER_TOKEN or not PUSHOVER_USER:
         return False
+
     try:
-        r = requests.post(PUSHOVER_URL, data={
-            "token": PUSHOVER_TOKEN, "user": PUSHOVER_USER,
-            "title": title, "message": message,
-            "priority": 2, "retry": 30, "expire": 3600,
-        }, timeout=10)
+        r = requests.post(
+            PUSHOVER_URL,
+            data={
+                "token": PUSHOVER_TOKEN,
+                "user": PUSHOVER_USER,
+                "title": title,
+                "message": message,
+                "priority": 2,
+                "retry": 30,
+                "expire": 3600,
+            },
+            timeout=10,
+        )
         return r.ok
+
     except requests.RequestException as exc:
         print(f"[PUSHOVER ERROR] {exc}", flush=True)
         return False
 
+
+# ============================================================
+# INDIA PERSISTENT TRIGGER NUMBER
+# ============================================================
 
 def _india_persistent_trigger_number(title, message):
     title_text = str(title or "")
@@ -72,85 +121,178 @@ def _india_persistent_trigger_number(title, message):
     is_nifty = (
         "NIFTY 10-STOCK" in title_u
         and "NIFTY WEIGHTED" in title_u
-        and ("LAST-4" in title_u or "LAST-4" in message_u)
+        and (
+            "LAST-4" in title_u
+            or "LAST-4" in message_u
+        )
     )
+
     is_banknifty = (
         "BANKNIFTY TOP-5" in title_u
         and "WEIGHTED" in title_u
-        and ("LAST-4" in title_u or "LAST-4" in message_u)
+        and (
+            "LAST-4" in title_u
+            or "LAST-4" in message_u
+        )
     )
 
     if is_banknifty:
         asset = "BANKNIFTY"
         serial_file = BANKNIFTY_TRIGGER_SERIAL_FILE
+
     elif is_nifty:
         asset = "NIFTY"
         serial_file = NIFTY_TRIGGER_SERIAL_FILE
+
     else:
         return message_text, None, False
 
-    match = re.search(r"(?i)\bTRIGGER\s*#\s*(\d+)", message_text)
-    incoming_serial = int(match.group(1)) if match else None
+    match = re.search(
+        r"(?i)\bTRIGGER\s*#\s*(\d+)",
+        message_text,
+    )
 
-    # Ignore Pine's local serial when identifying an exact resend/retry.
+    incoming_serial = (
+        int(match.group(1))
+        if match
+        else None
+    )
+
     fingerprint_message = re.sub(
         r"(?i)\bTRIGGER\s*#\s*\d+",
         "TRIGGER #",
         message_text,
         count=1,
     )
-    fingerprint = title_text + "\n" + fingerprint_message
+
+    fingerprint = (
+        title_text
+        + "\n"
+        + fingerprint_message
+    )
 
     # Daily Indian-market backend cycle boundary: 09:15 IST.
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    boundary = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    now_ist = datetime.now(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    boundary = now_ist.replace(
+        hour=9,
+        minute=15,
+        second=0,
+        microsecond=0,
+    )
+
     if now_ist < boundary:
         boundary -= timedelta(days=1)
-    reset_cycle = boundary.strftime("%Y-%m-%dT%H:%M%z")
 
-    os.makedirs(os.path.dirname(serial_file), exist_ok=True)
+    reset_cycle = boundary.strftime(
+        "%Y-%m-%dT%H:%M%z"
+    )
+
+    os.makedirs(
+        os.path.dirname(serial_file),
+        exist_ok=True,
+    )
+
     lock_path = serial_file + ".lock"
 
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    with open(
+        lock_path,
+        "a+",
+        encoding="utf-8",
+    ) as lock_file:
+
+        fcntl.flock(
+            lock_file.fileno(),
+            fcntl.LOCK_EX,
+        )
+
         try:
             saved = {}
+
             try:
-                with open(serial_file, "r", encoding="utf-8") as f:
+                with open(
+                    serial_file,
+                    "r",
+                    encoding="utf-8",
+                ) as f:
                     loaded = json.load(f)
+
                     if isinstance(loaded, dict):
                         saved = loaded
+
             except FileNotFoundError:
                 pass
-            except Exception as exc:
-                print(f"[{asset} TRIGGER DISK READ ERROR] {exc}", flush=True)
 
-            saved_cycle = str(saved.get("reset_cycle") or "")
-            daily_reset = bool(saved_cycle and saved_cycle != reset_cycle)
+            except Exception as exc:
+                print(
+                    f"[{asset} TRIGGER DISK READ ERROR] {exc}",
+                    flush=True,
+                )
+
+            saved_cycle = str(
+                saved.get("reset_cycle")
+                or ""
+            )
+
+            daily_reset = bool(
+                saved_cycle
+                and saved_cycle != reset_cycle
+            )
 
             try:
-                previous_serial = max(0, int(saved.get("serial", 0) or 0))
+                previous_serial = max(
+                    0,
+                    int(
+                        saved.get(
+                            "serial",
+                            0,
+                        )
+                        or 0
+                    ),
+                )
+
             except (TypeError, ValueError):
                 previous_serial = 0
-            previous_fingerprint = str(saved.get("last_fingerprint") or "")
+
+            previous_fingerprint = str(
+                saved.get(
+                    "last_fingerprint"
+                )
+                or ""
+            )
 
             if daily_reset:
                 previous_serial = 0
                 previous_fingerprint = ""
-                print(f"[{asset} TRIGGER DAILY RESET] cycle={reset_cycle}", flush=True)
+
+                print(
+                    f"[{asset} TRIGGER DAILY RESET] cycle={reset_cycle}",
+                    flush=True,
+                )
 
             duplicate = bool(
-                previous_fingerprint and previous_fingerprint == fingerprint
+                previous_fingerprint
+                and previous_fingerprint
+                == fingerprint
             )
+
             if duplicate:
                 serial = previous_serial
+
             elif previous_serial <= 0:
-                # On a brand-new disk file, preserve today's Pine serial if present.
-                # After a detected 09:15 cycle change, start the new day at #1.
                 if daily_reset:
                     serial = 1
+
                 else:
-                    serial = incoming_serial if incoming_serial and incoming_serial > 0 else 1
+                    serial = (
+                        incoming_serial
+                        if incoming_serial
+                        and incoming_serial > 0
+                        else 1
+                    )
+
             else:
                 serial = previous_serial + 1
 
@@ -160,19 +302,42 @@ def _india_persistent_trigger_number(title, message):
                     "serial": serial,
                     "last_fingerprint": fingerprint,
                     "reset_cycle": reset_cycle,
-                    "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "saved_at_utc": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
                 }
-                tmp = serial_file + f".{os.getpid()}.{threading.get_ident()}.tmp"
+
+                tmp = (
+                    serial_file
+                    + f".{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+
                 try:
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+                    with open(
+                        tmp,
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+                        json.dump(
+                            payload,
+                            f,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+
                         f.flush()
                         os.fsync(f.fileno())
-                    os.replace(tmp, serial_file)
+
+                    os.replace(
+                        tmp,
+                        serial_file,
+                    )
+
                 finally:
                     try:
                         if os.path.exists(tmp):
                             os.remove(tmp)
+
                     except OSError:
                         pass
 
@@ -182,18 +347,37 @@ def _india_persistent_trigger_number(title, message):
                     + f"TRIGGER #{serial}"
                     + message_text[match.end():]
                 )
+
             else:
-                rewritten = f"TRIGGER #{serial} | {message_text}"
+                rewritten = (
+                    f"TRIGGER #{serial} | "
+                    + message_text
+                )
 
             print(
                 f"[{asset} PERSISTENT TRIGGER] #{serial} "
                 f"| pine={incoming_serial if incoming_serial is not None else 'NA'} "
-                f"| duplicate={duplicate} | cycle={reset_cycle}",
+                f"| duplicate={duplicate} "
+                f"| cycle={reset_cycle}",
                 flush=True,
             )
-            return rewritten, serial, duplicate
+
+            return (
+                rewritten,
+                serial,
+                duplicate,
+            )
+
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(
+                lock_file.fileno(),
+                fcntl.LOCK_UN,
+            )
+
+
+# ============================================================
+# NQ PERSISTENT TRIGGER NUMBER
+# ============================================================
 
 def _nq_persistent_trigger_number(title, message):
     title_text = str(title or "")
@@ -204,106 +388,235 @@ def _nq_persistent_trigger_number(title, message):
     is_qqq_last4 = (
         "NASDAQ 10-STOCK" in title_u
         and "QQQ WEIGHTED" in title_u
-        and ("LAST-4" in title_u or "LAST-4" in message_u)
+        and (
+            "LAST-4" in title_u
+            or "LAST-4" in message_u
+        )
     )
+
     if not is_qqq_last4:
         return message_text, None, False
 
-    # Pine serial is used only to seed the disk counter on the very first alert.
-    # After that, the backend disk serial is authoritative.
-    match = re.search(r"(?i)\bTRIGGER\s*#\s*(\d+)", message_text)
-    incoming_serial = int(match.group(1)) if match else None
+    match = re.search(
+        r"(?i)\bTRIGGER\s*#\s*(\d+)",
+        message_text,
+    )
 
-    # Fingerprint excludes Pine's local serial so a resend/retry of the same
-    # TradingView event cannot consume another backend trigger number.
+    incoming_serial = (
+        int(match.group(1))
+        if match
+        else None
+    )
+
     fingerprint_message = re.sub(
         r"(?i)\bTRIGGER\s*#\s*\d+",
         "TRIGGER #",
         message_text,
         count=1,
     )
-    fingerprint = title_text + "\n" + fingerprint_message
 
-    os.makedirs(os.path.dirname(NQ_TRIGGER_SERIAL_FILE), exist_ok=True)
-    lock_path = NQ_TRIGGER_SERIAL_FILE + ".lock"
+    fingerprint = (
+        title_text
+        + "\n"
+        + fingerprint_message
+    )
 
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    os.makedirs(
+        os.path.dirname(
+            NQ_TRIGGER_SERIAL_FILE
+        ),
+        exist_ok=True,
+    )
+
+    lock_path = (
+        NQ_TRIGGER_SERIAL_FILE
+        + ".lock"
+    )
+
+    with open(
+        lock_path,
+        "a+",
+        encoding="utf-8",
+    ) as lock_file:
+
+        fcntl.flock(
+            lock_file.fileno(),
+            fcntl.LOCK_EX,
+        )
+
         try:
             saved = {}
+
             try:
-                with open(NQ_TRIGGER_SERIAL_FILE, "r", encoding="utf-8") as f:
+                with open(
+                    NQ_TRIGGER_SERIAL_FILE,
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+
                     loaded = json.load(f)
-                    if isinstance(loaded, dict):
+
+                    if isinstance(
+                        loaded,
+                        dict,
+                    ):
                         saved = loaded
+
             except FileNotFoundError:
                 pass
+
             except Exception as exc:
-                print(f"[NQ TRIGGER DISK READ ERROR] {exc}", flush=True)
+                print(
+                    f"[NQ TRIGGER DISK READ ERROR] {exc}",
+                    flush=True,
+                )
 
             # Weekly NQ trigger cycle (IST):
-            #   Saturday 02:30 -> reset
-            #   Monday 05:30 -> first valid alert starts again at TRIGGER #1.
-            # The LAST-4 Pine calculation itself is untouched; this is only the
-            # persistent backend display/sequence number.
-            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            days_since_saturday = (now_ist.weekday() - 5) % 7
-            reset_date = (now_ist - timedelta(days=days_since_saturday)).date()
+            # Saturday 02:30 -> reset
+            # Monday 05:30 -> first valid alert starts again at #1.
+            now_ist = datetime.now(
+                ZoneInfo("Asia/Kolkata")
+            )
+
+            days_since_saturday = (
+                now_ist.weekday() - 5
+            ) % 7
+
+            reset_date = (
+                now_ist
+                - timedelta(
+                    days=days_since_saturday
+                )
+            ).date()
+
             reset_ist = datetime.combine(
                 reset_date,
                 datetime.min.time(),
-                tzinfo=ZoneInfo("Asia/Kolkata"),
-            ).replace(hour=2, minute=30)
-            if now_ist < reset_ist:
-                reset_ist -= timedelta(days=7)
-            reset_cycle = reset_ist.strftime("%Y-%m-%dT%H:%M%z")
+                tzinfo=ZoneInfo(
+                    "Asia/Kolkata"
+                ),
+            ).replace(
+                hour=2,
+                minute=30,
+            )
 
-            saved_cycle = str(saved.get("reset_cycle") or "")
-            weekly_reset = bool(saved_cycle and saved_cycle != reset_cycle)
+            if now_ist < reset_ist:
+                reset_ist -= timedelta(
+                    days=7
+                )
+
+            reset_cycle = reset_ist.strftime(
+                "%Y-%m-%dT%H:%M%z"
+            )
+
+            saved_cycle = str(
+                saved.get("reset_cycle")
+                or ""
+            )
+
+            weekly_reset = bool(
+                saved_cycle
+                and saved_cycle
+                != reset_cycle
+            )
 
             try:
-                previous_serial = max(0, int(saved.get("serial", 0) or 0))
+                previous_serial = max(
+                    0,
+                    int(
+                        saved.get(
+                            "serial",
+                            0,
+                        )
+                        or 0
+                    ),
+                )
+
             except (TypeError, ValueError):
                 previous_serial = 0
-            previous_fingerprint = str(saved.get("last_fingerprint") or "")
+
+            previous_fingerprint = str(
+                saved.get(
+                    "last_fingerprint"
+                )
+                or ""
+            )
 
             if weekly_reset:
                 previous_serial = 0
                 previous_fingerprint = ""
+
                 print(
                     f"[NQ TRIGGER WEEKLY RESET] cycle={reset_cycle}",
                     flush=True,
                 )
 
-            duplicate = bool(previous_fingerprint and previous_fingerprint == fingerprint)
+            duplicate = bool(
+                previous_fingerprint
+                and previous_fingerprint
+                == fingerprint
+            )
+
             if duplicate:
                 serial = previous_serial
+
             elif previous_serial <= 0:
-                serial = incoming_serial if incoming_serial and incoming_serial > 0 else 1
+                serial = (
+                    incoming_serial
+                    if incoming_serial
+                    and incoming_serial > 0
+                    else 1
+                )
+
             else:
-                serial = previous_serial + 1
+                serial = (
+                    previous_serial + 1
+                )
 
             if not duplicate:
                 payload = {
                     "serial": serial,
                     "last_fingerprint": fingerprint,
                     "reset_cycle": reset_cycle,
-                    "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "saved_at_utc": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
                 }
+
                 tmp = (
                     NQ_TRIGGER_SERIAL_FILE
                     + f".{os.getpid()}.{threading.get_ident()}.tmp"
                 )
+
                 try:
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+                    with open(
+                        tmp,
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+
+                        json.dump(
+                            payload,
+                            f,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+
                         f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, NQ_TRIGGER_SERIAL_FILE)
+                        os.fsync(
+                            f.fileno()
+                        )
+
+                    os.replace(
+                        tmp,
+                        NQ_TRIGGER_SERIAL_FILE,
+                    )
+
                 finally:
                     try:
                         if os.path.exists(tmp):
                             os.remove(tmp)
+
                     except OSError:
                         pass
 
@@ -313,8 +626,12 @@ def _nq_persistent_trigger_number(title, message):
                     + f"TRIGGER #{serial}"
                     + message_text[match.end():]
                 )
+
             else:
-                rewritten = f"TRIGGER #{serial} | {message_text}"
+                rewritten = (
+                    f"TRIGGER #{serial} | "
+                    + message_text
+                )
 
             print(
                 f"[NQ PERSISTENT TRIGGER] #{serial} "
@@ -322,27 +639,74 @@ def _nq_persistent_trigger_number(title, message):
                 f"| duplicate={duplicate}",
                 flush=True,
             )
-            return rewritten, serial, duplicate
+
+            return (
+                rewritten,
+                serial,
+                duplicate,
+            )
+
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(
+                lock_file.fileno(),
+                fcntl.LOCK_UN,
+            )
+
+
+# ============================================================
+# QQQ WEIGHTED AUDIT PUSHOVER SPLITTER
+# ============================================================
 
 def _qqq_weighted_audit_pushover_parts(title, message):
-    title_u = str(title or "").upper()
-    text = str(message or "")
+    title_u = str(
+        title or ""
+    ).upper()
 
-    # Every other TradingView alert remains exactly one message.
-    if "NASDAQ 10-STOCK" not in title_u or "QQQ WEIGHTED" not in title_u:
-        return [(str(title or ""), text)]
+    text = str(
+        message or ""
+    )
+
+    if (
+        "NASDAQ 10-STOCK"
+        not in title_u
+        or "QQQ WEIGHTED"
+        not in title_u
+    ):
+        return [
+            (
+                str(title or ""),
+                text,
+            )
+        ]
 
     stock_names = {
-        "NVDA", "AAPL", "MSFT", "MU", "AMZN",
-        "AMD", "GOOGL", "META", "GOOG", "TSLA"
+        "NVDA",
+        "AAPL",
+        "MSFT",
+        "MU",
+        "AMZN",
+        "AMD",
+        "GOOGL",
+        "META",
+        "GOOG",
+        "TSLA",
     }
 
-    normalized = text.replace("\r", "").replace("\n", " | ")
-    tokens = [part.strip() for part in normalized.split("|") if part.strip()]
+    normalized = (
+        text
+        .replace("\r", "")
+        .replace("\n", " | ")
+    )
+
+    tokens = [
+        part.strip()
+        for part
+        in normalized.split("|")
+        if part.strip()
+    ]
 
     metadata = []
+
     wanted_prefixes = (
         "TRIGGER #",
         "TRIGGER BASE:",
@@ -351,195 +715,413 @@ def _qqq_weighted_audit_pushover_parts(title, message):
         "BASE 15:30 ENTRY CACHE:",
         "POSITION AFTER ALERT:",
     )
+
     for token in tokens:
-        if token.upper().startswith(wanted_prefixes):
+        if token.upper().startswith(
+            wanted_prefixes
+        ):
             if token not in metadata:
                 metadata.append(token)
 
     stock_rows = []
     i = 0
+
     while i < len(tokens):
         symbol = tokens[i].upper()
+
         if symbol not in stock_names:
             i += 1
             continue
 
         vals = {}
         j = i + 1
-        while j < len(tokens) and tokens[j].upper() not in stock_names:
+
+        while (
+            j < len(tokens)
+            and tokens[j].upper()
+            not in stock_names
+        ):
             p = tokens[j]
             up = p.upper()
 
             if up.startswith("OPEN "):
                 vals["O"] = p[5:].strip()
+
             elif up.startswith("LIVE "):
                 vals["T"] = p[5:].strip()
+
             elif up.startswith("TRIGGER "):
                 vals["T"] = p[8:].strip()
+
             elif up.startswith("RAW "):
                 vals["R"] = p[4:].strip()
+
             elif up.startswith("W "):
                 vals["W"] = p[2:].strip()
+
             elif up.startswith("CONTR "):
                 vals["C"] = p[6:].strip()
                 j += 1
                 break
+
             j += 1
 
-        if "O" in vals and "T" in vals:
-            row = f"{symbol} | O {vals['O']} | T {vals['T']}"
+        if (
+            "O" in vals
+            and "T" in vals
+        ):
+            row = (
+                f"{symbol} "
+                f"| O {vals['O']} "
+                f"| T {vals['T']}"
+            )
+
             if "R" in vals:
-                row += f" | R {vals['R']}"
+                row += (
+                    f" | R {vals['R']}"
+                )
+
             if "W" in vals:
-                row += f" | W {vals['W']}"
+                row += (
+                    f" | W {vals['W']}"
+                )
+
             if "C" in vals:
-                row += f" | C {vals['C']}"
+                row += (
+                    f" | C {vals['C']}"
+                )
+
             stock_rows.append(row)
 
-        i = max(j, i + 1)
+        i = max(
+            j,
+            i + 1,
+        )
 
     summary = []
+
     for token in tokens:
         u = token.upper()
+
         if (
-            u.startswith("WEIGHTED NET =")
-            or u.startswith("NQ AT TRIGGER:")
+            u.startswith(
+                "WEIGHTED NET ="
+            )
+            or u.startswith(
+                "NQ AT TRIGGER:"
+            )
         ):
             if token not in summary:
                 summary.append(token)
 
-    # Preserve source order exactly; only split after row 5.
     first_rows = stock_rows[:5]
     second_rows = stock_rows[5:]
 
     part1_lines = []
     part1_lines.extend(metadata)
-    part1_lines.append("AUDIT 1/2: O=OPEN | T=LIVE | R=RAW | W=WEIGHT | C=CONTR")
-    part1_lines.extend(first_rows)
+
+    part1_lines.append(
+        "AUDIT 1/2: "
+        "O=OPEN | T=LIVE | "
+        "R=RAW | W=WEIGHT | "
+        "C=CONTR"
+    )
+
+    part1_lines.extend(
+        first_rows
+    )
 
     part2_lines = [
-        "AUDIT 2/2: O=OPEN | T=LIVE | R=RAW | W=WEIGHT | C=CONTR"
+        "AUDIT 2/2: "
+        "O=OPEN | T=LIVE | "
+        "R=RAW | W=WEIGHT | "
+        "C=CONTR"
     ]
-    part2_lines.extend(second_rows)
-    part2_lines.extend(summary)
 
-    part1 = "\n".join(part1_lines).strip()
-    part2 = "\n".join(part2_lines).strip()
+    part2_lines.extend(
+        second_rows
+    )
 
-    # Defensive protection only. With 5 rows per part both messages should
-    # normally be comfortably below Pushover's 1024-character message limit.
+    part2_lines.extend(
+        summary
+    )
+
+    part1 = "\n".join(
+        part1_lines
+    ).strip()
+
+    part2 = "\n".join(
+        part2_lines
+    ).strip()
+
     if len(part1) > 1024:
         part1 = part1[:1024]
+
     if len(part2) > 1024:
         part2 = part2[:1024]
 
     return [
-        (f"{title} | PART 1/2", part1 or text),
-        (f"{title} | PART 2/2", part2 or text),
+        (
+            f"{title} | PART 1/2",
+            part1 or text,
+        ),
+        (
+            f"{title} | PART 2/2",
+            part2 or text,
+        ),
     ]
+
+
+# ============================================================
+# NQ LONG PUSHOVER SPLITTER
+# ============================================================
 
 def _nq_long_pushover_parts(title, message):
     title_text = str(title or "")
     message_text = str(message or "")
     title_u = title_text.upper()
 
-    # Only NQ/NASDAQ-family TradingView alerts are eligible.
-    if "NQ" not in title_u and "NASDAQ" not in title_u:
-        return [(title_text, message_text)]
+    if (
+        "NQ" not in title_u
+        and "NASDAQ" not in title_u
+    ):
+        return [
+            (
+                title_text,
+                message_text,
+            )
+        ]
 
-    # Short messages remain exactly one notification.
     if len(message_text) <= 950:
-        return [(title_text, message_text)]
+        return [
+            (
+                title_text,
+                message_text,
+            )
+        ]
 
-    normalized = message_text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = (
+        message_text
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
     lines = normalized.split("\n")
 
-    # Choose a line-boundary split closest to the middle while keeping
-    # both parts comfortably below Pushover's 1024-character message limit.
     best = None
-    for cut in range(1, len(lines)):
-        p1 = "\n".join(lines[:cut]).strip()
-        p2 = "\n".join(lines[cut:]).strip()
-        if len(p1) <= 950 and len(p2) <= 950:
-            score = abs(len(p1) - len(p2))
-            if best is None or score < best[0]:
-                best = (score, p1, p2)
+
+    for cut in range(
+        1,
+        len(lines),
+    ):
+        p1 = "\n".join(
+            lines[:cut]
+        ).strip()
+
+        p2 = "\n".join(
+            lines[cut:]
+        ).strip()
+
+        if (
+            len(p1) <= 950
+            and len(p2) <= 950
+        ):
+            score = abs(
+                len(p1)
+                - len(p2)
+            )
+
+            if (
+                best is None
+                or score < best[0]
+            ):
+                best = (
+                    score,
+                    p1,
+                    p2,
+                )
 
     if best is not None:
         _, part1, part2 = best
+
     else:
-        # Defensive fallback for a message containing very long single lines.
-        midpoint = len(normalized) // 2
-        left_break = normalized.rfind("\n", 0, midpoint + 1)
-        right_break = normalized.find("\n", midpoint)
+        midpoint = (
+            len(normalized) // 2
+        )
+
+        left_break = normalized.rfind(
+            "\n",
+            0,
+            midpoint + 1,
+        )
+
+        right_break = normalized.find(
+            "\n",
+            midpoint,
+        )
 
         if left_break > 0:
             cut = left_break
+
         elif right_break != -1:
             cut = right_break
+
         else:
             cut = midpoint
 
-        part1 = normalized[:cut].strip()
-        part2 = normalized[cut:].strip()
+        part1 = normalized[
+            :cut
+        ].strip()
 
-        # Final defensive cap only; normal structured TV messages should
-        # always split at line boundaries above without reaching this path.
+        part2 = normalized[
+            cut:
+        ].strip()
+
         part1 = part1[:1024]
         part2 = part2[:1024]
 
     return [
-        (f"{title_text} | PART 1/2", part1),
-        (f"{title_text} | PART 2/2", part2),
+        (
+            f"{title_text} | PART 1/2",
+            part1,
+        ),
+        (
+            f"{title_text} | PART 2/2",
+            part2,
+        ),
     ]
+
+
+# ============================================================
+# INDIA WEIGHTED PUSHOVER SPLITTER
+# ============================================================
 
 def _india_weighted_pushover_parts(title, message):
     title_text = str(title or "")
     message_text = str(message or "")
     title_u = title_text.upper()
 
-    is_nifty = "NIFTY 10-STOCK" in title_u and "NIFTY WEIGHTED" in title_u
-    is_banknifty = "BANKNIFTY TOP-5" in title_u and "WEIGHTED" in title_u
+    is_nifty = (
+        "NIFTY 10-STOCK" in title_u
+        and "NIFTY WEIGHTED" in title_u
+    )
 
-    if not (is_nifty or is_banknifty) or len(message_text) <= 950:
-        return [(title_text, message_text)]
+    is_banknifty = (
+        "BANKNIFTY TOP-5" in title_u
+        and "WEIGHTED" in title_u
+    )
 
-    # TradingView audit is pipe-delimited. Turn each field into a line so the
-    # split happens only at a clean audit-field boundary.
-    normalized = message_text.replace("\r", "").replace("\n", " | ")
-    fields = [field.strip() for field in normalized.split("|") if field.strip()]
+    if (
+        not (
+            is_nifty
+            or is_banknifty
+        )
+        or len(message_text) <= 950
+    ):
+        return [
+            (
+                title_text,
+                message_text,
+            )
+        ]
+
+    normalized = (
+        message_text
+        .replace("\r", "")
+        .replace("\n", " | ")
+    )
+
+    fields = [
+        field.strip()
+        for field
+        in normalized.split("|")
+        if field.strip()
+    ]
 
     best = None
-    for cut in range(1, len(fields)):
-        p1 = " | ".join(fields[:cut]).strip()
-        p2 = " | ".join(fields[cut:]).strip()
-        if len(p1) <= 950 and len(p2) <= 950:
-            score = abs(len(p1) - len(p2))
-            if best is None or score < best[0]:
-                best = (score, p1, p2)
+
+    for cut in range(
+        1,
+        len(fields),
+    ):
+        p1 = " | ".join(
+            fields[:cut]
+        ).strip()
+
+        p2 = " | ".join(
+            fields[cut:]
+        ).strip()
+
+        if (
+            len(p1) <= 950
+            and len(p2) <= 950
+        ):
+            score = abs(
+                len(p1)
+                - len(p2)
+            )
+
+            if (
+                best is None
+                or score < best[0]
+            ):
+                best = (
+                    score,
+                    p1,
+                    p2,
+                )
 
     if best is None:
-        # Defensive fallback: keep two parts and prefer a pipe boundary nearest
-        # the middle. This should not be needed for the current NIFTY/BANKNIFTY
-        # payload sizes.
-        midpoint = len(normalized) // 2
-        left = normalized.rfind(" | ", 0, midpoint + 1)
-        right = normalized.find(" | ", midpoint)
+        midpoint = (
+            len(normalized) // 2
+        )
+
+        left = normalized.rfind(
+            " | ",
+            0,
+            midpoint + 1,
+        )
+
+        right = normalized.find(
+            " | ",
+            midpoint,
+        )
+
         if left > 0:
             cut = left
+
         elif right != -1:
             cut = right
+
         else:
             cut = midpoint
-        part1 = normalized[:cut].strip()
-        part2 = normalized[cut:].strip()
+
+        part1 = normalized[
+            :cut
+        ].strip()
+
+        part2 = normalized[
+            cut:
+        ].strip()
+
     else:
         _, part1, part2 = best
 
     return [
-        (f"{title_text} | PART 1/2", part1),
-        (f"{title_text} | PART 2/2", part2),
+        (
+            f"{title_text} | PART 1/2",
+            part1,
+        ),
+        (
+            f"{title_text} | PART 2/2",
+            part2,
+        ),
     ]
+
+
+# ============================================================
+# EXISTING HOME
+# ============================================================
 
 @app.get("/")
 def home():
@@ -550,38 +1132,124 @@ def home():
         "nifty": "NIFTY 10-STOCK WEIGHTED LAST-4",
         "banknifty": "BANKNIFTY TOP-5 WEIGHTED LAST-4",
         "crypto_liquidation_code": "removed",
+        "nq_dashboard": "/nq-dashboard",
     })
+
+
+# ============================================================
+# EXISTING TRADINGVIEW ALERT WEBHOOK
+# ============================================================
 
 @app.post("/webhook")
 def webhook():
-    secret = request.args.get("secret", "")
-    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    secret = request.args.get(
+        "secret",
+        "",
+    )
 
-    data = request.get_json(silent=True) or {}
-    if "title" not in data or "message" not in data:
-        return jsonify({"ok": False, "error": "title_and_message_required"}), 400
+    if (
+        not WEBHOOK_SECRET
+        or secret != WEBHOOK_SECRET
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
 
-    tv_title = str(data.get("title", "TradingView Alert"))
-    tv_message = str(data.get("message", ""))
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-    tv_message, nq_serial, nq_duplicate = _nq_persistent_trigger_number(tv_title, tv_message)
-    tv_message, india_serial, india_duplicate = _india_persistent_trigger_number(tv_title, tv_message)
+    if (
+        "title" not in data
+        or "message" not in data
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "title_and_message_required",
+        }), 400
 
-    parts = _qqq_weighted_audit_pushover_parts(tv_title, tv_message)
+    tv_title = str(
+        data.get(
+            "title",
+            "TradingView Alert",
+        )
+    )
+
+    tv_message = str(
+        data.get(
+            "message",
+            "",
+        )
+    )
+
+    (
+        tv_message,
+        nq_serial,
+        nq_duplicate,
+    ) = _nq_persistent_trigger_number(
+        tv_title,
+        tv_message,
+    )
+
+    (
+        tv_message,
+        india_serial,
+        india_duplicate,
+    ) = _india_persistent_trigger_number(
+        tv_title,
+        tv_message,
+    )
+
+    parts = (
+        _qqq_weighted_audit_pushover_parts(
+            tv_title,
+            tv_message,
+        )
+    )
+
     if len(parts) == 1:
-        parts = _nq_long_pushover_parts(tv_title, tv_message)
+        parts = (
+            _nq_long_pushover_parts(
+                tv_title,
+                tv_message,
+            )
+        )
+
     if len(parts) == 1:
-        parts = _india_weighted_pushover_parts(tv_title, tv_message)
+        parts = (
+            _india_weighted_pushover_parts(
+                tv_title,
+                tv_message,
+            )
+        )
 
     def _send(parts_to_send):
         try:
-            for part_title, part_message in parts_to_send:
-                send_pushover(part_title, part_message)
-        except Exception as exc:
-            print(f"[PUSHOVER BACKGROUND ERROR] {exc}", flush=True)
+            for (
+                part_title,
+                part_message,
+            ) in parts_to_send:
+                send_pushover(
+                    part_title,
+                    part_message,
+                )
 
-    threading.Thread(target=_send, args=(list(parts),), daemon=True).start()
+        except Exception as exc:
+            print(
+                f"[PUSHOVER BACKGROUND ERROR] {exc}",
+                flush=True,
+            )
+
+    threading.Thread(
+        target=_send,
+        args=(list(parts),),
+        daemon=True,
+    ).start()
+
     return jsonify({
         "ok": True,
         "mode": "direct_pushover",
@@ -593,3 +1261,638 @@ def webhook():
         "parts_queued": len(parts),
     }), 200
 
+
+# ============================================================
+# NQ DASHBOARD HELPERS
+# ============================================================
+
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+
+        return float(value)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _dashboard_state_text(net):
+    if net is None:
+        return "--"
+
+    if net >= 0.100:
+        return "BUY SIDE"
+
+    if net <= -0.100:
+        return "SELL SIDE"
+
+    return "NEUTRAL"
+
+
+def _dashboard_load():
+    try:
+        with NQ_DASHBOARD_LOCK:
+            with open(
+                NQ_DASHBOARD_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+
+        if isinstance(
+            data,
+            dict,
+        ):
+            return data
+
+    except FileNotFoundError:
+        pass
+
+    except Exception as exc:
+        print(
+            f"[NQ DASHBOARD READ ERROR] {exc}",
+            flush=True,
+        )
+
+    return {
+        "updated_at_utc": None,
+        "updated_at_ist": None,
+        "threshold": 0.100,
+        "bases": [],
+    }
+
+
+def _dashboard_save(data):
+    os.makedirs(
+        os.path.dirname(
+            NQ_DASHBOARD_STATE_FILE
+        ),
+        exist_ok=True,
+    )
+
+    tmp = (
+        NQ_DASHBOARD_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with NQ_DASHBOARD_LOCK:
+        try:
+            with open(
+                tmp,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    data,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+
+                f.flush()
+                os.fsync(
+                    f.fileno()
+                )
+
+            os.replace(
+                tmp,
+                NQ_DASHBOARD_STATE_FILE,
+            )
+
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
+            except OSError:
+                pass
+
+
+# ============================================================
+# NQ DASHBOARD WEBHOOK
+# TradingView dashboard indicator sends current 4 bases here.
+# ============================================================
+
+@app.post("/nq-dashboard-webhook")
+def nq_dashboard_webhook():
+    secret = request.args.get(
+        "secret",
+        "",
+    )
+
+    if (
+        not WEBHOOK_SECRET
+        or secret != WEBHOOK_SECRET
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    bases = []
+
+    for i in range(1, 5):
+        time_value = str(
+            data.get(
+                f"base{i}_time",
+                "--",
+            )
+        ).strip()
+
+        net_value = _safe_float(
+            data.get(
+                f"base{i}_net"
+            )
+        )
+
+        bases.append({
+            "number": i,
+            "time": time_value,
+            "net": net_value,
+            "state": _dashboard_state_text(
+                net_value
+            ),
+        })
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    now_ist = (
+        now_utc.astimezone(
+            ZoneInfo(
+                "Asia/Kolkata"
+            )
+        )
+    )
+
+    state = {
+        "updated_at_utc": (
+            now_utc.isoformat()
+        ),
+        "updated_at_ist": (
+            now_ist.strftime(
+                "%d-%m-%Y %H:%M:%S"
+            )
+        ),
+        "threshold": 0.100,
+        "bases": bases,
+    }
+
+    try:
+        _dashboard_save(
+            state
+        )
+
+    except Exception as exc:
+        print(
+            f"[NQ DASHBOARD SAVE ERROR] {exc}",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        "[NQ DASHBOARD UPDATE] "
+        + " | ".join(
+            f"B{x['number']}={x['net']}"
+            for x in bases
+        ),
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "mode": "nq_live_4base_dashboard",
+        "updated_at_ist": state[
+            "updated_at_ist"
+        ],
+        "bases": bases,
+    }), 200
+
+
+# ============================================================
+# NQ DASHBOARD JSON DATA
+# ============================================================
+
+@app.get("/nq-dashboard-data")
+def nq_dashboard_data():
+    state = _dashboard_load()
+
+    return jsonify({
+        "ok": True,
+        **state,
+    })
+
+
+# ============================================================
+# NQ LIVE 4-BASE BROWSER DASHBOARD
+# ============================================================
+
+@app.get("/nq-dashboard")
+def nq_dashboard():
+    html = """
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>NQ LIVE 4-BASE DASHBOARD</title>
+
+<style>
+
+body {
+    margin: 0;
+    padding: 20px;
+    background: #0d1117;
+    color: #f0f6fc;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+.container {
+    max-width: 850px;
+    margin: 0 auto;
+}
+
+h1 {
+    text-align: center;
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    text-align: center;
+    color: #8b949e;
+    margin-bottom: 25px;
+}
+
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th {
+    background: #21262d;
+    padding: 15px 10px;
+    font-size: 14px;
+}
+
+td {
+    padding: 18px 10px;
+    text-align: center;
+    border-top: 1px solid #30363d;
+    font-size: 18px;
+}
+
+.net {
+    font-weight: bold;
+    font-size: 22px;
+}
+
+.buy {
+    color: #3fb950;
+    font-weight: bold;
+}
+
+.sell {
+    color: #f85149;
+    font-weight: bold;
+}
+
+.neutral {
+    color: #d29922;
+    font-weight: bold;
+}
+
+.footer {
+    margin-top: 18px;
+    text-align: center;
+    color: #8b949e;
+    line-height: 1.7;
+}
+
+.status {
+    margin-top: 10px;
+    text-align: center;
+    font-size: 13px;
+    color: #8b949e;
+}
+
+@media (max-width: 600px) {
+
+    body {
+        padding: 10px;
+    }
+
+    h1 {
+        font-size: 22px;
+    }
+
+    th {
+        font-size: 12px;
+    }
+
+    td {
+        font-size: 15px;
+        padding: 15px 5px;
+    }
+
+    .net {
+        font-size: 18px;
+    }
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>NQ LIVE 4-BASE DASHBOARD</h1>
+
+    <div class="subtitle">
+        NASDAQ 10-STOCK | QQQ WEIGHTED | ROLLING LAST-4
+    </div>
+
+    <div class="card">
+
+        <table>
+
+            <thead>
+
+                <tr>
+                    <th>BASE</th>
+                    <th>TIME</th>
+                    <th>CURRENT NET</th>
+                    <th>STATE</th>
+                </tr>
+
+            </thead>
+
+            <tbody id="rows">
+
+                <tr>
+                    <td colspan="4">
+                        Waiting for TradingView data...
+                    </td>
+                </tr>
+
+            </tbody>
+
+        </table>
+
+    </div>
+
+    <div class="footer">
+
+        Threshold:
+        <strong>+0.100% BUY</strong>
+        /
+        <strong>-0.100% SELL</strong>
+
+        <br>
+
+        QQQ Top-10 Weight:
+        <strong>46.76%</strong>
+
+        <br>
+
+        Last Update:
+        <span id="updated">--</span>
+        IST
+
+    </div>
+
+    <div
+        class="status"
+        id="connection"
+    >
+        Loading...
+    </div>
+
+</div>
+
+<script>
+
+function escapeHtml(value) {
+
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+
+function formatNet(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(
+            Number(value)
+        )
+    ) {
+        return "--";
+    }
+
+    const n = Number(value);
+
+    const sign =
+        n >= 0
+        ? "+"
+        : "";
+
+    return (
+        sign
+        + n.toFixed(3)
+        + "%"
+    );
+}
+
+
+function stateClass(state) {
+
+    if (
+        state === "BUY SIDE"
+    ) {
+        return "buy";
+    }
+
+    if (
+        state === "SELL SIDE"
+    ) {
+        return "sell";
+    }
+
+    return "neutral";
+}
+
+
+async function refreshDashboard() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/nq-dashboard-data?ts="
+                + Date.now(),
+                {
+                    cache: "no-store"
+                }
+            );
+
+        const data =
+            await response.json();
+
+        const rows =
+            document.getElementById(
+                "rows"
+            );
+
+        if (
+            !data.bases ||
+            data.bases.length === 0
+        ) {
+
+            rows.innerHTML =
+                '<tr>'
+                + '<td colspan="4">'
+                + 'Waiting for TradingView data...'
+                + '</td>'
+                + '</tr>';
+
+            document.getElementById(
+                "connection"
+            ).textContent =
+                "No dashboard data received yet.";
+
+            return;
+        }
+
+        let html = "";
+
+        for (
+            const base
+            of data.bases
+        ) {
+
+            const cls =
+                stateClass(
+                    base.state
+                );
+
+            html +=
+                "<tr>"
+
+                + "<td><strong>#"
+                + escapeHtml(
+                    base.number
+                )
+                + "</strong></td>"
+
+                + "<td>"
+                + escapeHtml(
+                    base.time || "--"
+                )
+                + "</td>"
+
+                + '<td class="net '
+                + cls
+                + '">'
+                + escapeHtml(
+                    formatNet(
+                        base.net
+                    )
+                )
+                + "</td>"
+
+                + '<td class="'
+                + cls
+                + '">'
+                + escapeHtml(
+                    base.state || "--"
+                )
+                + "</td>"
+
+                + "</tr>";
+        }
+
+        rows.innerHTML =
+            html;
+
+        document.getElementById(
+            "updated"
+        ).textContent =
+            data.updated_at_ist
+            || "--";
+
+        document.getElementById(
+            "connection"
+        ).textContent =
+            "LIVE • Auto refresh every 5 seconds";
+
+    }
+
+    catch (error) {
+
+        document.getElementById(
+            "connection"
+        ).textContent =
+            "Waiting for server...";
+
+    }
+}
+
+
+refreshDashboard();
+
+setInterval(
+    refreshDashboard,
+    5000
+);
+
+</script>
+
+</body>
+
+</html>
+"""
+
+    return html, 200, {
+        "Content-Type":
+            "text/html; charset=utf-8",
+
+        "Cache-Control":
+            "no-store, no-cache, must-revalidate",
+    }
