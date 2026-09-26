@@ -2102,3 +2102,740 @@ setInterval(
         "Cache-Control":
             "no-store, no-cache, must-revalidate",
     }
+# ============================================================
+# NQ FIXED 1H DASHBOARD
+# SEPARATE FROM EXISTING LAST-4 DASHBOARD
+# ============================================================
+
+NQ_FIXED1H_DASHBOARD_STATE_FILE = os.path.join(
+    "/var/data",
+    "nq_fixed1h_dashboard.json",
+)
+
+NQ_FIXED1H_DASHBOARD_LOCK = threading.Lock()
+
+
+def _fixed1h_safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fixed1h_load():
+    try:
+        with NQ_FIXED1H_DASHBOARD_LOCK:
+            with open(
+                NQ_FIXED1H_DASHBOARD_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+
+    except FileNotFoundError:
+        pass
+
+    except Exception as exc:
+        print(
+            f"[FIXED1H DASHBOARD READ ERROR] {exc}",
+            flush=True,
+        )
+
+    return {
+        "updated_at_utc": None,
+        "updated_at_ist": None,
+        "base_time": None,
+        "update_time": None,
+        "direct": None,
+        "carry": None,
+        "added": None,
+        "state": "NONE",
+        "threshold": 0.100,
+        "total_weight": 47.00,
+        "last_trigger": "NONE",
+        "last_trigger_type": "NONE",
+        "last_trigger_value": None,
+        "last_trigger_time": "NONE",
+        "stocks": [],
+    }
+
+
+def _fixed1h_save(data):
+    os.makedirs(
+        os.path.dirname(NQ_FIXED1H_DASHBOARD_STATE_FILE),
+        exist_ok=True,
+    )
+
+    tmp = (
+        NQ_FIXED1H_DASHBOARD_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with NQ_FIXED1H_DASHBOARD_LOCK:
+        try:
+            with open(
+                tmp,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    data,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(
+                tmp,
+                NQ_FIXED1H_DASHBOARD_STATE_FILE,
+            )
+
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+@app.post("/fixed1h-dashboard-webhook")
+def fixed1h_dashboard_webhook():
+    secret = request.args.get("secret", "")
+
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    if (
+        str(data.get("type", "")).strip()
+        != "NASDAQ_FIXED_1H_DASHBOARD"
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "invalid_dashboard_payload",
+        }), 400
+
+    stocks_raw = data.get("stocks", [])
+    stocks = []
+
+    if isinstance(stocks_raw, list):
+        for item in stocks_raw:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = str(
+                item.get("symbol", "")
+            ).strip().upper()
+
+            if not symbol:
+                continue
+
+            stocks.append({
+                "symbol": symbol,
+                "weight": _fixed1h_safe_float(
+                    item.get("weight")
+                ),
+                "open": _fixed1h_safe_float(
+                    item.get("open")
+                ),
+                "live": _fixed1h_safe_float(
+                    item.get("live")
+                ),
+                "move_pct": _fixed1h_safe_float(
+                    item.get("move_pct")
+                ),
+                "weighted": _fixed1h_safe_float(
+                    item.get("weighted")
+                ),
+            })
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    state = {
+        "updated_at_utc": now_utc.isoformat(),
+        "updated_at_ist": now_ist.strftime(
+            "%d-%m-%Y %H:%M:%S"
+        ),
+        "base_time": str(
+            data.get("base_time", "--")
+        ),
+        "update_time": str(
+            data.get("update_time", "--")
+        ),
+        "direct": _fixed1h_safe_float(
+            data.get("direct")
+        ),
+        "carry": _fixed1h_safe_float(
+            data.get("carry")
+        ),
+        "added": _fixed1h_safe_float(
+            data.get("added")
+        ),
+        "state": str(
+            data.get("state", "NONE")
+        ).upper(),
+        "threshold": _fixed1h_safe_float(
+            data.get("threshold")
+        ),
+        "total_weight": _fixed1h_safe_float(
+            data.get("total_weight")
+        ),
+        "last_trigger": str(
+            data.get("last_trigger", "NONE")
+        ).upper(),
+        "last_trigger_type": str(
+            data.get("last_trigger_type", "NONE")
+        ).upper(),
+        "last_trigger_value": _fixed1h_safe_float(
+            data.get("last_trigger_value")
+        ),
+        "last_trigger_time": str(
+            data.get("last_trigger_time", "NONE")
+        ),
+        "stocks": stocks,
+    }
+
+    if state["threshold"] is None:
+        state["threshold"] = 0.100
+
+    if state["total_weight"] is None:
+        state["total_weight"] = 47.00
+
+    try:
+        _fixed1h_save(state)
+
+    except Exception as exc:
+        print(
+            f"[FIXED1H DASHBOARD SAVE ERROR] {exc}",
+            flush=True,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        "[FIXED1H DASHBOARD UPDATE] "
+        f"BASE={state['base_time']} "
+        f"| DIRECT={state['direct']} "
+        f"| CARRY={state['carry']} "
+        f"| ADDED={state['added']} "
+        f"| STATE={state['state']} "
+        f"| STOCKS={len(stocks)}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "mode": "nq_fixed1h_dashboard",
+        "updated_at_ist": state["updated_at_ist"],
+        "base_time": state["base_time"],
+        "direct": state["direct"],
+        "carry": state["carry"],
+        "added": state["added"],
+        "state": state["state"],
+        "stocks_received": len(stocks),
+    }), 200
+
+
+@app.get("/fixed1h-dashboard-data")
+def fixed1h_dashboard_data():
+    state = _fixed1h_load()
+    return jsonify({
+        "ok": True,
+        **state,
+    })
+
+
+@app.get("/fixed1h-dashboard")
+def fixed1h_dashboard():
+    html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+<title>NQ FIXED 1H DASHBOARD</title>
+
+<style>
+body {
+    margin: 0;
+    padding: 20px;
+    background: #0d1117;
+    color: #f0f6fc;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+.container {
+    max-width: 1150px;
+    margin: 0 auto;
+}
+
+h1 {
+    text-align: center;
+    margin: 0 0 5px 0;
+}
+
+.subtitle {
+    text-align: center;
+    color: #8b949e;
+    margin-bottom: 20px;
+}
+
+.summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+}
+
+.metric {
+    padding: 14px;
+    text-align: center;
+}
+
+.metric-label {
+    color: #8b949e;
+    font-size: 12px;
+    margin-bottom: 7px;
+}
+
+.metric-value {
+    font-size: 20px;
+    font-weight: bold;
+}
+
+.table-card {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 800px;
+}
+
+th {
+    background: #21262d;
+    padding: 12px 8px;
+    font-size: 13px;
+}
+
+td {
+    padding: 12px 8px;
+    text-align: center;
+    border-top: 1px solid #30363d;
+    font-size: 15px;
+}
+
+.buy {
+    color: #3fb950;
+    font-weight: bold;
+}
+
+.sell {
+    color: #f85149;
+    font-weight: bold;
+}
+
+.neutral {
+    color: #d29922;
+    font-weight: bold;
+}
+
+.trigger {
+    margin-top: 14px;
+    padding: 14px;
+    line-height: 1.7;
+}
+
+.footer {
+    margin-top: 15px;
+    text-align: center;
+    color: #8b949e;
+    line-height: 1.7;
+    font-size: 13px;
+}
+
+@media (max-width: 850px) {
+    body {
+        padding: 10px;
+    }
+
+    .summary {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 500px) {
+    .summary {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+    <h1>NQ FIXED 1H DASHBOARD</h1>
+
+    <div class="subtitle">
+        NASDAQ 10-STOCK | FIXED 1H OPEN + CONTRIBUTION ADD | ±0.100%
+    </div>
+
+    <div class="summary">
+        <div class="card metric">
+            <div class="metric-label">FIXED 1H BASE</div>
+            <div class="metric-value" id="baseTime">--</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">1H DIRECT</div>
+            <div class="metric-value" id="direct">--</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">CARRY</div>
+            <div class="metric-value" id="carry">--</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">ADDED</div>
+            <div class="metric-value" id="added">--</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">STATE</div>
+            <div class="metric-value" id="state">NONE</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">THRESHOLD</div>
+            <div class="metric-value" id="threshold">±0.100%</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">TOP-10 WEIGHT</div>
+            <div class="metric-value" id="weight">47.00%</div>
+        </div>
+
+        <div class="card metric">
+            <div class="metric-label">TRADINGVIEW UPDATE</div>
+            <div class="metric-value" id="updateTime">--</div>
+        </div>
+    </div>
+
+    <div class="card table-card">
+        <table>
+            <thead>
+                <tr>
+                    <th>STOCK</th>
+                    <th>WEIGHT</th>
+                    <th>1H OPEN</th>
+                    <th>LIVE</th>
+                    <th>OPEN→LIVE</th>
+                    <th>WEIGHTED</th>
+                </tr>
+            </thead>
+            <tbody id="stockRows">
+                <tr>
+                    <td colspan="6">
+                        Waiting for TradingView data...
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card trigger">
+        <strong>LAST TRIGGER:</strong>
+        <span id="lastTrigger">NONE</span>
+        &nbsp; | &nbsp;
+        <strong>TYPE:</strong>
+        <span id="lastTriggerType">NONE</span>
+        &nbsp; | &nbsp;
+        <strong>VALUE:</strong>
+        <span id="lastTriggerValue">--</span>
+        &nbsp; | &nbsp;
+        <strong>TIME:</strong>
+        <span id="lastTriggerTime">NONE</span>
+    </div>
+
+    <div class="footer">
+        Backend update:
+        <span id="updated">--</span>
+        IST
+        <br>
+        <span id="connection">
+            Loading...
+        </span>
+    </div>
+
+</div>
+
+<script>
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function numberText(value, decimals) {
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(Number(value))
+    ) {
+        return "--";
+    }
+
+    return Number(value).toFixed(decimals);
+}
+
+function percentText(value, decimals) {
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(Number(value))
+    ) {
+        return "--";
+    }
+
+    const n = Number(value);
+    const sign = n > 0 ? "+" : "";
+    return sign + n.toFixed(decimals) + "%";
+}
+
+function sideClass(value) {
+    const n = Number(value);
+
+    if (Number.isNaN(n)) {
+        return "neutral";
+    }
+
+    if (n > 0) {
+        return "buy";
+    }
+
+    if (n < 0) {
+        return "sell";
+    }
+
+    return "neutral";
+}
+
+function stateClass(value) {
+    const s = String(value || "").toUpperCase();
+
+    if (s === "BUY") {
+        return "buy";
+    }
+
+    if (s === "SELL") {
+        return "sell";
+    }
+
+    return "neutral";
+}
+
+async function refreshDashboard() {
+    try {
+        const response = await fetch(
+            "/fixed1h-dashboard-data?ts=" + Date.now(),
+            {
+                cache: "no-store"
+            }
+        );
+
+        const data = await response.json();
+
+        document.getElementById(
+            "baseTime"
+        ).textContent = data.base_time || "--";
+
+        const directEl = document.getElementById("direct");
+        directEl.textContent = percentText(data.direct, 3);
+        directEl.className =
+            "metric-value " + sideClass(data.direct);
+
+        const carryEl = document.getElementById("carry");
+        carryEl.textContent = percentText(data.carry, 3);
+        carryEl.className =
+            "metric-value " + sideClass(data.carry);
+
+        const addedEl = document.getElementById("added");
+        addedEl.textContent = percentText(data.added, 3);
+        addedEl.className =
+            "metric-value " + sideClass(data.added);
+
+        const stateEl = document.getElementById("state");
+        stateEl.textContent = data.state || "NONE";
+        stateEl.className =
+            "metric-value " + stateClass(data.state);
+
+        document.getElementById(
+            "threshold"
+        ).textContent =
+            "±" + numberText(data.threshold, 3) + "%";
+
+        document.getElementById(
+            "weight"
+        ).textContent =
+            numberText(data.total_weight, 2) + "%";
+
+        document.getElementById(
+            "updateTime"
+        ).textContent =
+            data.update_time || "--";
+
+        document.getElementById(
+            "updated"
+        ).textContent =
+            data.updated_at_ist || "--";
+
+        const rows = document.getElementById(
+            "stockRows"
+        );
+
+        if (
+            !Array.isArray(data.stocks) ||
+            data.stocks.length === 0
+        ) {
+            rows.innerHTML =
+                '<tr><td colspan="6">'
+                + 'Waiting for TradingView data...'
+                + '</td></tr>';
+        } else {
+            let html = "";
+
+            for (const stock of data.stocks) {
+                html +=
+                    "<tr>"
+                    + "<td><strong>"
+                    + escapeHtml(stock.symbol || "--")
+                    + "</strong></td>"
+                    + "<td>"
+                    + escapeHtml(
+                        numberText(stock.weight, 2) + "%"
+                    )
+                    + "</td>"
+                    + "<td>"
+                    + escapeHtml(
+                        numberText(stock.open, 2)
+                    )
+                    + "</td>"
+                    + "<td>"
+                    + escapeHtml(
+                        numberText(stock.live, 2)
+                    )
+                    + "</td>"
+                    + '<td class="'
+                    + sideClass(stock.move_pct)
+                    + '">'
+                    + escapeHtml(
+                        percentText(stock.move_pct, 3)
+                    )
+                    + "</td>"
+                    + '<td class="'
+                    + sideClass(stock.weighted)
+                    + '">'
+                    + escapeHtml(
+                        percentText(stock.weighted, 4)
+                    )
+                    + "</td>"
+                    + "</tr>";
+            }
+
+            rows.innerHTML = html;
+        }
+
+        const lastTriggerEl =
+            document.getElementById("lastTrigger");
+
+        lastTriggerEl.textContent =
+            data.last_trigger || "NONE";
+
+        lastTriggerEl.className =
+            stateClass(data.last_trigger);
+
+        document.getElementById(
+            "lastTriggerType"
+        ).textContent =
+            data.last_trigger_type || "NONE";
+
+        const lastValueEl =
+            document.getElementById("lastTriggerValue");
+
+        lastValueEl.textContent =
+            percentText(
+                data.last_trigger_value,
+                3
+            );
+
+        lastValueEl.className =
+            sideClass(data.last_trigger_value);
+
+        document.getElementById(
+            "lastTriggerTime"
+        ).textContent =
+            data.last_trigger_time || "NONE";
+
+        document.getElementById(
+            "connection"
+        ).textContent =
+            "LIVE • Auto refresh every 5 seconds";
+
+    } catch (error) {
+        document.getElementById(
+            "connection"
+        ).textContent =
+            "Waiting for server...";
+    }
+}
+
+refreshDashboard();
+
+setInterval(
+    refreshDashboard,
+    5000
+);
+</script>
+
+</body>
+</html>
+"""
+
+    return html, 200, {
+        "Content-Type":
+            "text/html; charset=utf-8",
+
+        "Cache-Control":
+            "no-store, no-cache, must-revalidate",
+    }
