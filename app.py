@@ -2292,7 +2292,46 @@ def fixed1h_dashboard_webhook():
             "queued": True,
         }), 200
 
-    if payload_type != "NASDAQ_FIXED_1H_DASHBOARD":
+    # MASTER payload: update dashboard and, when event is BUY/SELL,
+    # also send the Fixed-1H Pushover from the same webhook call.
+    if payload_type == "NASDAQ_FIXED_1H_MASTER":
+        event = str(data.get("event", "UPDATE")).strip().upper()
+
+        if event in {"BUY", "SELL"}:
+            trigger_type = str(data.get("last_trigger_type", "NONE")).strip().upper()
+            trigger_value = _fixed1h_safe_float(data.get("last_trigger_value"))
+            direct_value = _fixed1h_safe_float(data.get("direct"))
+            threshold_value = _fixed1h_safe_float(data.get("threshold"))
+
+            title = f"NASDAQ 10-STOCK {event}"
+            message = (
+                "FIXED 1H OPEN BASE"
+                f"\nTYPE: {trigger_type}"
+                f"\nTRIGGER: {trigger_value:.3f}%"
+                f"\nDIRECT: {direct_value:.3f}%"
+                f"\nTHRESHOLD: ±{threshold_value:.3f}%"
+            )
+
+            def _send_fixed1h_master():
+                try:
+                    _fixed1h_send_pushover(title, message)
+                except Exception as exc:
+                    print(
+                        f"[FIXED1H MASTER PUSHOVER ERROR] {exc}",
+                        flush=True,
+                    )
+
+            threading.Thread(
+                target=_send_fixed1h_master,
+                daemon=True,
+            ).start()
+
+            print(
+                f"[FIXED1H MASTER SIGNAL] {event} | {message}",
+                flush=True,
+            )
+
+    elif payload_type != "NASDAQ_FIXED_1H_DASHBOARD":
         return jsonify({
             "ok": False,
             "error": "invalid_fixed1h_payload",
