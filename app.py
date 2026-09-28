@@ -3633,7 +3633,7 @@ def coinglass_orders_test():
         }), 502
 
 # ============================================================
-# COINGLASS V13 - BTC EXACT TRAILING 60M TRADE-COUNT MONITOR
+# COINGLASS V14 - BTC EXACT TRAILING 60M TRADE-COUNT MONITOR
 # Verified CoinGlass liquidation semantics:
 #   side=1 -> LONG liquidation
 #   side=2 -> SHORT liquidation
@@ -3643,7 +3643,7 @@ def coinglass_orders_test():
 # Strict alternation: same state never repeats.
 # ============================================================
 
-BTC_LIQ_STATE_FILE = os.path.join('/var/data', 'btc_coinglass_60m_state.json')
+BTC_LIQ_STATE_FILE = os.path.join('/var/data', 'btc_liquidation_state.json')
 BTC_LIQ_MONITOR_LOCK_FILE = os.path.join('/var/data', 'btc_coinglass_monitor.lock')
 BTC_LIQ_LOCK = threading.Lock()
 BTC_LIQ_MONITOR_START_LOCK = threading.Lock()
@@ -3696,8 +3696,15 @@ def _btc_load_state():
             for k in BTC_LIQ_STATE:
                 if k in saved:
                     BTC_LIQ_STATE[k] = saved[k]
-    except Exception:
-        pass
+            print(
+                f"[BTC 60M DISK] state loaded path={BTC_LIQ_STATE_FILE} "
+                f"state={BTC_LIQ_STATE.get('state')}",
+                flush=True,
+            )
+    except FileNotFoundError:
+        print(f'[BTC 60M DISK] no previous state yet path={BTC_LIQ_STATE_FILE}', flush=True)
+    except Exception as exc:
+        print(f'[BTC 60M DISK LOAD ERROR] {exc}', flush=True)
 
 
 def _btc_send_pushover(title, message):
