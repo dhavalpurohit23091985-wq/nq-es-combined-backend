@@ -3290,7 +3290,7 @@ def coinglass_test():
 
 
 # ============================================================
-# COINGLASS V10 - INDIVIDUAL LIQUIDATION ORDER ENDPOINT TEST
+# COINGLASS V11 - INDIVIDUAL LIQUIDATION ORDER ENDPOINT TEST
 # Source endpoint: /api/futures/liquidation/order
 # Reuses the verified V8 AES + pako/inflate decryption flow.
 # This is intentionally a schema-discovery endpoint first; once the
@@ -3319,6 +3319,7 @@ def coinglass_orders_test():
     exchange = (request.args.get("exchange") or "").strip()
     limit_text = (request.args.get("limit") or "").strip()
     page_size_text = (request.args.get("pageSize") or "100").strip()
+    page_num_text = (request.args.get("pageNum") or "1").strip()
 
     params = {"symbol": symbol}
     if exchange:
@@ -3332,6 +3333,12 @@ def coinglass_orders_test():
         params["pageSize"] = int(page_size_text)
     else:
         params["pageSize"] = 100
+
+    # CoinGlass also requires pageNum as an integer. Default to first page.
+    if page_num_text.isdigit() and int(page_num_text) > 0:
+        params["pageNum"] = int(page_num_text)
+    else:
+        params["pageNum"] = 1
 
     # Browser-like request. cache-ts-v2 is generated fresh each request.
     cache_ts_v2 = str(int(time.time() * 1000))
@@ -3546,11 +3553,12 @@ def coinglass_orders_test():
 
         result = {
             "ok": bool(r.ok),
-            "diagnostic_version": "COINGLASS_V10_LIQUIDATION_ORDER_PAGESIZE",
+            "diagnostic_version": "COINGLASS_V11_LIQUIDATION_ORDER_PAGESIZE_PAGENUM",
             "requested_symbol": symbol,
             "requested_exchange": exchange or None,
             "requested_limit": params.get("limit"),
             "requested_pageSize": params.get("pageSize"),
+            "requested_pageNum": params.get("pageNum"),
             "http_status": r.status_code,
             "final_url": r.url,
             "json_parse_ok": json_parse_ok,
