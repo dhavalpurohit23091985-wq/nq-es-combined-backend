@@ -2981,8 +2981,8 @@ setInterval(
     }
 
 # ============================================================
-# COINGLASS ISOLATED DIAGNOSTIC V6
-# Exact current CoinGlass two-stage AES-ECB/PKCS7 response flow
+# COINGLASS ISOLATED DIAGNOSTIC V7
+# Correct current CoinGlass two-stage AES-ECB/PKCS7 response flow
 # reconstructed from the uploaded _app-cd1f34fb3d7c610a.js.
 # Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
 # ============================================================
@@ -3129,16 +3129,25 @@ def coinglass_test():
             ).decode("ascii")[:16]
             report["stage1_key_length"] = len(stage1_key)
 
-            # JS case 4: a = Sn(t.data.data, a)
+            # Exact JS interceptor order:
+            #   a = Sn(t.headers.user, a)
+            #   o = Sn(t.data.data, a)
+            # Stage 1 therefore decrypts the RESPONSE HEADER `user`,
+            # not the encrypted data payload.
+            encrypted_user = response_obj.headers.get("user") or ""
+            if not encrypted_user:
+                raise ValueError("missing CoinGlass user response header")
+
             stage2_key = _aes_ecb_decrypt_cryptojs(
-                encrypted_data,
+                encrypted_user,
                 stage1_key,
             )
             report["stage1_success"] = True
+            report["encrypted_user_length"] = len(encrypted_user)
             report["stage2_key_length"] = len(stage2_key.encode("utf-8"))
             # Do not expose the derived key itself in the diagnostic response.
 
-            # JS case 0: o = Sn(t.data.data, a)
+            # Stage 2 decrypts data.data with the key derived from `user`.
             plaintext = _aes_ecb_decrypt_cryptojs(
                 encrypted_data,
                 stage2_key,
@@ -3183,7 +3192,7 @@ def coinglass_test():
 
         result = {
             "ok": bool(r.ok),
-            "diagnostic_version": "COINGLASS_V6_EXACT_TWO_STAGE_AES",
+            "diagnostic_version": "COINGLASS_V7_HEADER_USER_TWO_STAGE_AES",
             "http_status": r.status_code,
             "final_url": r.url,
             "json_parse_ok": json_parse_ok,
@@ -3232,7 +3241,7 @@ def coinglass_test():
 
         decrypt_info = result.get("decrypt", {})
         print(
-            "[COINGLASS V6] "
+            "[COINGLASS V7] "
             f"status={r.status_code} "
             f"v={v_value} "
             f"seed_source={decrypt_info.get('seed_source')} "
@@ -3247,12 +3256,12 @@ def coinglass_test():
 
     except requests.RequestException as exc:
         print(
-            f"[COINGLASS V6 REQUEST ERROR] {exc}",
+            f"[COINGLASS V7 REQUEST ERROR] {exc}",
             flush=True,
         )
         return jsonify({
             "ok": False,
-            "diagnostic_version": "COINGLASS_V6_EXACT_TWO_STAGE_AES",
+            "diagnostic_version": "COINGLASS_V7_HEADER_USER_TWO_STAGE_AES",
             "error": "request_failed",
             "detail": str(exc),
         }), 502
