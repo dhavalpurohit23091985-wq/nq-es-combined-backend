@@ -2235,6 +2235,35 @@ def _fixed1h_send_pushover(title, message):
         return False
 
 
+
+# ============================================================
+# TEMP FIXED-1H PUSHOVER TEST
+# Protected by existing WEBHOOK_SECRET.
+# ============================================================
+
+@app.get("/fixed1h-pushover-test")
+def fixed1h_pushover_test():
+    secret = request.args.get("secret", "")
+
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    ok = _fixed1h_send_pushover(
+        "NASDAQ FIXED 1H TEST",
+        "Master Pushover connection test",
+    )
+
+    print(f"[FIXED1H PUSHOVER TEST] ok={ok}", flush=True)
+
+    return jsonify({
+        "ok": bool(ok),
+        "mode": "fixed1h_pushover_test",
+    }), 200 if ok else 502
+
+
 @app.post("/fixed1h-dashboard-webhook")
 def fixed1h_dashboard_webhook():
     secret = request.args.get("secret", "")
