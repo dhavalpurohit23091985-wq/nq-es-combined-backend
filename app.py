@@ -2981,7 +2981,7 @@ setInterval(
     }
 
 # ============================================================
-# COINGLASS ISOLATED DIAGNOSTIC V7
+# COINGLASS ISOLATED DIAGNOSTIC V8
 # Correct current CoinGlass two-stage AES-ECB/PKCS7 response flow
 # reconstructed from the uploaded _app-cd1f34fb3d7c610a.js.
 # Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
@@ -3047,8 +3047,26 @@ def coinglass_test():
             raise ValueError("invalid padding bytes")
         return raw[:-pad]
 
+    def _coinglass_wn_decode(compressed_bytes):
+        """Exact role of CoinGlass wn(): pako inflate bytes, then UTF-8 text."""
+        import zlib
+
+        # The uploaded bundle imports pako and wn() passes the AES-decrypted
+        # byte array into pako's inflate path before converting it to UTF-8.
+        # pako inflate accepts zlib/gzip-wrapped streams; keep raw-deflate as
+        # a compatibility fallback without changing the cryptographic flow.
+        last_error = None
+        for wbits in (47, 15, -15):
+            try:
+                inflated = zlib.decompress(compressed_bytes, wbits)
+                return inflated.decode("utf-8")
+            except Exception as exc:
+                last_error = exc
+
+        raise ValueError("CoinGlass wn()/inflate failed: " + str(last_error))
+
     def _aes_ecb_decrypt_cryptojs(ciphertext_b64, key_text):
-        """Equivalent to CryptoJS AES.decrypt(... Utf8.parse(key), ECB, Pkcs7)."""
+        """CoinGlass Sn(): AES-ECB/PKCS7 -> hex bytes -> wn()/inflate -> UTF-8."""
         from Crypto.Cipher import AES
 
         key = str(key_text).encode("utf-8")
@@ -3067,7 +3085,11 @@ def coinglass_test():
 
         raw = AES.new(key, AES.MODE_ECB).decrypt(cipher_bytes)
         plain = _pkcs7_unpad(raw)
-        decoded = plain.decode("utf-8")
+
+        # IMPORTANT: CoinGlass does NOT UTF-8 decode AES plaintext directly.
+        # JS Sn() converts the decrypted Hex WordArray back to bytes and wn()
+        # inflates those bytes first. V7 missed this inflate step.
+        decoded = _coinglass_wn_decode(plain)
 
         # CoinGlass Sn() strips a surrounding double quote if present.
         if decoded.startswith('"'):
@@ -3094,7 +3116,7 @@ def coinglass_test():
         if v == "1":
             # Current endpoint normally returns fixed-key versions (55/66/77).
             # Keep v=1 explicit rather than guessing Mn(url)'s transformed value.
-            raise ValueError("v=1 URL-derived seed not implemented in V6")
+            raise ValueError("v=1 URL-derived seed not implemented in V8")
 
         raise ValueError(f"unsupported CoinGlass v header: {v!r}")
 
@@ -3192,7 +3214,7 @@ def coinglass_test():
 
         result = {
             "ok": bool(r.ok),
-            "diagnostic_version": "COINGLASS_V7_HEADER_USER_TWO_STAGE_AES",
+            "diagnostic_version": "COINGLASS_V8_HEADER_USER_AES_PAKO_INFLATE",
             "http_status": r.status_code,
             "final_url": r.url,
             "json_parse_ok": json_parse_ok,
@@ -3241,7 +3263,7 @@ def coinglass_test():
 
         decrypt_info = result.get("decrypt", {})
         print(
-            "[COINGLASS V7] "
+            "[COINGLASS V8] "
             f"status={r.status_code} "
             f"v={v_value} "
             f"seed_source={decrypt_info.get('seed_source')} "
@@ -3256,12 +3278,12 @@ def coinglass_test():
 
     except requests.RequestException as exc:
         print(
-            f"[COINGLASS V7 REQUEST ERROR] {exc}",
+            f"[COINGLASS V8 REQUEST ERROR] {exc}",
             flush=True,
         )
         return jsonify({
             "ok": False,
-            "diagnostic_version": "COINGLASS_V7_HEADER_USER_TWO_STAGE_AES",
+            "diagnostic_version": "COINGLASS_V8_HEADER_USER_AES_PAKO_INFLATE",
             "error": "request_failed",
             "detail": str(exc),
         }), 502
