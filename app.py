@@ -2981,8 +2981,10 @@ setInterval(
     }
 
 # ============================================================
-# COINGLASS ISOLATED DIAGNOSTIC V4
-# Capture response headers needed for encrypted-data key branch.
+# COINGLASS ISOLATED DIAGNOSTIC V5
+# V=66 + USER branch investigation.
+# Captures the encrypted response and tests safe AES-ECB/PKCS7
+# key candidates derived from the response USER header.
 # Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
 # ============================================================
 
@@ -2995,6 +2997,9 @@ def coinglass_test():
             "ok": False,
             "error": "unauthorized",
         }), 401
+
+    import base64
+    import hashlib
 
     url = "https://capi.coinglass.com/api/coin/liquidation"
 
@@ -3021,28 +3026,149 @@ def coinglass_test():
         ),
     }
 
+    def _pkcs7_unpad(raw):
+        if not raw:
+            raise ValueError("empty plaintext")
+        pad = raw[-1]
+        if pad < 1 or pad > 16:
+            raise ValueError("invalid padding")
+        if raw[-pad:] != bytes([pad]) * pad:
+            raise ValueError("invalid padding bytes")
+        return raw[:-pad]
+
+    def _candidate_keys(user_value):
+        candidates = []
+        seen = set()
+
+        def add(name, value):
+            if isinstance(value, str):
+                value = value.encode("utf-8")
+            if not isinstance(value, (bytes, bytearray)):
+                return
+            value = bytes(value)
+            if len(value) not in (16, 24, 32):
+                return
+            if value in seen:
+                return
+            seen.add(value)
+            candidates.append((name, value))
+
+        u = str(user_value or "")
+        ub = u.encode("utf-8")
+
+        # Direct USER slices.
+        add("user_first16", ub[:16])
+        add("user_last16", ub[-16:])
+        add("user_first24", ub[:24])
+        add("user_first32", ub[:32])
+        add("user_last24", ub[-24:])
+        add("user_last32", ub[-32:])
+
+        # Common digest-derived AES keys.
+        add("md5_user_raw16", hashlib.md5(ub).digest())
+        add("md5_user_hex_first16", hashlib.md5(ub).hexdigest()[:16])
+        add("sha256_user_raw16", hashlib.sha256(ub).digest()[:16])
+        add("sha256_user_raw32", hashlib.sha256(ub).digest())
+        add("sha256_user_hex_first16", hashlib.sha256(ub).hexdigest()[:16])
+        add("sha256_user_hex_first32", hashlib.sha256(ub).hexdigest()[:32])
+
+        # USER itself may be Base64.
+        try:
+            decoded = base64.b64decode(u + "=" * (-len(u) % 4), validate=False)
+            add("user_b64_first16", decoded[:16])
+            add("user_b64_last16", decoded[-16:])
+            add("user_b64_first24", decoded[:24])
+            add("user_b64_first32", decoded[:32])
+            add("md5_user_b64_raw16", hashlib.md5(decoded).digest())
+            add("sha256_user_b64_raw16", hashlib.sha256(decoded).digest()[:16])
+            add("sha256_user_b64_raw32", hashlib.sha256(decoded).digest())
+        except Exception:
+            pass
+
+        return candidates
+
+    def _try_decrypt(ciphertext_b64, user_value):
+        report = {
+            "crypto_available": False,
+            "cipher_base64_ok": False,
+            "cipher_bytes": None,
+            "candidates_tested": [],
+            "decrypt_success": False,
+            "winning_candidate": None,
+            "plaintext_preview": None,
+            "plaintext_json": None,
+        }
+
+        try:
+            from Crypto.Cipher import AES
+            report["crypto_available"] = True
+        except Exception as exc:
+            report["crypto_error"] = (
+                "PyCryptodome not installed: " + str(exc)
+            )
+            return report
+
+        try:
+            cipher_bytes = base64.b64decode(
+                str(ciphertext_b64) + "=" * (-len(str(ciphertext_b64)) % 4),
+                validate=False,
+            )
+            report["cipher_base64_ok"] = True
+            report["cipher_bytes"] = len(cipher_bytes)
+        except Exception as exc:
+            report["cipher_error"] = str(exc)
+            return report
+
+        if len(cipher_bytes) == 0 or len(cipher_bytes) % 16 != 0:
+            report["cipher_error"] = "cipher length is not AES block aligned"
+            return report
+
+        for name, key in _candidate_keys(user_value):
+            item = {
+                "name": name,
+                "key_length": len(key),
+                "padding_ok": False,
+                "utf8_ok": False,
+                "json_ok": False,
+            }
+
+            try:
+                decrypted = AES.new(key, AES.MODE_ECB).decrypt(cipher_bytes)
+                plain = _pkcs7_unpad(decrypted)
+                item["padding_ok"] = True
+
+                decoded = plain.decode("utf-8")
+                item["utf8_ok"] = True
+
+                try:
+                    obj = json.loads(decoded)
+                    item["json_ok"] = True
+                except Exception:
+                    obj = None
+
+                # Only accept a strong plaintext result:
+                # valid UTF-8 plus JSON.
+                if obj is not None:
+                    report["decrypt_success"] = True
+                    report["winning_candidate"] = name
+                    report["plaintext_preview"] = decoded[:1000]
+                    report["plaintext_json"] = obj
+                    report["candidates_tested"].append(item)
+                    break
+
+            except Exception as exc:
+                item["error"] = str(exc)[:120]
+
+            report["candidates_tested"].append(item)
+
+        return report
+
     try:
         r = requests.get(
             url,
             headers=headers,
             timeout=20,
         )
-
-        response_headers = {
-            str(k): str(v)
-            for k, v in r.headers.items()
-        }
-
-        important_headers = {
-            "v": r.headers.get("v"),
-            "user": r.headers.get("user"),
-            "time": r.headers.get("time"),
-            "encryption": r.headers.get("encryption"),
-            "content-type": r.headers.get("content-type"),
-            "content-encoding": r.headers.get("content-encoding"),
-            "server": r.headers.get("server"),
-            "date": r.headers.get("date"),
-        }
 
         try:
             parsed = r.json()
@@ -3051,14 +3177,24 @@ def coinglass_test():
             parsed = None
             json_parse_ok = False
 
+        v_value = r.headers.get("v")
+        user_value = r.headers.get("user")
+        time_value = r.headers.get("time")
+
         result = {
             "ok": bool(r.ok),
-            "diagnostic_version": "COINGLASS_V4_HEADERS",
+            "diagnostic_version": "COINGLASS_V5_V66_USER_AES",
             "http_status": r.status_code,
             "final_url": r.url,
             "json_parse_ok": json_parse_ok,
-            "KEY_HEADERS": important_headers,
-            "ALL_RESPONSE_HEADERS": response_headers,
+            "KEY_HEADERS": {
+                "v": v_value,
+                "user_present": bool(user_value),
+                "user_length": len(user_value) if user_value else 0,
+                "time": time_value,
+                "encryption": r.headers.get("encryption"),
+                "content-type": r.headers.get("content-type"),
+            },
         }
 
         if isinstance(parsed, dict):
@@ -3070,34 +3206,41 @@ def coinglass_test():
                 "coinglass_msg": parsed.get("msg"),
                 "coinglass_success": parsed.get("success"),
                 "data_present": "data" in parsed,
-                "data_is_null": data is None,
                 "data_type": type(data).__name__,
                 "data_length": (
                     len(data)
                     if isinstance(data, (str, list, dict))
                     else None
                 ),
-                "encrypted_or_encoded": isinstance(data, str),
-                "data_preview": (
-                    data[:300]
-                    if isinstance(data, str)
-                    else data
-                ),
             })
+
+            if isinstance(data, str):
+                result["decrypt"] = _try_decrypt(
+                    data,
+                    user_value,
+                )
+            else:
+                result["decrypt"] = {
+                    "decrypt_success": False,
+                    "reason": "data is not encrypted string",
+                }
+
         else:
             result.update({
                 "body_length": len(r.text),
                 "body_preview": r.text[:1000],
             })
 
+        decrypt_info = result.get("decrypt", {})
+
         print(
-            "[COINGLASS V4] "
+            "[COINGLASS V5] "
             f"status={r.status_code} "
-            f"v={r.headers.get('v')} "
-            f"user={r.headers.get('user')} "
-            f"time={r.headers.get('time')} "
-            f"data_type="
-            f"{type(parsed.get('data')).__name__ if isinstance(parsed, dict) else 'NA'}",
+            f"v={v_value} "
+            f"user_present={bool(user_value)} "
+            f"user_len={len(user_value) if user_value else 0} "
+            f"time={time_value} "
+            f"decrypt_success={decrypt_info.get('decrypt_success')}",
             flush=True,
         )
 
@@ -3105,13 +3248,13 @@ def coinglass_test():
 
     except requests.RequestException as exc:
         print(
-            f"[COINGLASS V4 REQUEST ERROR] {exc}",
+            f"[COINGLASS V5 REQUEST ERROR] {exc}",
             flush=True,
         )
 
         return jsonify({
             "ok": False,
-            "diagnostic_version": "COINGLASS_V4_HEADERS",
+            "diagnostic_version": "COINGLASS_V5_V66_USER_AES",
             "error": "request_failed",
             "detail": str(exc),
         }), 502
