@@ -2980,10 +2980,10 @@ setInterval(
             "no-store, no-cache, must-revalidate",
     }
 
-
 # ============================================================
-# COINGLASS ISOLATED DIAGNOSTIC
+# COINGLASS ISOLATED DIAGNOSTIC V2
 # Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
+# Captures the full safe response shape for comparison with browser.
 # ============================================================
 
 @app.get("/coinglass-test")
@@ -2993,18 +2993,29 @@ def coinglass_test():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     url = "https://capi.coinglass.com/api/futures/home/statistics"
+
     headers = {
         "Accept": "application/json",
         "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "Cache-Is-V2": "1790584622017",
         "Encryption": "true",
         "Language": "en",
         "Origin": "https://www.coinglass.com",
         "Referer": "https://www.coinglass.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
     }
+
+    # Browser capture previously showed this value. Keep it isolated here
+    # so we can verify whether it changes CoinGlass's response shape.
+    headers["Obe"] = "s_36cffab1e8d14c9d967b1fdad45136ee"
 
     try:
         r = requests.get(url, headers=headers, timeout=20)
+
         try:
             parsed = r.json()
         except Exception:
@@ -3013,23 +3024,37 @@ def coinglass_test():
         result = {
             "ok": bool(r.ok),
             "http_status": r.status_code,
-            "content_type": r.headers.get("Content-Type", ""),
             "final_url": r.url,
+            "content_type": r.headers.get("Content-Type", ""),
+            "response_headers": {
+                "content-type": r.headers.get("Content-Type"),
+                "content-length": r.headers.get("Content-Length"),
+                "content-encoding": r.headers.get("Content-Encoding"),
+                "server": r.headers.get("Server"),
+            },
         }
 
         if isinstance(parsed, dict):
             data = parsed.get("data")
+
             result.update({
+                "json_keys": list(parsed.keys()),
                 "coinglass_code": parsed.get("code"),
                 "coinglass_msg": parsed.get("msg"),
                 "coinglass_success": parsed.get("success"),
+                "data_present": "data" in parsed,
                 "data_type": type(data).__name__,
-                "encrypted_or_encoded": isinstance(data, str),
-                "data_length": len(data) if isinstance(data, str) else None,
-                "data_preview": data[:500] if isinstance(data, str) else data,
+                "data_is_null": data is None,
+                "data_length": len(data) if isinstance(data, (str, list, dict)) else None,
+                "data_preview": data[:1000] if isinstance(data, str) else data,
+                "full_json": parsed,
             })
         else:
-            result["body_preview"] = r.text[:1000]
+            result.update({
+                "json_parse_ok": False,
+                "body_length": len(r.text),
+                "body_preview": r.text[:2000],
+            })
 
         return jsonify(result), 200
 
