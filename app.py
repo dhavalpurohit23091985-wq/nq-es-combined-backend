@@ -2979,3 +2979,63 @@ setInterval(
         "Cache-Control":
             "no-store, no-cache, must-revalidate",
     }
+
+
+# ============================================================
+# COINGLASS ISOLATED DIAGNOSTIC
+# Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
+# ============================================================
+
+@app.get("/coinglass-test")
+def coinglass_test():
+    secret = request.args.get("secret", "")
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    url = "https://capi.coinglass.com/api/futures/home/statistics"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "Encryption": "true",
+        "Language": "en",
+        "Origin": "https://www.coinglass.com",
+        "Referer": "https://www.coinglass.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+
+        result = {
+            "ok": bool(r.ok),
+            "http_status": r.status_code,
+            "content_type": r.headers.get("Content-Type", ""),
+            "final_url": r.url,
+        }
+
+        if isinstance(parsed, dict):
+            data = parsed.get("data")
+            result.update({
+                "coinglass_code": parsed.get("code"),
+                "coinglass_msg": parsed.get("msg"),
+                "coinglass_success": parsed.get("success"),
+                "data_type": type(data).__name__,
+                "encrypted_or_encoded": isinstance(data, str),
+                "data_length": len(data) if isinstance(data, str) else None,
+                "data_preview": data[:500] if isinstance(data, str) else data,
+            })
+        else:
+            result["body_preview"] = r.text[:1000]
+
+        return jsonify(result), 200
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "error": "request_failed",
+            "detail": str(exc),
+        }), 500
