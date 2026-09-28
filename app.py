@@ -3290,7 +3290,7 @@ def coinglass_test():
 
 
 # ============================================================
-# COINGLASS V9 - INDIVIDUAL LIQUIDATION ORDER ENDPOINT TEST
+# COINGLASS V10 - INDIVIDUAL LIQUIDATION ORDER ENDPOINT TEST
 # Source endpoint: /api/futures/liquidation/order
 # Reuses the verified V8 AES + pako/inflate decryption flow.
 # This is intentionally a schema-discovery endpoint first; once the
@@ -3318,12 +3318,20 @@ def coinglass_orders_test():
     symbol = (request.args.get("symbol") or "BTC").strip().upper()
     exchange = (request.args.get("exchange") or "").strip()
     limit_text = (request.args.get("limit") or "").strip()
+    page_size_text = (request.args.get("pageSize") or "100").strip()
 
     params = {"symbol": symbol}
     if exchange:
         params["exchange"] = exchange
     if limit_text.isdigit():
         params["limit"] = int(limit_text)
+
+    # CoinGlass requires pageSize as an integer for this endpoint.
+    # Default to 100 so the browser test works even if pageSize is omitted.
+    if page_size_text.isdigit() and int(page_size_text) > 0:
+        params["pageSize"] = int(page_size_text)
+    else:
+        params["pageSize"] = 100
 
     # Browser-like request. cache-ts-v2 is generated fresh each request.
     cache_ts_v2 = str(int(time.time() * 1000))
@@ -3439,7 +3447,7 @@ def coinglass_orders_test():
         if v == "1":
             # Current endpoint normally returns fixed-key versions (55/66/77).
             # Keep v=1 explicit rather than guessing Mn(url)'s transformed value.
-            raise ValueError("v=1 URL-derived seed not implemented in V9")
+            raise ValueError("v=1 URL-derived seed not implemented in V10")
 
         raise ValueError(f"unsupported CoinGlass v header: {v!r}")
 
@@ -3538,10 +3546,11 @@ def coinglass_orders_test():
 
         result = {
             "ok": bool(r.ok),
-            "diagnostic_version": "COINGLASS_V9_LIQUIDATION_ORDER_TEST",
+            "diagnostic_version": "COINGLASS_V10_LIQUIDATION_ORDER_PAGESIZE",
             "requested_symbol": symbol,
             "requested_exchange": exchange or None,
             "requested_limit": params.get("limit"),
+            "requested_pageSize": params.get("pageSize"),
             "http_status": r.status_code,
             "final_url": r.url,
             "json_parse_ok": json_parse_ok,
@@ -3590,7 +3599,7 @@ def coinglass_orders_test():
 
         decrypt_info = result.get("decrypt", {})
         print(
-            "[COINGLASS V9 ORDERS] "
+            "[COINGLASS V10 ORDERS] "
             f"status={r.status_code} "
             f"v={v_value} "
             f"seed_source={decrypt_info.get('seed_source')} "
@@ -3605,12 +3614,12 @@ def coinglass_orders_test():
 
     except requests.RequestException as exc:
         print(
-            f"[COINGLASS V9 ORDERS REQUEST ERROR] {exc}",
+            f"[COINGLASS V10 ORDERS REQUEST ERROR] {exc}",
             flush=True,
         )
         return jsonify({
             "ok": False,
-            "diagnostic_version": "COINGLASS_V9_LIQUIDATION_ORDER_TEST",
+            "diagnostic_version": "COINGLASS_V10_LIQUIDATION_ORDER_PAGESIZE",
             "error": "request_failed",
             "detail": str(exc),
         }), 502
