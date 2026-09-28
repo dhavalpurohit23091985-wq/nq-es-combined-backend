@@ -3287,3 +3287,330 @@ def coinglass_test():
             "error": "request_failed",
             "detail": str(exc),
         }), 502
+
+
+# ============================================================
+# COINGLASS V9 - INDIVIDUAL LIQUIDATION ORDER ENDPOINT TEST
+# Source endpoint: /api/futures/liquidation/order
+# Reuses the verified V8 AES + pako/inflate decryption flow.
+# This is intentionally a schema-discovery endpoint first; once the
+# live order fields are confirmed, the trailing-60m counter can be
+# wired without guessing field names or timestamps.
+# ============================================================
+
+@app.get("/coinglass-orders-test")
+def coinglass_orders_test():
+    secret = request.args.get("secret", "")
+
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    import base64
+    import time
+
+    url = "https://capi.coinglass.com/api/futures/liquidation/order"
+
+    # Exact individual liquidation-order endpoint found in the uploaded CoinGlass JS.
+    # Keep filters configurable until we inspect the live decrypted schema.
+    symbol = (request.args.get("symbol") or "BTC").strip().upper()
+    exchange = (request.args.get("exchange") or "").strip()
+    limit_text = (request.args.get("limit") or "").strip()
+
+    params = {"symbol": symbol}
+    if exchange:
+        params["exchange"] = exchange
+    if limit_text.isdigit():
+        params["limit"] = int(limit_text)
+
+    # Browser-like request. cache-ts-v2 is generated fresh each request.
+    cache_ts_v2 = str(int(time.time() * 1000))
+    headers = {
+        "accept": "application/json",
+        "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "cache-ts-v2": cache_ts_v2,
+        "encryption": "true",
+        "language": "en",
+        "obe": "s_009b65e04f6f431599afef84fa3fbf8f",
+        "origin": "https://www.coinglass.com",
+        "priority": "u=1, i",
+        "referer": "https://www.coinglass.com/",
+        "sec-ch-ua": '"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
+    }
+
+    # Constants decoded from the current CoinGlass JS mn() v-branches.
+    # v=55 -> 170b070da9654622
+    # v=66 -> d6537d845a964081
+    # v=77 -> 863f08689c97435b
+    FIXED_V_KEYS = {
+        "55": "170b070da9654622",
+        "66": "d6537d845a964081",
+        "77": "863f08689c97435b",
+    }
+
+    def _pkcs7_unpad(raw):
+        if not raw:
+            raise ValueError("empty plaintext")
+        pad = raw[-1]
+        if pad < 1 or pad > 16:
+            raise ValueError("invalid padding")
+        if raw[-pad:] != bytes([pad]) * pad:
+            raise ValueError("invalid padding bytes")
+        return raw[:-pad]
+
+    def _coinglass_wn_decode(compressed_bytes):
+        """Exact role of CoinGlass wn(): pako inflate bytes, then UTF-8 text."""
+        import zlib
+
+        # The uploaded bundle imports pako and wn() passes the AES-decrypted
+        # byte array into pako's inflate path before converting it to UTF-8.
+        # pako inflate accepts zlib/gzip-wrapped streams; keep raw-deflate as
+        # a compatibility fallback without changing the cryptographic flow.
+        last_error = None
+        for wbits in (47, 15, -15):
+            try:
+                inflated = zlib.decompress(compressed_bytes, wbits)
+                return inflated.decode("utf-8")
+            except Exception as exc:
+                last_error = exc
+
+        raise ValueError("CoinGlass wn()/inflate failed: " + str(last_error))
+
+    def _aes_ecb_decrypt_cryptojs(ciphertext_b64, key_text):
+        """CoinGlass Sn(): AES-ECB/PKCS7 -> hex bytes -> wn()/inflate -> UTF-8."""
+        from Crypto.Cipher import AES
+
+        key = str(key_text).encode("utf-8")
+        if len(key) not in (16, 24, 32):
+            raise ValueError(f"invalid AES key length: {len(key)}")
+
+        ctext = str(ciphertext_b64)
+        cipher_bytes = base64.b64decode(
+            ctext + "=" * (-len(ctext) % 4),
+            validate=False,
+        )
+        if not cipher_bytes or len(cipher_bytes) % 16 != 0:
+            raise ValueError(
+                f"cipher length not AES block aligned: {len(cipher_bytes)}"
+            )
+
+        raw = AES.new(key, AES.MODE_ECB).decrypt(cipher_bytes)
+        plain = _pkcs7_unpad(raw)
+
+        # IMPORTANT: CoinGlass does NOT UTF-8 decode AES plaintext directly.
+        # JS Sn() converts the decrypted Hex WordArray back to bytes and wn()
+        # inflates those bytes first. V7 missed this inflate step.
+        decoded = _coinglass_wn_decode(plain)
+
+        # CoinGlass Sn() strips a surrounding double quote if present.
+        if decoded.startswith('"'):
+            decoded = decoded[1:]
+        if decoded.endswith('"'):
+            decoded = decoded[:-1]
+
+        return decoded
+
+    def _stage1_seed(response_obj, v_value):
+        """Equivalent to the decoded mn(response, Mn(config.url)) branch."""
+        v = str(v_value or "")
+
+        if v in FIXED_V_KEYS:
+            return FIXED_V_KEYS[v], f"fixed_v{v}"
+
+        if v == "0":
+            # JS uses response.config.headers['cache-ts-v2'].
+            return cache_ts_v2, "cache-ts-v2"
+
+        if v == "2":
+            return response_obj.headers.get("time") or "", "response_time_header"
+
+        if v == "1":
+            # Current endpoint normally returns fixed-key versions (55/66/77).
+            # Keep v=1 explicit rather than guessing Mn(url)'s transformed value.
+            raise ValueError("v=1 URL-derived seed not implemented in V9")
+
+        raise ValueError(f"unsupported CoinGlass v header: {v!r}")
+
+    def _exact_two_stage_decrypt(response_obj, encrypted_data, v_value):
+        report = {
+            "crypto_available": False,
+            "decrypt_success": False,
+            "v": v_value,
+            "seed_source": None,
+            "stage1_success": False,
+            "stage1_key_length": None,
+            "stage2_success": False,
+            "plaintext_preview": None,
+            "plaintext_json": None,
+        }
+
+        try:
+            from Crypto.Cipher import AES  # noqa: F401
+            report["crypto_available"] = True
+        except Exception as exc:
+            report["error"] = "PyCryptodome unavailable: " + str(exc)
+            return report
+
+        try:
+            seed, source = _stage1_seed(response_obj, v_value)
+            report["seed_source"] = source
+            report["seed_length_before_b64"] = len(seed)
+
+            # JS: a = btoa(seed); a = a.substring(0, 16)
+            stage1_key = base64.b64encode(
+                seed.encode("utf-8")
+            ).decode("ascii")[:16]
+            report["stage1_key_length"] = len(stage1_key)
+
+            # Exact JS interceptor order:
+            #   a = Sn(t.headers.user, a)
+            #   o = Sn(t.data.data, a)
+            # Stage 1 therefore decrypts the RESPONSE HEADER `user`,
+            # not the encrypted data payload.
+            encrypted_user = response_obj.headers.get("user") or ""
+            if not encrypted_user:
+                raise ValueError("missing CoinGlass user response header")
+
+            stage2_key = _aes_ecb_decrypt_cryptojs(
+                encrypted_user,
+                stage1_key,
+            )
+            report["stage1_success"] = True
+            report["encrypted_user_length"] = len(encrypted_user)
+            report["stage2_key_length"] = len(stage2_key.encode("utf-8"))
+            # Do not expose the derived key itself in the diagnostic response.
+
+            # Stage 2 decrypts data.data with the key derived from `user`.
+            plaintext = _aes_ecb_decrypt_cryptojs(
+                encrypted_data,
+                stage2_key,
+            )
+            report["stage2_success"] = True
+            report["plaintext_preview"] = plaintext[:1500]
+
+            try:
+                obj = json.loads(plaintext)
+                report["plaintext_json"] = obj
+                report["json_success"] = True
+            except Exception as exc:
+                report["json_success"] = False
+                report["json_error"] = str(exc)[:200]
+                obj = None
+
+            # CoinGlass JS accepts either parsed JSON or the plaintext string.
+            report["decrypt_success"] = True
+
+        except Exception as exc:
+            report["error"] = str(exc)[:300]
+
+        return report
+
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+
+        try:
+            parsed = r.json()
+            json_parse_ok = True
+        except Exception:
+            parsed = None
+            json_parse_ok = False
+
+        v_value = r.headers.get("v")
+        user_value = r.headers.get("user")
+        time_value = r.headers.get("time")
+
+        result = {
+            "ok": bool(r.ok),
+            "diagnostic_version": "COINGLASS_V9_LIQUIDATION_ORDER_TEST",
+            "requested_symbol": symbol,
+            "requested_exchange": exchange or None,
+            "requested_limit": params.get("limit"),
+            "http_status": r.status_code,
+            "final_url": r.url,
+            "json_parse_ok": json_parse_ok,
+            "KEY_HEADERS": {
+                "v": v_value,
+                "user_present": bool(user_value),
+                "user_length": len(user_value) if user_value else 0,
+                "time": time_value,
+                "encryption": r.headers.get("encryption"),
+                "content-type": r.headers.get("content-type"),
+            },
+        }
+
+        if isinstance(parsed, dict):
+            data = parsed.get("data")
+            result.update({
+                "json_keys": list(parsed.keys()),
+                "coinglass_code": parsed.get("code"),
+                "coinglass_msg": parsed.get("msg"),
+                "coinglass_success": parsed.get("success"),
+                "data_present": "data" in parsed,
+                "data_type": type(data).__name__,
+                "data_length": (
+                    len(data)
+                    if isinstance(data, (str, list, dict))
+                    else None
+                ),
+            })
+
+            if isinstance(data, str):
+                result["decrypt"] = _exact_two_stage_decrypt(
+                    r,
+                    data,
+                    v_value,
+                )
+            else:
+                result["decrypt"] = {
+                    "decrypt_success": False,
+                    "reason": "data is not encrypted string",
+                }
+        else:
+            result.update({
+                "body_length": len(r.text),
+                "body_preview": r.text[:1000],
+            })
+
+        decrypt_info = result.get("decrypt", {})
+        print(
+            "[COINGLASS V9 ORDERS] "
+            f"status={r.status_code} "
+            f"v={v_value} "
+            f"seed_source={decrypt_info.get('seed_source')} "
+            f"stage1={decrypt_info.get('stage1_success')} "
+            f"stage2={decrypt_info.get('stage2_success')} "
+            f"json={decrypt_info.get('json_success')} "
+            f"success={decrypt_info.get('decrypt_success')}",
+            flush=True,
+        )
+
+        return jsonify(result), 200
+
+    except requests.RequestException as exc:
+        print(
+            f"[COINGLASS V9 ORDERS REQUEST ERROR] {exc}",
+            flush=True,
+        )
+        return jsonify({
+            "ok": False,
+            "diagnostic_version": "COINGLASS_V9_LIQUIDATION_ORDER_TEST",
+            "error": "request_failed",
+            "detail": str(exc),
+        }), 502
