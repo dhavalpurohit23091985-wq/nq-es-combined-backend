@@ -2,3 +2,4 @@ Flask
 requests
 gunicorn
 websockets>=12.0,<16.0
+pycryptodome
