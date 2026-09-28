@@ -2981,16 +2981,20 @@ setInterval(
     }
 
 # ============================================================
-# COINGLASS ISOLATED DIAGNOSTIC V3
-# Exact endpoint/header shape captured from the working browser request.
+# COINGLASS ISOLATED DIAGNOSTIC V4
+# Capture response headers needed for encrypted-data key branch.
 # Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
 # ============================================================
 
 @app.get("/coinglass-test")
 def coinglass_test():
     secret = request.args.get("secret", "")
+
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
 
     url = "https://capi.coinglass.com/api/coin/liquidation"
 
@@ -3018,22 +3022,48 @@ def coinglass_test():
     }
 
     try:
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(
+            url,
+            headers=headers,
+            timeout=20,
+        )
+
+        response_headers = {
+            str(k): str(v)
+            for k, v in r.headers.items()
+        }
+
+        important_headers = {
+            "v": r.headers.get("v"),
+            "user": r.headers.get("user"),
+            "time": r.headers.get("time"),
+            "encryption": r.headers.get("encryption"),
+            "content-type": r.headers.get("content-type"),
+            "content-encoding": r.headers.get("content-encoding"),
+            "server": r.headers.get("server"),
+            "date": r.headers.get("date"),
+        }
 
         try:
             parsed = r.json()
+            json_parse_ok = True
         except Exception:
             parsed = None
+            json_parse_ok = False
 
         result = {
             "ok": bool(r.ok),
+            "diagnostic_version": "COINGLASS_V4_HEADERS",
             "http_status": r.status_code,
             "final_url": r.url,
-            "content_type": r.headers.get("Content-Type", ""),
+            "json_parse_ok": json_parse_ok,
+            "KEY_HEADERS": important_headers,
+            "ALL_RESPONSE_HEADERS": response_headers,
         }
 
         if isinstance(parsed, dict):
             data = parsed.get("data")
+
             result.update({
                 "json_keys": list(parsed.keys()),
                 "coinglass_code": parsed.get("code"),
@@ -3042,22 +3072,47 @@ def coinglass_test():
                 "data_present": "data" in parsed,
                 "data_is_null": data is None,
                 "data_type": type(data).__name__,
-                "data_length": len(data) if isinstance(data, (str, list, dict)) else None,
+                "data_length": (
+                    len(data)
+                    if isinstance(data, (str, list, dict))
+                    else None
+                ),
                 "encrypted_or_encoded": isinstance(data, str),
-                "data_preview": data[:1000] if isinstance(data, str) else data,
+                "data_preview": (
+                    data[:300]
+                    if isinstance(data, str)
+                    else data
+                ),
             })
         else:
             result.update({
-                "json_parse_ok": False,
                 "body_length": len(r.text),
-                "body_preview": r.text[:2000],
+                "body_preview": r.text[:1000],
             })
+
+        print(
+            "[COINGLASS V4] "
+            f"status={r.status_code} "
+            f"v={r.headers.get('v')} "
+            f"user={r.headers.get('user')} "
+            f"time={r.headers.get('time')} "
+            f"data_type="
+            f"{type(parsed.get('data')).__name__ if isinstance(parsed, dict) else 'NA'}",
+            flush=True,
+        )
 
         return jsonify(result), 200
 
     except requests.RequestException as exc:
+        print(
+            f"[COINGLASS V4 REQUEST ERROR] {exc}",
+            flush=True,
+        )
+
         return jsonify({
             "ok": False,
+            "diagnostic_version": "COINGLASS_V4_HEADERS",
             "error": "request_failed",
             "detail": str(exc),
-        }), 500
+        }), 502
+
