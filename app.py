@@ -3633,83 +3633,74 @@ def coinglass_orders_test():
         }), 502
 
 # ============================================================
-# COINGLASS V14 - BTC EXACT TRAILING 60M TRADE-COUNT MONITOR
-# Verified CoinGlass liquidation semantics:
-#   side=1 -> LONG liquidation
-#   side=2 -> SHORT liquidation
-# Signal mapping (user's frozen logic):
+# COINGLASS V15 - BTC 1H LIQUIDATION TRADES ALERT ONLY
+# Uses CoinGlass's own pre-calculated 1h liquidation trade counts.
+# Frozen signal logic:
 #   SHORT - LONG >= 50 -> BUY
 #   LONG - SHORT >= 50 -> SELL
-# Strict alternation: same state never repeats.
+# Same signal never repeats; only an opposite qualifying state can alert next.
+# Poll interval: 60 seconds. State persists on Render disk.
 # ============================================================
 
-BTC_LIQ_STATE_FILE = os.path.join('/var/data', 'btc_liquidation_state.json')
-BTC_LIQ_MONITOR_LOCK_FILE = os.path.join('/var/data', 'btc_coinglass_monitor.lock')
-BTC_LIQ_LOCK = threading.Lock()
-BTC_LIQ_MONITOR_START_LOCK = threading.Lock()
-BTC_LIQ_MONITOR_STARTED = False
-BTC_LIQ_MONITOR_HANDLE = None
-BTC_LIQ_THRESHOLD = 50
-BTC_LIQ_WINDOW_MS = 60 * 60 * 1000
-BTC_LIQ_PAGE_SIZE = 100
-BTC_LIQ_MAX_PAGES = 60
+BTC_1H_STATE_FILE = os.path.join('/var/data', 'btc_coinglass_1h_trades_state.json')
+BTC_1H_MONITOR_LOCK_FILE = os.path.join('/var/data', 'btc_coinglass_1h_trades.lock')
+BTC_1H_LOCK = threading.Lock()
+BTC_1H_START_LOCK = threading.Lock()
+BTC_1H_MONITOR_STARTED = False
+BTC_1H_MONITOR_HANDLE = None
+BTC_1H_THRESHOLD = 50
 
-BTC_LIQ_STATE = {
-    'long_count': 0,
-    'short_count': 0,
-    'diff_short_minus_long': 0,
+BTC_1H_STATE = {
+    'long_count': None,
+    'short_count': None,
+    'diff_short_minus_long': None,
     'state': None,
     'last_change_ms': None,
     'last_update_ms': None,
-    'oldest_event_ms': None,
-    'newest_event_ms': None,
-    'events_scanned': 0,
-    'pages_scanned': 0,
     'status': 'STARTING',
     'error': None,
 }
 
 
-def _btc_now_ms():
+def _btc1h_now_ms():
     import time
     return int(time.time() * 1000)
 
 
-def _btc_atomic_json_write(path, payload):
+def _btc1h_atomic_write(payload):
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + f'.{os.getpid()}.{threading.get_ident()}.tmp'
+        os.makedirs('/var/data', exist_ok=True)
+        tmp = BTC_1H_STATE_FILE + f'.{os.getpid()}.{threading.get_ident()}.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        os.replace(tmp, BTC_1H_STATE_FILE)
     except Exception as exc:
-        print(f'[BTC 60M STATE WRITE ERROR] {exc}', flush=True)
+        print(f'[BTC 1H STATE WRITE ERROR] {exc}', flush=True)
 
 
-def _btc_load_state():
+def _btc1h_load_state():
     try:
-        with open(BTC_LIQ_STATE_FILE, 'r', encoding='utf-8') as f:
+        with open(BTC_1H_STATE_FILE, 'r', encoding='utf-8') as f:
             saved = json.load(f)
         if isinstance(saved, dict):
-            for k in BTC_LIQ_STATE:
-                if k in saved:
-                    BTC_LIQ_STATE[k] = saved[k]
-            print(
-                f"[BTC 60M DISK] state loaded path={BTC_LIQ_STATE_FILE} "
-                f"state={BTC_LIQ_STATE.get('state')}",
-                flush=True,
-            )
+            with BTC_1H_LOCK:
+                for key in BTC_1H_STATE:
+                    if key in saved:
+                        BTC_1H_STATE[key] = saved[key]
+            print(f'[BTC 1H DISK] state loaded path={BTC_1H_STATE_FILE}', flush=True)
+            return True
     except FileNotFoundError:
-        print(f'[BTC 60M DISK] no previous state yet path={BTC_LIQ_STATE_FILE}', flush=True)
+        print(f'[BTC 1H DISK] no previous state yet path={BTC_1H_STATE_FILE}', flush=True)
     except Exception as exc:
-        print(f'[BTC 60M DISK LOAD ERROR] {exc}', flush=True)
+        print(f'[BTC 1H STATE READ ERROR] {exc}', flush=True)
+    return False
 
 
-def _btc_send_pushover(title, message):
+def _btc1h_send_pushover(title, message):
     if not PUSHOVER_TOKEN or not PUSHOVER_USER:
-        print(f'[BTC PUSHOVER NOT CONFIGURED] {title} | {message}', flush=True)
+        print(f'[BTC 1H PUSHOVER NOT CONFIGURED] {title} | {message}', flush=True)
         return False
     try:
         r = requests.post(
@@ -3723,14 +3714,14 @@ def _btc_send_pushover(title, message):
             },
             timeout=10,
         )
-        print(f'[BTC PUSHOVER] status={r.status_code} ok={r.ok}', flush=True)
+        print(f'[BTC 1H PUSHOVER] status={r.status_code} ok={r.ok}', flush=True)
         return r.ok
     except requests.RequestException as exc:
-        print(f'[BTC PUSHOVER ERROR] {exc}', flush=True)
+        print(f'[BTC 1H PUSHOVER ERROR] {exc}', flush=True)
         return False
 
 
-def _btc_cg_inflate(compressed_bytes):
+def _btc1h_inflate(compressed_bytes):
     import zlib
     last_error = None
     for wbits in (47, 15, -15):
@@ -3741,7 +3732,7 @@ def _btc_cg_inflate(compressed_bytes):
     raise ValueError('CoinGlass inflate failed: ' + str(last_error))
 
 
-def _btc_cg_unpad(raw):
+def _btc1h_unpad(raw):
     if not raw:
         raise ValueError('empty plaintext')
     pad = raw[-1]
@@ -3750,16 +3741,16 @@ def _btc_cg_unpad(raw):
     return raw[:-pad]
 
 
-def _btc_cg_aes_decrypt(ciphertext_b64, key_text):
+def _btc1h_aes_decrypt(ciphertext_b64, key_text):
     import base64
     from Crypto.Cipher import AES
     key = str(key_text).encode('utf-8')
     if len(key) not in (16, 24, 32):
         raise ValueError(f'invalid AES key length: {len(key)}')
-    text = str(ciphertext_b64)
-    cipher_bytes = base64.b64decode(text + '=' * (-len(text) % 4), validate=False)
+    text_value = str(ciphertext_b64)
+    cipher_bytes = base64.b64decode(text_value + '=' * (-len(text_value) % 4), validate=False)
     raw = AES.new(key, AES.MODE_ECB).decrypt(cipher_bytes)
-    decoded = _btc_cg_inflate(_btc_cg_unpad(raw))
+    decoded = _btc1h_inflate(_btc1h_unpad(raw))
     if decoded.startswith('"'):
         decoded = decoded[1:]
     if decoded.endswith('"'):
@@ -3767,7 +3758,7 @@ def _btc_cg_aes_decrypt(ciphertext_b64, key_text):
     return decoded
 
 
-def _btc_cg_decrypt_response(resp, encrypted_data, cache_ts_v2):
+def _btc1h_decrypt_response(resp, encrypted_data, cache_ts_v2):
     import base64
     fixed = {
         '55': '170b070da9654622',
@@ -3788,12 +3779,12 @@ def _btc_cg_decrypt_response(resp, encrypted_data, cache_ts_v2):
     encrypted_user = resp.headers.get('user') or ''
     if not encrypted_user:
         raise ValueError('missing CoinGlass user response header')
-    stage2_key = _btc_cg_aes_decrypt(encrypted_user, stage1_key)
-    plaintext = _btc_cg_aes_decrypt(encrypted_data, stage2_key)
+    stage2_key = _btc1h_aes_decrypt(encrypted_user, stage1_key)
+    plaintext = _btc1h_aes_decrypt(encrypted_data, stage2_key)
     return json.loads(plaintext)
 
 
-def _btc_cg_headers(cache_ts_v2):
+def _btc1h_headers(cache_ts_v2):
     return {
         'accept': 'application/json',
         'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
@@ -3817,29 +3808,80 @@ def _btc_cg_headers(cache_ts_v2):
     }
 
 
-def _btc_extract_list(obj):
-    # V11 live schema: {'endRow': 99, ..., 'list': [...]}
+def _btc1h_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except Exception:
+        return None
+
+
+def _btc1h_pair_from_dict(d):
+    if not isinstance(d, dict):
+        return None
+
+    # Exact field names expected from CoinGlass Liquidation Trades mode.
+    pairs = [
+        ('longLiquidationCount', 'shortLiquidationCount'),
+        ('long_liquidation_count', 'short_liquidation_count'),
+        ('longCount', 'shortCount'),
+        ('long_count', 'short_count'),
+    ]
+    for lk, sk in pairs:
+        if lk in d and sk in d:
+            long_n = _btc1h_number(d.get(lk))
+            short_n = _btc1h_number(d.get(sk))
+            if long_n is not None and short_n is not None:
+                return long_n, short_n
+
+    # Some CoinGlass payloads place 1h fields directly on the BTC row.
+    direct_pairs = [
+        ('h1LongLiquidationCount', 'h1ShortLiquidationCount'),
+        ('h1LongCount', 'h1ShortCount'),
+        ('longLiquidationCount1h', 'shortLiquidationCount1h'),
+    ]
+    for lk, sk in direct_pairs:
+        if lk in d and sk in d:
+            long_n = _btc1h_number(d.get(lk))
+            short_n = _btc1h_number(d.get(sk))
+            if long_n is not None and short_n is not None:
+                return long_n, short_n
+
+    for hkey in ('h1', 'H1', '1h', '1H'):
+        nested = d.get(hkey)
+        pair = _btc1h_pair_from_dict(nested) if isinstance(nested, dict) else None
+        if pair:
+            return pair
+    return None
+
+
+def _btc1h_find_btc_counts(obj):
+    # Find a BTC row first, then read its CoinGlass 1h trade-count fields.
     if isinstance(obj, dict):
-        rows = obj.get('list')
-        if isinstance(rows, list):
-            return rows
-        data = obj.get('data')
-        if isinstance(data, dict) and isinstance(data.get('list'), list):
-            return data['list']
-    return []
+        symbol = str(obj.get('symbol') or obj.get('coin') or obj.get('name') or '').upper()
+        if symbol in ('BTC', 'BITCOIN'):
+            pair = _btc1h_pair_from_dict(obj)
+            if pair:
+                return pair
+        for value in obj.values():
+            found = _btc1h_find_btc_counts(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _btc1h_find_btc_counts(item)
+            if found:
+                return found
+    return None
 
 
-def _btc_fetch_page(page_num):
+def _btc1h_fetch_counts():
     import time
     cache_ts_v2 = str(int(time.time() * 1000))
     resp = requests.get(
-        'https://capi.coinglass.com/api/futures/liquidation/order',
-        headers=_btc_cg_headers(cache_ts_v2),
-        params={
-            'symbol': 'BTC',
-            'pageSize': BTC_LIQ_PAGE_SIZE,
-            'pageNum': int(page_num),
-        },
+        'https://capi.coinglass.com/api/coin/liquidation',
+        headers=_btc1h_headers(cache_ts_v2),
         timeout=20,
     )
     resp.raise_for_status()
@@ -3849,253 +3891,128 @@ def _btc_fetch_page(page_num):
     encrypted = outer.get('data')
     if not isinstance(encrypted, str):
         raise ValueError('CoinGlass encrypted data missing')
-    inner = _btc_cg_decrypt_response(resp, encrypted, cache_ts_v2)
-    return _btc_extract_list(inner)
+    inner = _btc1h_decrypt_response(resp, encrypted, cache_ts_v2)
+    pair = _btc1h_find_btc_counts(inner)
+    if not pair:
+        raise ValueError('BTC 1h Liquidation Trades count fields not found in CoinGlass response')
+    return pair
 
 
-def _btc_event_time_ms(row):
-    # createTime is present in the verified V11 response; turnoverTime is fallback.
-    for key in ('createTime', 'turnoverTime', 'time'):
-        value = row.get(key) if isinstance(row, dict) else None
-        try:
-            n = int(float(value))
-            if n > 0:
-                return n
-        except Exception:
-            pass
-    return None
-
-
-def _btc_scan_exact_60m():
-    now_ms = _btc_now_ms()
-    cutoff = now_ms - BTC_LIQ_WINDOW_MS
-    seen = set()
-    long_count = 0
-    short_count = 0
-    oldest = None
-    newest = None
-    pages = 0
-    stop = False
-
-    for page_num in range(1, BTC_LIQ_MAX_PAGES + 1):
-        rows = _btc_fetch_page(page_num)
-        pages += 1
-        if not rows:
-            break
-
-        page_has_old = False
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            ts = _btc_event_time_ms(row)
-            if ts is None:
-                continue
-            if ts < cutoff:
-                page_has_old = True
-                continue
-            if ts > now_ms + 120000:
-                continue
-
-            # Deduplicate defensively across page boundaries.
-            event_key = (
-                ts,
-                row.get('exchangeName'),
-                row.get('originalSymbol'),
-                row.get('side'),
-                row.get('price'),
-                row.get('qty'),
-                row.get('volUsd'),
-            )
-            if event_key in seen:
-                continue
-            seen.add(event_key)
-
-            side = row.get('side')
-            try:
-                side = int(side)
-            except Exception:
-                continue
-
-            if side == 1:
-                long_count += 1
-            elif side == 2:
-                short_count += 1
-            else:
-                continue
-
-            oldest = ts if oldest is None else min(oldest, ts)
-            newest = ts if newest is None else max(newest, ts)
-
-        # Endpoint is newest-first. Once this page crosses the 60m cutoff,
-        # later pages are older and are not part of the exact trailing window.
-        if page_has_old:
-            stop = True
-        if stop or len(rows) < BTC_LIQ_PAGE_SIZE:
-            break
-
-    if pages >= BTC_LIQ_MAX_PAGES and oldest is not None and oldest > cutoff:
-        raise RuntimeError(
-            '60m window exceeded pagination safety cap; increase BTC_LIQ_MAX_PAGES'
-        )
-
-    return {
-        'long_count': long_count,
-        'short_count': short_count,
-        'diff_short_minus_long': short_count - long_count,
-        'oldest_event_ms': oldest,
-        'newest_event_ms': newest,
-        'events_scanned': len(seen),
-        'pages_scanned': pages,
-        'window_start_ms': cutoff,
-        'window_end_ms': now_ms,
-    }
-
-
-def _btc_evaluate_once(send_alert=True):
-    snapshot = _btc_scan_exact_60m()
-    now_ms = _btc_now_ms()
-    diff = snapshot['diff_short_minus_long']
+def _btc1h_evaluate_once(send_alert=True):
+    long_n, short_n = _btc1h_fetch_counts()
+    diff = int(short_n - long_n)
+    now_ms = _btc1h_now_ms()
 
     desired = None
-    if diff >= BTC_LIQ_THRESHOLD:
+    if diff >= BTC_1H_THRESHOLD:
         desired = 'BUY'
-    elif diff <= -BTC_LIQ_THRESHOLD:
+    elif diff <= -BTC_1H_THRESHOLD:
         desired = 'SELL'
 
     alert_state = None
-    with BTC_LIQ_LOCK:
-        previous = BTC_LIQ_STATE.get('state')
-
-        # Strict alternation is naturally enforced by only changing state
-        # when desired != previous. Inside the neutral band, state is held.
+    with BTC_1H_LOCK:
+        previous = BTC_1H_STATE.get('state')
         if desired is not None and desired != previous:
-            BTC_LIQ_STATE['state'] = desired
-            BTC_LIQ_STATE['last_change_ms'] = now_ms
+            BTC_1H_STATE['state'] = desired
+            BTC_1H_STATE['last_change_ms'] = now_ms
             alert_state = desired
 
-        BTC_LIQ_STATE.update(snapshot)
-        BTC_LIQ_STATE['last_update_ms'] = now_ms
-        BTC_LIQ_STATE['status'] = 'LIVE'
-        BTC_LIQ_STATE['error'] = None
-        state_copy = dict(BTC_LIQ_STATE)
-        _btc_atomic_json_write(BTC_LIQ_STATE_FILE, state_copy)
+        BTC_1H_STATE['long_count'] = long_n
+        BTC_1H_STATE['short_count'] = short_n
+        BTC_1H_STATE['diff_short_minus_long'] = diff
+        BTC_1H_STATE['last_update_ms'] = now_ms
+        BTC_1H_STATE['status'] = 'LIVE'
+        BTC_1H_STATE['error'] = None
+        state_copy = dict(BTC_1H_STATE)
+        _btc1h_atomic_write(state_copy)
 
     if alert_state and send_alert:
-        long_n = snapshot['long_count']
-        short_n = snapshot['short_count']
-        gap = abs(diff)
         if alert_state == 'BUY':
-            reason = f'SHORT liquidations stronger by {gap} trades'
+            reason = f'SHORT liquidation trades stronger by {abs(diff)}'
         else:
-            reason = f'LONG liquidations stronger by {gap} trades'
-        _btc_send_pushover(
-            f'BTC 60M {alert_state}',
-            f'{reason}\nLONG={long_n} | SHORT={short_n} | DIFF={diff:+d}\nExact trailing 60 minutes',
+            reason = f'LONG liquidation trades stronger by {abs(diff)}'
+        _btc1h_send_pushover(
+            f'BTC 1H {alert_state}',
+            f'{reason}\nLONG={long_n} | SHORT={short_n} | DIFF={diff:+d}\nCoinGlass Liquidation Trades',
         )
-        print(
-            f'[BTC 60M SIGNAL] {alert_state} LONG={long_n} SHORT={short_n} DIFF={diff:+d}',
-            flush=True,
-        )
+        print(f'[BTC 1H SIGNAL] {alert_state} LONG={long_n} SHORT={short_n} DIFF={diff:+d}', flush=True)
 
     return state_copy
 
 
-def _btc_monitor_loop():
+def _btc1h_monitor_loop():
     import time
-    print('[BTC 60M MONITOR] started', flush=True)
+    print('[BTC 1H MONITOR] started', flush=True)
     while True:
         started = time.time()
         try:
-            _btc_evaluate_once(send_alert=True)
+            _btc1h_evaluate_once(send_alert=True)
         except Exception as exc:
-            with BTC_LIQ_LOCK:
-                BTC_LIQ_STATE['last_update_ms'] = _btc_now_ms()
-                BTC_LIQ_STATE['status'] = 'ERROR'
-                BTC_LIQ_STATE['error'] = str(exc)[:500]
-                _btc_atomic_json_write(BTC_LIQ_STATE_FILE, dict(BTC_LIQ_STATE))
-            print(f'[BTC 60M MONITOR ERROR] {exc}', flush=True)
+            with BTC_1H_LOCK:
+                BTC_1H_STATE['last_update_ms'] = _btc1h_now_ms()
+                BTC_1H_STATE['status'] = 'ERROR'
+                BTC_1H_STATE['error'] = str(exc)[:500]
+                _btc1h_atomic_write(dict(BTC_1H_STATE))
+            print(f'[BTC 1H MONITOR ERROR] {exc}', flush=True)
         elapsed = time.time() - started
         time.sleep(max(5.0, 60.0 - elapsed))
 
 
-def _btc_start_single_monitor():
-    # V13: idempotent + lazy-safe startup.  Gunicorn imports can vary, so
-    # BTC endpoints also call this function.  A process guard prevents
-    # duplicate local threads; flock prevents duplicate workers.
-    global BTC_LIQ_MONITOR_STARTED, BTC_LIQ_MONITOR_HANDLE
-
-    with BTC_LIQ_MONITOR_START_LOCK:
-        if BTC_LIQ_MONITOR_STARTED:
+def _btc1h_start_monitor():
+    global BTC_1H_MONITOR_STARTED, BTC_1H_MONITOR_HANDLE
+    with BTC_1H_START_LOCK:
+        if BTC_1H_MONITOR_STARTED:
             return True
-
         try:
             os.makedirs('/var/data', exist_ok=True)
-            lock_handle = open(BTC_LIQ_MONITOR_LOCK_FILE, 'a+')
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle = open(BTC_1H_MONITOR_LOCK_FILE, 'a+')
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except Exception as exc:
-            print(f'[BTC 60M MONITOR] another worker owns monitor lock: {exc}', flush=True)
+            print(f'[BTC 1H MONITOR] another worker owns lock: {exc}', flush=True)
             return False
 
-        # Store the handle globally so the process-lifetime flock cannot be
-        # released by garbage collection.
-        BTC_LIQ_MONITOR_HANDLE = lock_handle
-        BTC_LIQ_MONITOR_STARTED = True
-
-        with BTC_LIQ_LOCK:
-            if BTC_LIQ_STATE.get('status') == 'STARTING':
-                BTC_LIQ_STATE['status'] = 'STARTING_MONITOR'
-
-        thread = threading.Thread(
-            target=_btc_monitor_loop,
-            daemon=True,
-            name='btc-coinglass-60m',
-        )
+        BTC_1H_MONITOR_HANDLE = handle
+        BTC_1H_MONITOR_STARTED = True
+        thread = threading.Thread(target=_btc1h_monitor_loop, daemon=True, name='btc-coinglass-1h-trades')
         thread.start()
-        print(f'[BTC 60M MONITOR] thread launched pid={os.getpid()}', flush=True)
+        print(f'[BTC 1H MONITOR] thread launched pid={os.getpid()}', flush=True)
         return True
 
 
 @app.get('/btc-liquidation-data')
 def btc_liquidation_data():
     if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
-        _btc_start_single_monitor()
-    _btc_load_state()
-    with BTC_LIQ_LOCK:
-        return jsonify(dict(BTC_LIQ_STATE)), 200
+        _btc1h_start_monitor()
+    with BTC_1H_LOCK:
+        return jsonify(dict(BTC_1H_STATE)), 200
 
 
 @app.get('/btc-liquidation-refresh')
 def btc_liquidation_refresh():
     if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
-        _btc_start_single_monitor()
+        _btc1h_start_monitor()
     secret = request.args.get('secret', '')
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
     try:
-        return jsonify({'ok': True, 'state': _btc_evaluate_once(send_alert=False)}), 200
+        return jsonify({'ok': True, 'state': _btc1h_evaluate_once(send_alert=False)}), 200
     except Exception as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 502
 
 
-@app.get('/btc-liquidation-dashboard')
-def btc_liquidation_dashboard():
-    if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
-        _btc_start_single_monitor()
-    return '''<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BTC CoinGlass 60M Dashboard</title>
-<style>
-body{margin:0;background:#0d1117;color:#f0f6fc;font-family:Arial,sans-serif}.wrap{max-width:1100px;margin:35px auto;padding:0 18px}h1{text-align:center;margin-bottom:5px}.sub{text-align:center;color:#8b949e;margin-bottom:28px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:#161b22;border:1px solid #30363d;border-radius:14px;padding:20px;text-align:center}.label{color:#8b949e;font-size:13px}.value{font-size:30px;font-weight:700;margin-top:8px}.buy{color:#3fb950}.sell{color:#f85149}.neutral{color:#d29922}.meta{margin-top:18px;background:#161b22;border:1px solid #30363d;border-radius:14px;padding:18px;line-height:1.8}@media(max-width:750px){.grid{grid-template-columns:repeat(2,1fr)}}</style>
-</head><body><div class="wrap"><h1>BTC EXACT TRAILING 60M</h1><div class="sub">CoinGlass individual liquidation trade-count | threshold ±50 | strict BUY ↔ SELL</div>
-<div class="grid"><div class="card"><div class="label">LONG LIQUIDATIONS</div><div id="long" class="value">-</div></div><div class="card"><div class="label">SHORT LIQUIDATIONS</div><div id="short" class="value">-</div></div><div class="card"><div class="label">DIFF (SHORT − LONG)</div><div id="diff" class="value">-</div></div><div class="card"><div class="label">STATE</div><div id="state" class="value neutral">-</div></div></div>
-<div class="meta"><b>Status:</b> <span id="status">-</span><br><b>Last update:</b> <span id="update">-</span><br><b>Last state change:</b> <span id="change">-</span><br><b>Events scanned:</b> <span id="events">-</span> &nbsp; | &nbsp; <b>Pages:</b> <span id="pages">-</span><br><b>Error:</b> <span id="error">None</span></div></div>
-<script>
-function dt(ms){return ms?new Date(ms).toLocaleString():'-'}
-async function load(){try{const r=await fetch('/btc-liquidation-data',{cache:'no-store'});const d=await r.json();document.getElementById('long').textContent=d.long_count??0;document.getElementById('short').textContent=d.short_count??0;document.getElementById('diff').textContent=((d.diff_short_minus_long??0)>=0?'+':'')+(d.diff_short_minus_long??0);const s=d.state||'WAIT';const el=document.getElementById('state');el.textContent=s;el.className='value '+(s==='BUY'?'buy':s==='SELL'?'sell':'neutral');document.getElementById('status').textContent=d.status||'-';document.getElementById('update').textContent=dt(d.last_update_ms);document.getElementById('change').textContent=dt(d.last_change_ms);document.getElementById('events').textContent=d.events_scanned??0;document.getElementById('pages').textContent=d.pages_scanned??0;document.getElementById('error').textContent=d.error||'None'}catch(e){document.getElementById('error').textContent=e}}
-load();setInterval(load,60000);
-</script></body></html>'''
+@app.get('/btc-pushover-test')
+def btc_pushover_test():
+    secret = request.args.get('secret', '')
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    ok = _btc1h_send_pushover(
+        'BTC 1H ALERT TEST',
+        'CoinGlass Liquidation Trades alert connection is working.',
+    )
+    return jsonify({'ok': bool(ok), 'mode': 'btc_1h_pushover_test'}), 200 if ok else 502
 
 
-_btc_load_state()
+_btc1h_load_state()
 if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
-    _btc_start_single_monitor()
+    _btc1h_start_monitor()
+
