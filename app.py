@@ -3633,7 +3633,7 @@ def coinglass_orders_test():
         }), 502
 
 # ============================================================
-# COINGLASS V12 - BTC EXACT TRAILING 60M TRADE-COUNT MONITOR
+# COINGLASS V13 - BTC EXACT TRAILING 60M TRADE-COUNT MONITOR
 # Verified CoinGlass liquidation semantics:
 #   side=1 -> LONG liquidation
 #   side=2 -> SHORT liquidation
@@ -3646,6 +3646,9 @@ def coinglass_orders_test():
 BTC_LIQ_STATE_FILE = os.path.join('/var/data', 'btc_coinglass_60m_state.json')
 BTC_LIQ_MONITOR_LOCK_FILE = os.path.join('/var/data', 'btc_coinglass_monitor.lock')
 BTC_LIQ_LOCK = threading.Lock()
+BTC_LIQ_MONITOR_START_LOCK = threading.Lock()
+BTC_LIQ_MONITOR_STARTED = False
+BTC_LIQ_MONITOR_HANDLE = None
 BTC_LIQ_THRESHOLD = 50
 BTC_LIQ_WINDOW_MS = 60 * 60 * 1000
 BTC_LIQ_PAGE_SIZE = 100
@@ -4009,32 +4012,55 @@ def _btc_monitor_loop():
 
 
 def _btc_start_single_monitor():
-    # Gunicorn can import the app more than once. Hold a process-lifetime
-    # flock so only one worker runs the CoinGlass 1-minute monitor.
-    try:
-        os.makedirs('/var/data', exist_ok=True)
-        lock_handle = open(BTC_LIQ_MONITOR_LOCK_FILE, 'a+')
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception as exc:
-        print(f'[BTC 60M MONITOR] another worker owns monitor lock: {exc}', flush=True)
-        return
+    # V13: idempotent + lazy-safe startup.  Gunicorn imports can vary, so
+    # BTC endpoints also call this function.  A process guard prevents
+    # duplicate local threads; flock prevents duplicate workers.
+    global BTC_LIQ_MONITOR_STARTED, BTC_LIQ_MONITOR_HANDLE
 
-    # Keep the handle alive for the lifetime of this process/thread.
-    def runner():
-        _ = lock_handle
-        _btc_monitor_loop()
+    with BTC_LIQ_MONITOR_START_LOCK:
+        if BTC_LIQ_MONITOR_STARTED:
+            return True
 
-    threading.Thread(target=runner, daemon=True, name='btc-coinglass-60m').start()
+        try:
+            os.makedirs('/var/data', exist_ok=True)
+            lock_handle = open(BTC_LIQ_MONITOR_LOCK_FILE, 'a+')
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception as exc:
+            print(f'[BTC 60M MONITOR] another worker owns monitor lock: {exc}', flush=True)
+            return False
+
+        # Store the handle globally so the process-lifetime flock cannot be
+        # released by garbage collection.
+        BTC_LIQ_MONITOR_HANDLE = lock_handle
+        BTC_LIQ_MONITOR_STARTED = True
+
+        with BTC_LIQ_LOCK:
+            if BTC_LIQ_STATE.get('status') == 'STARTING':
+                BTC_LIQ_STATE['status'] = 'STARTING_MONITOR'
+
+        thread = threading.Thread(
+            target=_btc_monitor_loop,
+            daemon=True,
+            name='btc-coinglass-60m',
+        )
+        thread.start()
+        print(f'[BTC 60M MONITOR] thread launched pid={os.getpid()}', flush=True)
+        return True
 
 
 @app.get('/btc-liquidation-data')
 def btc_liquidation_data():
+    if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
+        _btc_start_single_monitor()
+    _btc_load_state()
     with BTC_LIQ_LOCK:
         return jsonify(dict(BTC_LIQ_STATE)), 200
 
 
 @app.get('/btc-liquidation-refresh')
 def btc_liquidation_refresh():
+    if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
+        _btc_start_single_monitor()
     secret = request.args.get('secret', '')
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
@@ -4046,6 +4072,8 @@ def btc_liquidation_refresh():
 
 @app.get('/btc-liquidation-dashboard')
 def btc_liquidation_dashboard():
+    if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
+        _btc_start_single_monitor()
     return '''<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BTC CoinGlass 60M Dashboard</title>
