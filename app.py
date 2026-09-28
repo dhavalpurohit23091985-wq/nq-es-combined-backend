@@ -2981,9 +2981,9 @@ setInterval(
     }
 
 # ============================================================
-# COINGLASS ISOLATED DIAGNOSTIC V2
+# COINGLASS ISOLATED DIAGNOSTIC V3
+# Exact endpoint/header shape captured from the working browser request.
 # Does not change NQ / NIFTY / BANKNIFTY / FIXED-1H logic.
-# Captures the full safe response shape for comparison with browser.
 # ============================================================
 
 @app.get("/coinglass-test")
@@ -2992,26 +2992,30 @@ def coinglass_test():
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    url = "https://capi.coinglass.com/api/futures/home/statistics"
+    url = "https://capi.coinglass.com/api/coin/liquidation"
 
     headers = {
-        "Accept": "application/json",
-        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-        "Cache-Is-V2": "1790584622017",
-        "Encryption": "true",
-        "Language": "en",
-        "Origin": "https://www.coinglass.com",
-        "Referer": "https://www.coinglass.com/",
-        "User-Agent": (
+        "accept": "application/json",
+        "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "cache-ts-v2": "1790611545831",
+        "encryption": "true",
+        "language": "en",
+        "obe": "s_009b65e04f6f431599afef84fa3fbf8f",
+        "origin": "https://www.coinglass.com",
+        "priority": "u=1, i",
+        "referer": "https://www.coinglass.com/",
+        "sec-ch-ua": '"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "user-agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/153.0.0.0 Safari/537.36"
         ),
     }
-
-    # Browser capture previously showed this value. Keep it isolated here
-    # so we can verify whether it changes CoinGlass's response shape.
-    headers["Obe"] = "s_36cffab1e8d14c9d967b1fdad45136ee"
 
     try:
         r = requests.get(url, headers=headers, timeout=20)
@@ -3026,28 +3030,21 @@ def coinglass_test():
             "http_status": r.status_code,
             "final_url": r.url,
             "content_type": r.headers.get("Content-Type", ""),
-            "response_headers": {
-                "content-type": r.headers.get("Content-Type"),
-                "content-length": r.headers.get("Content-Length"),
-                "content-encoding": r.headers.get("Content-Encoding"),
-                "server": r.headers.get("Server"),
-            },
         }
 
         if isinstance(parsed, dict):
             data = parsed.get("data")
-
             result.update({
                 "json_keys": list(parsed.keys()),
                 "coinglass_code": parsed.get("code"),
                 "coinglass_msg": parsed.get("msg"),
                 "coinglass_success": parsed.get("success"),
                 "data_present": "data" in parsed,
-                "data_type": type(data).__name__,
                 "data_is_null": data is None,
+                "data_type": type(data).__name__,
                 "data_length": len(data) if isinstance(data, (str, list, dict)) else None,
+                "encrypted_or_encoded": isinstance(data, str),
                 "data_preview": data[:1000] if isinstance(data, str) else data,
-                "full_json": parsed,
             })
         else:
             result.update({
