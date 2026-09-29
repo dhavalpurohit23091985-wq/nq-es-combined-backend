@@ -4016,3 +4016,96 @@ _btc1h_load_state()
 if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
     _btc1h_start_monitor()
 
+
+# ============================================================
+# INDIA FIXED-1H LIVE DASHBOARD
+# NIFTY 10-STOCK + BANKNIFTY TOP-5
+# Separate from all existing alert / NQ / BTC logic.
+# ============================================================
+INDIA_FIXED1H_DASHBOARD_STATE_FILE = os.path.join('/var/data', 'india_fixed1h_dashboard.json')
+INDIA_FIXED1H_DASHBOARD_LOCK = threading.Lock()
+
+def _india_fixed1h_default_state():
+    def blank(weight):
+        return {'received': False, 'direct': None, 'carry': None, 'added': None, 'state': 'NONE', 'threshold': 0.100, 'weight': weight, 'hour_open_time': None, 'pine_update_time': None, 'updated_at_utc': None, 'updated_at_ist': None}
+    return {'nifty': blank(52.87), 'banknifty': blank(61.23)}
+
+def _india_fixed1h_load():
+    state = _india_fixed1h_default_state()
+    try:
+        with INDIA_FIXED1H_DASHBOARD_LOCK:
+            with open(INDIA_FIXED1H_DASHBOARD_STATE_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+        if isinstance(saved, dict):
+            for key in ('nifty', 'banknifty'):
+                if isinstance(saved.get(key), dict):
+                    state[key].update(saved[key])
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f'[INDIA DASHBOARD READ ERROR] {exc}', flush=True)
+    return state
+
+def _india_fixed1h_save(state):
+    os.makedirs(os.path.dirname(INDIA_FIXED1H_DASHBOARD_STATE_FILE), exist_ok=True)
+    tmp = INDIA_FIXED1H_DASHBOARD_STATE_FILE + f'.{os.getpid()}.{threading.get_ident()}.tmp'
+    with INDIA_FIXED1H_DASHBOARD_LOCK:
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(state, f, separators=(',', ':'), sort_keys=True)
+                f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, INDIA_FIXED1H_DASHBOARD_STATE_FILE)
+        finally:
+            try:
+                if os.path.exists(tmp): os.remove(tmp)
+            except OSError:
+                pass
+
+def _india_fixed1h_float(value):
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+@app.post('/india-fixed1h-dashboard-webhook')
+def india_fixed1h_dashboard_webhook():
+    secret = request.args.get('secret', '')
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        try: data = json.loads(request.get_data(as_text=True) or '{}')
+        except Exception: data = {}
+    payload_type = str(data.get('type', '')).strip().upper()
+    if payload_type == 'NIFTY_DASHBOARD': key, expected_weight = 'nifty', 52.87
+    elif payload_type == 'BANKNIFTY_DASHBOARD': key, expected_weight = 'banknifty', 61.23
+    else: return jsonify({'ok': False, 'error': 'unsupported_dashboard_type'}), 400
+    direct = _india_fixed1h_float(data.get('direct'))
+    carry = _india_fixed1h_float(data.get('carry'))
+    added = _india_fixed1h_float(data.get('added'))
+    threshold_value = _india_fixed1h_float(data.get('threshold'))
+    weight_value = _india_fixed1h_float(data.get('weight'))
+    state_text = str(data.get('state', 'NONE')).strip().upper()
+    if state_text not in {'BUY', 'SELL', 'NONE'}: state_text = 'NONE'
+    now_utc = datetime.now(timezone.utc); now_ist = now_utc.astimezone(ZoneInfo('Asia/Kolkata'))
+    state = _india_fixed1h_load()
+    state[key] = {'received': True, 'direct': direct, 'carry': carry, 'added': added, 'state': state_text, 'threshold': threshold_value if threshold_value is not None else 0.100, 'weight': weight_value if weight_value is not None else expected_weight, 'hour_open_time': data.get('hour_open_time'), 'pine_update_time': data.get('update_time'), 'updated_at_utc': now_utc.isoformat(), 'updated_at_ist': now_ist.strftime('%d-%m-%Y %H:%M:%S')}
+    try: _india_fixed1h_save(state)
+    except Exception as exc:
+        print(f'[INDIA DASHBOARD SAVE ERROR] {exc}', flush=True)
+        return jsonify({'ok': False, 'error': 'save_failed'}), 500
+    print(f'[INDIA DASHBOARD UPDATE] {key.upper()} | DIRECT={direct} | CARRY={carry} | ADDED={added} | STATE={state_text}', flush=True)
+    return jsonify({'ok': True, 'mode': 'india_fixed1h_dashboard', 'asset': key, 'updated_at_ist': state[key]['updated_at_ist']}), 200
+
+@app.get('/india-fixed1h-dashboard-data')
+def india_fixed1h_dashboard_data():
+    return jsonify({'ok': True, **_india_fixed1h_load()}), 200
+
+@app.get('/india-fixed1h-dashboard')
+def india_fixed1h_dashboard():
+    html = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NIFTY + BANKNIFTY FIXED 1H</title>
+<style>*{box-sizing:border-box}body{margin:0;padding:22px;background:#0d1117;color:#f0f6fc;font-family:Arial,sans-serif}.wrap{max-width:1180px;margin:auto}h1{text-align:center;margin:5px 0 7px}.sub{text-align:center;color:#8b949e;margin-bottom:22px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#161b22;border:1px solid #30363d;border-radius:14px;overflow:hidden}.head{padding:18px 20px;background:#21262d}.head h2{margin:0}.meta{color:#8b949e;font-size:13px;margin-top:6px}.hero{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:#30363d}.metric{background:#161b22;padding:20px 10px;text-align:center}.label{font-size:12px;color:#8b949e}.value{font-size:25px;font-weight:bold;margin-top:7px}.details{padding:8px 18px 16px}.row{display:flex;justify-content:space-between;padding:12px 2px;border-bottom:1px solid #30363d}.muted{color:#8b949e}.buy{color:#3fb950}.sell{color:#f85149}.none{color:#d29922}.state{font-weight:bold;font-size:21px}.status{text-align:center;color:#8b949e;margin-top:18px}.live{color:#3fb950;font-weight:bold}.waiting{color:#d29922;font-weight:bold}@media(max-width:760px){.grid{grid-template-columns:1fr}body{padding:10px}}</style></head><body><div class="wrap"><h1>NIFTY + BANKNIFTY FIXED 1H</h1><div class="sub">LIVE WEIGHTED CONTRIBUTION DASHBOARD • FIXED 1H OPEN • ±0.100%</div><div class="grid">
+<div class="card"><div class="head"><h2>NIFTY 10-STOCK</h2><div class="meta">TOP-10 ACTUAL WEIGHT • 52.87%</div></div><div class="hero"><div class="metric"><div class="label">DIRECT</div><div class="value" id="niftyDirect">--</div></div><div class="metric"><div class="label">CARRY</div><div class="value" id="niftyCarry">--</div></div><div class="metric"><div class="label">ADDED</div><div class="value" id="niftyAdded">--</div></div></div><div class="details"><div class="row"><span class="muted">STATE</span><span class="state none" id="niftyState">NONE</span></div><div class="row"><span class="muted">THRESHOLD</span><strong id="niftyThreshold">±0.100%</strong></div><div class="row"><span class="muted">TOTAL WEIGHT</span><strong id="niftyWeight">52.87%</strong></div><div class="row"><span class="muted">LAST UPDATE</span><strong id="niftyUpdated">--</strong></div></div></div>
+<div class="card"><div class="head"><h2>BANKNIFTY TOP-5</h2><div class="meta">TOP-5 ACTUAL WEIGHT • 61.23%</div></div><div class="hero"><div class="metric"><div class="label">DIRECT</div><div class="value" id="bankDirect">--</div></div><div class="metric"><div class="label">CARRY</div><div class="value" id="bankCarry">--</div></div><div class="metric"><div class="label">ADDED</div><div class="value" id="bankAdded">--</div></div></div><div class="details"><div class="row"><span class="muted">STATE</span><span class="state none" id="bankState">NONE</span></div><div class="row"><span class="muted">THRESHOLD</span><strong id="bankThreshold">±0.100%</strong></div><div class="row"><span class="muted">TOTAL WEIGHT</span><strong id="bankWeight">61.23%</strong></div><div class="row"><span class="muted">LAST UPDATE</span><strong id="bankUpdated">--</strong></div></div></div></div><div class="status" id="status">Loading...</div></div>
+<script>function fmt(v){if(v===null||v===undefined||Number.isNaN(Number(v)))return'--';let n=Number(v);return(n>=0?'+':'')+n.toFixed(3)+'%'}function cls(v){v=String(v||'NONE').toUpperCase();return v==='BUY'?'buy':v==='SELL'?'sell':'none'}function paint(prefix,x){let p=prefix==='nifty'?'nifty':'bank';document.getElementById(p+'Direct').textContent=fmt(x.direct);document.getElementById(p+'Carry').textContent=fmt(x.carry);document.getElementById(p+'Added').textContent=fmt(x.added);let st=document.getElementById(p+'State');st.textContent=x.state||'NONE';st.className='state '+cls(x.state);document.getElementById(p+'Threshold').textContent='±'+Number(x.threshold??.1).toFixed(3)+'%';document.getElementById(p+'Weight').textContent=Number(x.weight??(prefix==='nifty'?52.87:61.23)).toFixed(2)+'%';document.getElementById(p+'Updated').textContent=x.updated_at_ist?x.updated_at_ist+' IST':'--'}async function refresh(){try{let r=await fetch('/india-fixed1h-dashboard-data?ts='+Date.now(),{cache:'no-store'}),d=await r.json();paint('nifty',d.nifty||{});paint('banknifty',d.banknifty||{});let n=d.nifty&&d.nifty.received,b=d.banknifty&&d.banknifty.received,s=document.getElementById('status');s.innerHTML=n&&b?'<span class="live">LIVE</span> • Both TradingView feeds received • Browser refresh every 5 seconds':'<span class="waiting">WAITING</span> • '+(!n?'NIFTY ':'')+(!b?'BANKNIFTY ':'')+'feed not received yet'}catch(e){document.getElementById('status').textContent='Waiting for server...'}}refresh();setInterval(refresh,5000)</script></body></html>'''
+    return html, 200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate'}
