@@ -4125,3 +4125,371 @@ refresh();setInterval(refresh,5000)
 </body>
 </html>"""
     return html, 200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate'}
+
+
+# ============================================================
+# COINGLASS LIQUIDATION TRADES DASHBOARD
+# BTC + XAU always included + 8 highest-ranked unique assets.
+# DATA ONLY: this route never sends Pushover.
+# ============================================================
+
+COINGLASS_DASHBOARD_STATE_FILE = os.path.join(
+    "/var/data",
+    "coinglass_top10_dashboard.json",
+)
+COINGLASS_DASHBOARD_LOCK = threading.Lock()
+
+
+def _coinglass_dashboard_load():
+    try:
+        with COINGLASS_DASHBOARD_LOCK:
+            with open(
+                COINGLASS_DASHBOARD_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[COINGLASS DASHBOARD READ ERROR] {exc}", flush=True)
+
+    return {
+        "updated_at_utc": None,
+        "updated_at_ist": None,
+        "assets": [],
+    }
+
+
+def _coinglass_dashboard_save(data):
+    os.makedirs(
+        os.path.dirname(COINGLASS_DASHBOARD_STATE_FILE),
+        exist_ok=True,
+    )
+    tmp = (
+        COINGLASS_DASHBOARD_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with COINGLASS_DASHBOARD_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    data,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp, COINGLASS_DASHBOARD_STATE_FILE)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+@app.post("/coinglass-dashboard-webhook")
+def coinglass_dashboard_webhook():
+    secret = request.args.get("secret", "")
+
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+    raw_assets = data.get("assets", [])
+
+    if not isinstance(raw_assets, list):
+        return jsonify({
+            "ok": False,
+            "error": "assets_list_required",
+        }), 400
+
+    assets = []
+    seen = set()
+
+    for item in raw_assets:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+
+        try:
+            rank = int(item.get("rank", 999999))
+        except (TypeError, ValueError):
+            rank = 999999
+
+        try:
+            long_count = float(item.get("long"))
+            short_count = float(item.get("short"))
+        except (TypeError, ValueError):
+            continue
+
+        difference = abs(long_count - short_count)
+
+        if long_count > short_count:
+            stronger = "LONG"
+        elif short_count > long_count:
+            stronger = "SHORT"
+        else:
+            stronger = "EQUAL"
+
+        assets.append({
+            "rank": rank,
+            "symbol": symbol,
+            "long": long_count,
+            "short": short_count,
+            "difference": difference,
+            "stronger": stronger,
+        })
+        seen.add(symbol)
+
+    # Monkey sends the already-selected 10 rows:
+    # BTC + XAU compulsory, remaining 8 by CoinGlass ranking.
+    assets = assets[:10]
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    state = {
+        "updated_at_utc": now_utc.isoformat(),
+        "updated_at_ist": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+        "assets": assets,
+    }
+
+    try:
+        _coinglass_dashboard_save(state)
+    except Exception as exc:
+        print(f"[COINGLASS DASHBOARD SAVE ERROR] {exc}", flush=True)
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        "[COINGLASS DASHBOARD UPDATE] "
+        + ", ".join(x["symbol"] for x in assets),
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "mode": "coinglass_liquidation_trades_dashboard",
+        "count": len(assets),
+        "updated_at_ist": state["updated_at_ist"],
+        "pushover": False,
+    }), 200
+
+
+@app.get("/coinglass-dashboard-data")
+def coinglass_dashboard_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_dashboard_load(),
+    })
+
+
+@app.get("/coinglass-dashboard")
+def coinglass_dashboard():
+    html = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoinGlass Top-10 Dashboard</title>
+<style>
+body {
+    margin: 0;
+    padding: 22px;
+    background: #0d1117;
+    color: #f0f6fc;
+    font-family: Arial, Helvetica, sans-serif;
+}
+.container {
+    max-width: 1050px;
+    margin: 0 auto;
+}
+h1 {
+    text-align: center;
+    margin: 0 0 7px;
+}
+.subtitle {
+    text-align: center;
+    color: #8b949e;
+    margin-bottom: 22px;
+}
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    overflow-x: auto;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+th {
+    background: #21262d;
+    padding: 14px 10px;
+    font-size: 13px;
+}
+td {
+    padding: 14px 10px;
+    text-align: center;
+    border-top: 1px solid #30363d;
+    font-size: 16px;
+}
+.asset {
+    font-weight: 800;
+    font-size: 17px;
+}
+.long {
+    color: #3fb950;
+    font-weight: 700;
+}
+.short {
+    color: #f85149;
+    font-weight: 700;
+}
+.equal {
+    color: #d29922;
+    font-weight: 700;
+}
+.fixed {
+    color: #58a6ff;
+}
+.footer {
+    text-align: center;
+    color: #8b949e;
+    margin-top: 18px;
+    line-height: 1.8;
+}
+@media (max-width: 650px) {
+    body { padding: 10px; }
+    h1 { font-size: 21px; }
+    th { font-size: 11px; }
+    td { font-size: 13px; padding: 12px 5px; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>COINGLASS TOP-10 DASHBOARD</h1>
+    <div class="subtitle">
+        LIQUIDATION TRADES • 1H LONG vs 1H SHORT • BTC + XAU ALWAYS INCLUDED
+    </div>
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>RANK</th>
+                    <th>ASSET</th>
+                    <th>1H LONG</th>
+                    <th>1H SHORT</th>
+                    <th>DIFFERENCE</th>
+                    <th>STRONGER</th>
+                </tr>
+            </thead>
+            <tbody id="rows">
+                <tr>
+                    <td colspan="6">Waiting for CoinGlass feed...</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer">
+        BTC + XAU fixed • Remaining 8 follow CoinGlass ranking<br>
+        Feed update: <span id="updated">--</span> IST<br>
+        <span id="status">Loading...</span>
+    </div>
+</div>
+
+<script>
+function esc(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function fmt(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "--";
+    if (Number.isInteger(n)) return String(n);
+    return n.toFixed(2).replace(/\.?0+$/, "");
+}
+
+async function refreshDashboard() {
+    const status = document.getElementById("status");
+
+    try {
+        const response = await fetch(
+            "/coinglass-dashboard-data?ts=" + Date.now(),
+            {cache: "no-store"}
+        );
+        const data = await response.json();
+        const rows = document.getElementById("rows");
+
+        if (!Array.isArray(data.assets) || data.assets.length === 0) {
+            rows.innerHTML =
+                '<tr><td colspan="6">Waiting for CoinGlass feed...</td></tr>';
+            status.textContent = "No feed received yet.";
+            return;
+        }
+
+        let html = "";
+
+        data.assets.forEach((item, index) => {
+            const stronger = String(item.stronger || "EQUAL").toUpperCase();
+            const cls =
+                stronger === "LONG" ? "long" :
+                stronger === "SHORT" ? "short" : "equal";
+            const fixed =
+                item.symbol === "BTC" || item.symbol === "XAU"
+                ? " fixed" : "";
+
+            html += "<tr>"
+                + "<td>" + esc(index + 1) + "</td>"
+                + '<td class="asset' + fixed + '">' + esc(item.symbol) + "</td>"
+                + '<td class="long">' + esc(fmt(item.long)) + "</td>"
+                + '<td class="short">' + esc(fmt(item.short)) + "</td>"
+                + "<td><strong>" + esc(fmt(item.difference)) + "</strong></td>"
+                + '<td class="' + cls + '">' + esc(stronger) + "</td>"
+                + "</tr>";
+        });
+
+        rows.innerHTML = html;
+        document.getElementById("updated").textContent =
+            data.updated_at_ist || "--";
+        status.textContent = "LIVE • Browser refresh every 5 seconds";
+    } catch (error) {
+        status.textContent = "Waiting for server...";
+    }
+}
+
+refreshDashboard();
+setInterval(refreshDashboard, 5000);
+</script>
+</body>
+</html>
+"""
+    return html, 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+    }
+
