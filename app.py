@@ -4020,7 +4020,7 @@ def india_fixed1h_dashboard_webhook():
     state[key] = {
         'received': True, 'direct': direct,
         'state': state_text,
-        'threshold': threshold_value if threshold_value is not None else 0.50,
+        'threshold': 0.50,
         'weight': weight_value if weight_value is not None else expected_weight,
         'hour_open_time': data.get('hour_open_time') or data.get('base_time'),
         'pine_update_time': data.get('update_time'),
