@@ -53,31 +53,20 @@ def send_pushover(title, message):
         )
     )
 
-    nifty_last4 = (
+    # INDIA: allow BOTH existing LAST-4 alerts and current FIXED-1H
+    # NIFTY/BANKNIFTY signal alerts through the main /webhook route.
+    # Dashboard V2 uses /india-fixed1h-dashboard-webhook separately,
+    # so its 1-minute UPDATE payloads do not create Pushover alerts here.
+    nifty_allowed = (
         "NIFTY 10-STOCK" in title_upper
-        and (
-            "NIFTY WEIGHTED" in title_upper
-            or "NIFTY WEIGHTED" in message_upper
-        )
-        and (
-            "LAST-4" in title_upper
-            or "LAST-4" in message_upper
-        )
+        and "BANKNIFTY" not in title_upper
     )
 
-    banknifty_last4 = (
+    banknifty_allowed = (
         "BANKNIFTY TOP-5" in title_upper
-        and (
-            "WEIGHTED" in title_upper
-            or "WEIGHTED" in message_upper
-        )
-        and (
-            "LAST-4" in title_upper
-            or "LAST-4" in message_upper
-        )
     )
 
-    if not (latest_qqq_last4 or nifty_last4 or banknifty_last4):
+    if not (latest_qqq_last4 or nifty_allowed or banknifty_allowed):
         print(
             f"[PUSHOVER SILENT - NQ + NIFTY + BANKNIFTY ONLY] {title}",
             flush=True,
