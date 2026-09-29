@@ -50,6 +50,8 @@ def send_pushover(title, message):
             or "ROLLING LAST-4" in message_upper
             or "LAST-4" in title_upper
             or "LAST-4" in message_upper
+            or "NASDAQ 10-STOCK" in title_upper
+            or "FIXED 1H OPEN BASE" in message_upper
         )
     )
 
@@ -4020,7 +4022,7 @@ def india_fixed1h_dashboard_webhook():
     state[key] = {
         'received': True, 'direct': direct,
         'state': state_text,
-        'threshold': 0.50,
+        'threshold': threshold_value if threshold_value is not None else 0.50,
         'weight': weight_value if weight_value is not None else expected_weight,
         'hour_open_time': data.get('hour_open_time') or data.get('base_time'),
         'pine_update_time': data.get('update_time'),
@@ -4116,7 +4118,7 @@ function pct(v,d=3){if(v===null||v===undefined||Number.isNaN(Number(v)))return"-
 function stateCls(v){v=String(v||"NONE").toUpperCase();return v==="BUY"?"buy":v==="SELL"?"sell":"none"}
 function valueCls(v){if(v===null||v===undefined||Number.isNaN(Number(v)))return"";let n=Number(v);return n>0?"buy":n<0?"sell":"none"}
 function stockRows(stocks){if(!Array.isArray(stocks)||stocks.length===0)return'<tr><td colspan="6">Waiting for stock-level TradingView data...</td></tr>';return stocks.map(s=>'<tr><td><strong>'+esc(s.symbol||"--")+'</strong></td><td>'+esc(num(s.weight,2))+'%</td><td>'+esc(num(s.open,2))+'</td><td>'+esc(num(s.live,2))+'</td><td class="'+valueCls(s.move)+'">'+esc(pct(s.move))+'</td><td class="'+valueCls(s.contribution)+'">'+esc(pct(s.contribution))+'</td></tr>').join("")}
-function paint(asset,x){let p=asset==="nifty"?"nifty":"bank";document.getElementById(p+"Direct").textContent=pct(x.direct);let st=document.getElementById(p+"State");st.textContent=x.state||"NONE";st.className="value "+stateCls(x.state);document.getElementById(p+"Threshold").textContent="±0.50%";document.getElementById(p+"Weight").textContent=num(x.weight??(asset==="nifty"?52.87:61.23),2)+"%";document.getElementById(p+"Updated").textContent=x.updated_at_ist?x.updated_at_ist+" IST":"--";document.getElementById(p+"Rows").innerHTML=stockRows(x.stocks)}
+function paint(asset,x){let p=asset==="nifty"?"nifty":"bank";document.getElementById(p+"Direct").textContent=pct(x.direct);let st=document.getElementById(p+"State");st.textContent=x.state||"NONE";st.className="value "+stateCls(x.state);document.getElementById(p+"Threshold").textContent="±"+num(x.threshold??0.50,2)+"%";document.getElementById(p+"Weight").textContent=num(x.weight??(asset==="nifty"?52.87:61.23),2)+"%";document.getElementById(p+"Updated").textContent=x.updated_at_ist?x.updated_at_ist+" IST":"--";document.getElementById(p+"Rows").innerHTML=stockRows(x.stocks)}
 async function refresh(){try{let r=await fetch("/india-fixed1h-dashboard-data?ts="+Date.now(),{cache:"no-store"}),d=await r.json();paint("nifty",d.nifty||{});paint("banknifty",d.banknifty||{});let n=d.nifty&&d.nifty.received,b=d.banknifty&&d.banknifty.received,s=document.getElementById("status");s.innerHTML=n&&b?'<span class="live">LIVE</span> • Both TradingView feeds received • Browser refresh every 5 seconds':'<span class="waiting">WAITING</span> • '+(!n?"NIFTY ":"")+(!b?"BANKNIFTY ":"")+"feed not received yet"}catch(e){document.getElementById("status").textContent="Waiting for server..."}}
 refresh();setInterval(refresh,5000)
 </script>
