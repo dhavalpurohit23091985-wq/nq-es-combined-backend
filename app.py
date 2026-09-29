@@ -4020,6 +4020,7 @@ if os.environ.get('COINGLASS_BTC_MONITOR', '1') == '1':
 # ============================================================
 # INDIA FIXED-1H LIVE DASHBOARD
 # NIFTY 10-STOCK + BANKNIFTY TOP-5
+# NQ-STYLE stock-level display.
 # Separate from all existing alert / NQ / BTC logic.
 # ============================================================
 INDIA_FIXED1H_DASHBOARD_STATE_FILE = os.path.join('/var/data', 'india_fixed1h_dashboard.json')
@@ -4027,7 +4028,7 @@ INDIA_FIXED1H_DASHBOARD_LOCK = threading.Lock()
 
 def _india_fixed1h_default_state():
     def blank(weight):
-        return {'received': False, 'direct': None, 'carry': None, 'added': None, 'state': 'NONE', 'threshold': 0.100, 'weight': weight, 'hour_open_time': None, 'pine_update_time': None, 'updated_at_utc': None, 'updated_at_ist': None}
+        return {'received': False, 'direct': None, 'carry': None, 'added': None, 'state': 'NONE', 'threshold': 0.100, 'weight': weight, 'hour_open_time': None, 'pine_update_time': None, 'updated_at_utc': None, 'updated_at_ist': None, 'stocks': []}
     return {'nifty': blank(52.87), 'banknifty': blank(61.23)}
 
 def _india_fixed1h_load():
@@ -4053,11 +4054,13 @@ def _india_fixed1h_save(state):
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(state, f, separators=(',', ':'), sort_keys=True)
-                f.flush(); os.fsync(f.fileno())
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, INDIA_FIXED1H_DASHBOARD_STATE_FILE)
         finally:
             try:
-                if os.path.exists(tmp): os.remove(tmp)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
             except OSError:
                 pass
 
@@ -4074,28 +4077,68 @@ def india_fixed1h_dashboard_webhook():
         return jsonify({'ok': False, 'error': 'unauthorized'}), 401
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        try: data = json.loads(request.get_data(as_text=True) or '{}')
-        except Exception: data = {}
+        try:
+            data = json.loads(request.get_data(as_text=True) or '{}')
+        except Exception:
+            data = {}
+
     payload_type = str(data.get('type', '')).strip().upper()
-    if payload_type == 'NIFTY_DASHBOARD': key, expected_weight = 'nifty', 52.87
-    elif payload_type == 'BANKNIFTY_DASHBOARD': key, expected_weight = 'banknifty', 61.23
-    else: return jsonify({'ok': False, 'error': 'unsupported_dashboard_type'}), 400
+    if payload_type == 'NIFTY_DASHBOARD':
+        key, expected_weight = 'nifty', 52.87
+    elif payload_type == 'BANKNIFTY_DASHBOARD':
+        key, expected_weight = 'banknifty', 61.23
+    else:
+        return jsonify({'ok': False, 'error': 'unsupported_dashboard_type'}), 400
+
+    stocks = []
+    incoming_stocks = data.get('stocks', [])
+    if isinstance(incoming_stocks, list):
+        for item in incoming_stocks:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get('symbol', '')).strip().upper()
+            if not symbol:
+                continue
+            stocks.append({
+                'symbol': symbol,
+                'weight': _india_fixed1h_float(item.get('weight')),
+                'open': _india_fixed1h_float(item.get('open')),
+                'live': _india_fixed1h_float(item.get('live')),
+                'move': _india_fixed1h_float(item.get('move')),
+                'contribution': _india_fixed1h_float(item.get('contribution')),
+            })
+
     direct = _india_fixed1h_float(data.get('direct'))
     carry = _india_fixed1h_float(data.get('carry'))
     added = _india_fixed1h_float(data.get('added'))
     threshold_value = _india_fixed1h_float(data.get('threshold'))
     weight_value = _india_fixed1h_float(data.get('weight'))
     state_text = str(data.get('state', 'NONE')).strip().upper()
-    if state_text not in {'BUY', 'SELL', 'NONE'}: state_text = 'NONE'
-    now_utc = datetime.now(timezone.utc); now_ist = now_utc.astimezone(ZoneInfo('Asia/Kolkata'))
+    if state_text not in {'BUY', 'SELL', 'NONE'}:
+        state_text = 'NONE'
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo('Asia/Kolkata'))
     state = _india_fixed1h_load()
-    state[key] = {'received': True, 'direct': direct, 'carry': carry, 'added': added, 'state': state_text, 'threshold': threshold_value if threshold_value is not None else 0.100, 'weight': weight_value if weight_value is not None else expected_weight, 'hour_open_time': data.get('hour_open_time'), 'pine_update_time': data.get('update_time'), 'updated_at_utc': now_utc.isoformat(), 'updated_at_ist': now_ist.strftime('%d-%m-%Y %H:%M:%S')}
-    try: _india_fixed1h_save(state)
+    state[key] = {
+        'received': True, 'direct': direct, 'carry': carry, 'added': added,
+        'state': state_text,
+        'threshold': threshold_value if threshold_value is not None else 0.100,
+        'weight': weight_value if weight_value is not None else expected_weight,
+        'hour_open_time': data.get('hour_open_time'),
+        'pine_update_time': data.get('update_time'),
+        'updated_at_utc': now_utc.isoformat(),
+        'updated_at_ist': now_ist.strftime('%d-%m-%Y %H:%M:%S'),
+        'stocks': stocks,
+    }
+    try:
+        _india_fixed1h_save(state)
     except Exception as exc:
         print(f'[INDIA DASHBOARD SAVE ERROR] {exc}', flush=True)
         return jsonify({'ok': False, 'error': 'save_failed'}), 500
-    print(f'[INDIA DASHBOARD UPDATE] {key.upper()} | DIRECT={direct} | CARRY={carry} | ADDED={added} | STATE={state_text}', flush=True)
-    return jsonify({'ok': True, 'mode': 'india_fixed1h_dashboard', 'asset': key, 'updated_at_ist': state[key]['updated_at_ist']}), 200
+
+    print(f'[INDIA DASHBOARD UPDATE] {key.upper()} | DIRECT={direct} | CARRY={carry} | ADDED={added} | STATE={state_text} | STOCKS={len(stocks)}', flush=True)
+    return jsonify({'ok': True, 'mode': 'india_fixed1h_dashboard', 'asset': key, 'updated_at_ist': state[key]['updated_at_ist'], 'stocks_received': len(stocks)}), 200
 
 @app.get('/india-fixed1h-dashboard-data')
 def india_fixed1h_dashboard_data():
@@ -4104,8 +4147,20 @@ def india_fixed1h_dashboard_data():
 @app.get('/india-fixed1h-dashboard')
 def india_fixed1h_dashboard():
     html = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NIFTY + BANKNIFTY FIXED 1H</title>
-<style>*{box-sizing:border-box}body{margin:0;padding:22px;background:#0d1117;color:#f0f6fc;font-family:Arial,sans-serif}.wrap{max-width:1180px;margin:auto}h1{text-align:center;margin:5px 0 7px}.sub{text-align:center;color:#8b949e;margin-bottom:22px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#161b22;border:1px solid #30363d;border-radius:14px;overflow:hidden}.head{padding:18px 20px;background:#21262d}.head h2{margin:0}.meta{color:#8b949e;font-size:13px;margin-top:6px}.hero{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:#30363d}.metric{background:#161b22;padding:20px 10px;text-align:center}.label{font-size:12px;color:#8b949e}.value{font-size:25px;font-weight:bold;margin-top:7px}.details{padding:8px 18px 16px}.row{display:flex;justify-content:space-between;padding:12px 2px;border-bottom:1px solid #30363d}.muted{color:#8b949e}.buy{color:#3fb950}.sell{color:#f85149}.none{color:#d29922}.state{font-weight:bold;font-size:21px}.status{text-align:center;color:#8b949e;margin-top:18px}.live{color:#3fb950;font-weight:bold}.waiting{color:#d29922;font-weight:bold}@media(max-width:760px){.grid{grid-template-columns:1fr}body{padding:10px}}</style></head><body><div class="wrap"><h1>NIFTY + BANKNIFTY FIXED 1H</h1><div class="sub">LIVE WEIGHTED CONTRIBUTION DASHBOARD • FIXED 1H OPEN • ±0.100%</div><div class="grid">
-<div class="card"><div class="head"><h2>NIFTY 10-STOCK</h2><div class="meta">TOP-10 ACTUAL WEIGHT • 52.87%</div></div><div class="hero"><div class="metric"><div class="label">DIRECT</div><div class="value" id="niftyDirect">--</div></div><div class="metric"><div class="label">CARRY</div><div class="value" id="niftyCarry">--</div></div><div class="metric"><div class="label">ADDED</div><div class="value" id="niftyAdded">--</div></div></div><div class="details"><div class="row"><span class="muted">STATE</span><span class="state none" id="niftyState">NONE</span></div><div class="row"><span class="muted">THRESHOLD</span><strong id="niftyThreshold">±0.100%</strong></div><div class="row"><span class="muted">TOTAL WEIGHT</span><strong id="niftyWeight">52.87%</strong></div><div class="row"><span class="muted">LAST UPDATE</span><strong id="niftyUpdated">--</strong></div></div></div>
-<div class="card"><div class="head"><h2>BANKNIFTY TOP-5</h2><div class="meta">TOP-5 ACTUAL WEIGHT • 61.23%</div></div><div class="hero"><div class="metric"><div class="label">DIRECT</div><div class="value" id="bankDirect">--</div></div><div class="metric"><div class="label">CARRY</div><div class="value" id="bankCarry">--</div></div><div class="metric"><div class="label">ADDED</div><div class="value" id="bankAdded">--</div></div></div><div class="details"><div class="row"><span class="muted">STATE</span><span class="state none" id="bankState">NONE</span></div><div class="row"><span class="muted">THRESHOLD</span><strong id="bankThreshold">±0.100%</strong></div><div class="row"><span class="muted">TOTAL WEIGHT</span><strong id="bankWeight">61.23%</strong></div><div class="row"><span class="muted">LAST UPDATE</span><strong id="bankUpdated">--</strong></div></div></div></div><div class="status" id="status">Loading...</div></div>
-<script>function fmt(v){if(v===null||v===undefined||Number.isNaN(Number(v)))return'--';let n=Number(v);return(n>=0?'+':'')+n.toFixed(3)+'%'}function cls(v){v=String(v||'NONE').toUpperCase();return v==='BUY'?'buy':v==='SELL'?'sell':'none'}function paint(prefix,x){let p=prefix==='nifty'?'nifty':'bank';document.getElementById(p+'Direct').textContent=fmt(x.direct);document.getElementById(p+'Carry').textContent=fmt(x.carry);document.getElementById(p+'Added').textContent=fmt(x.added);let st=document.getElementById(p+'State');st.textContent=x.state||'NONE';st.className='state '+cls(x.state);document.getElementById(p+'Threshold').textContent='±'+Number(x.threshold??.1).toFixed(3)+'%';document.getElementById(p+'Weight').textContent=Number(x.weight??(prefix==='nifty'?52.87:61.23)).toFixed(2)+'%';document.getElementById(p+'Updated').textContent=x.updated_at_ist?x.updated_at_ist+' IST':'--'}async function refresh(){try{let r=await fetch('/india-fixed1h-dashboard-data?ts='+Date.now(),{cache:'no-store'}),d=await r.json();paint('nifty',d.nifty||{});paint('banknifty',d.banknifty||{});let n=d.nifty&&d.nifty.received,b=d.banknifty&&d.banknifty.received,s=document.getElementById('status');s.innerHTML=n&&b?'<span class="live">LIVE</span> • Both TradingView feeds received • Browser refresh every 5 seconds':'<span class="waiting">WAITING</span> • '+(!n?'NIFTY ':'')+(!b?'BANKNIFTY ':'')+'feed not received yet'}catch(e){document.getElementById('status').textContent='Waiting for server...'}}refresh();setInterval(refresh,5000)</script></body></html>'''
+<style>*{box-sizing:border-box}body{margin:0;padding:20px;background:#0d1117;color:#f0f6fc;font-family:Arial,Helvetica,sans-serif}.wrap{max-width:1180px;margin:auto}h1{text-align:center;margin:4px 0 5px}.sub{text-align:center;color:#8b949e;margin-bottom:22px}.section{margin-bottom:24px}.head{display:flex;justify-content:space-between;align-items:end;gap:12px;margin-bottom:10px}.head h2{margin:0}.meta{color:#8b949e;font-size:13px}.summary{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:12px}.card{background:#161b22;border:1px solid #30363d;border-radius:12px}.metric{padding:13px 8px;text-align:center}.label{color:#8b949e;font-size:11px;margin-bottom:6px}.value{font-size:18px;font-weight:bold}.table-card{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:780px}th{background:#21262d;padding:11px 8px;font-size:12px}td{padding:11px 8px;text-align:center;border-top:1px solid #30363d;font-size:14px}.buy{color:#3fb950;font-weight:bold}.sell{color:#f85149;font-weight:bold}.none{color:#d29922;font-weight:bold}.footer{text-align:center;color:#8b949e;line-height:1.7;font-size:13px;margin-top:10px}.live{color:#3fb950;font-weight:bold}.waiting{color:#d29922;font-weight:bold}@media(max-width:900px){.summary{grid-template-columns:repeat(3,1fr)}}@media(max-width:600px){body{padding:10px}.summary{grid-template-columns:repeat(2,1fr)}.head{display:block}.meta{margin-top:5px}}</style></head><body><div class="wrap">
+<h1>NIFTY + BANKNIFTY FIXED 1H</h1><div class="sub">NQ-STYLE LIVE STOCK DASHBOARD • FIXED 1H OPEN • ±0.100%</div>
+<div class="section"><div class="head"><h2>NIFTY 10-STOCK</h2><div class="meta">TOP-10 ACTUAL WEIGHT • 52.87%</div></div><div class="summary"><div class="card metric"><div class="label">1H DIRECT</div><div class="value" id="niftyDirect">--</div></div><div class="card metric"><div class="label">CARRY</div><div class="value" id="niftyCarry">--</div></div><div class="card metric"><div class="label">ADDED</div><div class="value" id="niftyAdded">--</div></div><div class="card metric"><div class="label">STATE</div><div class="value none" id="niftyState">NONE</div></div><div class="card metric"><div class="label">THRESHOLD</div><div class="value" id="niftyThreshold">±0.100%</div></div><div class="card metric"><div class="label">TOP-10 WEIGHT</div><div class="value" id="niftyWeight">52.87%</div></div></div><div class="card table-card"><table><thead><tr><th>STOCK</th><th>WEIGHT</th><th>1H OPEN</th><th>LIVE</th><th>OPEN→LIVE</th><th>WEIGHTED</th></tr></thead><tbody id="niftyRows"><tr><td colspan="6">Waiting for TradingView data...</td></tr></tbody></table></div><div class="footer">Last Update: <span id="niftyUpdated">--</span></div></div>
+<div class="section"><div class="head"><h2>BANKNIFTY TOP-5</h2><div class="meta">TOP-5 ACTUAL WEIGHT • 61.23%</div></div><div class="summary"><div class="card metric"><div class="label">1H DIRECT</div><div class="value" id="bankDirect">--</div></div><div class="card metric"><div class="label">CARRY</div><div class="value" id="bankCarry">--</div></div><div class="card metric"><div class="label">ADDED</div><div class="value" id="bankAdded">--</div></div><div class="card metric"><div class="label">STATE</div><div class="value none" id="bankState">NONE</div></div><div class="card metric"><div class="label">THRESHOLD</div><div class="value" id="bankThreshold">±0.100%</div></div><div class="card metric"><div class="label">TOP-5 WEIGHT</div><div class="value" id="bankWeight">61.23%</div></div></div><div class="card table-card"><table><thead><tr><th>STOCK</th><th>WEIGHT</th><th>1H OPEN</th><th>LIVE</th><th>OPEN→LIVE</th><th>WEIGHTED</th></tr></thead><tbody id="bankRows"><tr><td colspan="6">Waiting for TradingView data...</td></tr></tbody></table></div><div class="footer">Last Update: <span id="bankUpdated">--</span></div></div>
+<div class="footer" id="status">Loading...</div></div>
+<script>
+function esc(v){return String(v).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;")}
+function num(v,d){if(v===null||v===undefined||Number.isNaN(Number(v)))return"--";return Number(v).toFixed(d)}
+function pct(v,d=3){if(v===null||v===undefined||Number.isNaN(Number(v)))return"--";let n=Number(v);return(n>=0?"+":"")+n.toFixed(d)+"%"}
+function stateCls(v){v=String(v||"NONE").toUpperCase();return v==="BUY"?"buy":v==="SELL"?"sell":"none"}
+function valueCls(v){if(v===null||v===undefined||Number.isNaN(Number(v)))return"";let n=Number(v);return n>0?"buy":n<0?"sell":"none"}
+function stockRows(stocks){if(!Array.isArray(stocks)||stocks.length===0)return'<tr><td colspan="6">Waiting for stock-level TradingView data...</td></tr>';return stocks.map(s=>'<tr><td><strong>'+esc(s.symbol||"--")+'</strong></td><td>'+esc(num(s.weight,2))+'%</td><td>'+esc(num(s.open,2))+'</td><td>'+esc(num(s.live,2))+'</td><td class="'+valueCls(s.move)+'">'+esc(pct(s.move))+'</td><td class="'+valueCls(s.contribution)+'">'+esc(pct(s.contribution))+'</td></tr>').join("")}
+function paint(asset,x){let p=asset==="nifty"?"nifty":"bank";document.getElementById(p+"Direct").textContent=pct(x.direct);document.getElementById(p+"Carry").textContent=pct(x.carry);document.getElementById(p+"Added").textContent=pct(x.added);let st=document.getElementById(p+"State");st.textContent=x.state||"NONE";st.className="value "+stateCls(x.state);document.getElementById(p+"Threshold").textContent="±"+num(x.threshold??0.1,3)+"%";document.getElementById(p+"Weight").textContent=num(x.weight??(asset==="nifty"?52.87:61.23),2)+"%";document.getElementById(p+"Updated").textContent=x.updated_at_ist?x.updated_at_ist+" IST":"--";document.getElementById(p+"Rows").innerHTML=stockRows(x.stocks)}
+async function refresh(){try{let r=await fetch("/india-fixed1h-dashboard-data?ts="+Date.now(),{cache:"no-store"}),d=await r.json();paint("nifty",d.nifty||{});paint("banknifty",d.banknifty||{});let n=d.nifty&&d.nifty.received,b=d.banknifty&&d.banknifty.received,s=document.getElementById("status");s.innerHTML=n&&b?'<span class="live">LIVE</span> • Both TradingView feeds received • Browser refresh every 5 seconds':'<span class="waiting">WAITING</span> • '+(!n?"NIFTY ":"")+(!b?"BANKNIFTY ":"")+"feed not received yet"}catch(e){document.getElementById("status").textContent="Waiting for server..."}}
+refresh();setInterval(refresh,5000)
+</script></body></html>'''
     return html, 200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate'}
