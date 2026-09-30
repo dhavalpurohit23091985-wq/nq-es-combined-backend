@@ -1325,6 +1325,13 @@ def webhook():
         )
     )
 
+    # Keep the Fixed-1H browser dashboard synced to the REAL MAIN alert.
+    # This is separate from the old LAST-4 dashboard history helper below.
+    fixed1h_main_trigger = _fixed1h_record_main_trigger(
+        tv_title,
+        tv_message,
+    )
+
     (
         tv_message,
         nq_serial,
@@ -1406,6 +1413,7 @@ def webhook():
         "nq_duplicate": nq_duplicate,
         "india_trigger": india_serial,
         "india_duplicate": india_duplicate,
+        "fixed1h_dashboard_synced": bool(fixed1h_main_trigger),
         "parts_queued": len(parts),
     }), 200
 
@@ -2111,6 +2119,15 @@ NQ_FIXED1H_DASHBOARD_STATE_FILE = os.path.join(
 
 NQ_FIXED1H_DASHBOARD_LOCK = threading.Lock()
 
+# MAIN /webhook trigger state is stored separately so the 1-minute
+# dashboard feed can NEVER overwrite a newer real BUY/SELL trigger
+# with stale Pine metadata.
+NQ_FIXED1H_MAIN_TRIGGER_FILE = os.path.join(
+    "/var/data",
+    "nq_fixed1h_main_trigger.json",
+)
+NQ_FIXED1H_MAIN_TRIGGER_LOCK = threading.Lock()
+
 
 def _fixed1h_safe_float(value):
     try:
@@ -2198,6 +2215,146 @@ def _fixed1h_save(data):
                     os.remove(tmp)
             except OSError:
                 pass
+
+
+def _fixed1h_main_trigger_load():
+    try:
+        with NQ_FIXED1H_MAIN_TRIGGER_LOCK:
+            with open(
+                NQ_FIXED1H_MAIN_TRIGGER_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+
+    except FileNotFoundError:
+        pass
+
+    except Exception as exc:
+        print(
+            f"[FIXED1H MAIN TRIGGER READ ERROR] {exc}",
+            flush=True,
+        )
+
+    return {}
+
+
+def _fixed1h_main_trigger_save(data):
+    os.makedirs(
+        os.path.dirname(NQ_FIXED1H_MAIN_TRIGGER_FILE),
+        exist_ok=True,
+    )
+
+    tmp = (
+        NQ_FIXED1H_MAIN_TRIGGER_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with NQ_FIXED1H_MAIN_TRIGGER_LOCK:
+        try:
+            with open(
+                tmp,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    data,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(
+                tmp,
+                NQ_FIXED1H_MAIN_TRIGGER_FILE,
+            )
+
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _fixed1h_record_main_trigger(title, message):
+    """Mirror a real NQ Fixed-1H MAIN alert into the browser dashboard.
+
+    MAIN /webhook is authoritative for BUY/SELL state.  The dashboard Pine
+    remains data-only and is not allowed to overwrite this trigger metadata.
+    """
+    title_text = str(title or "")
+    message_text = str(message or "")
+    title_u = title_text.upper()
+    message_u = message_text.upper()
+
+    if (
+        "NASDAQ 10-STOCK" not in title_u
+        or "FIXED 1H OPEN BASE" not in message_u
+    ):
+        return None
+
+    if "SELL" in title_u:
+        direction = "SELL"
+    elif "BUY" in title_u:
+        direction = "BUY"
+    else:
+        return None
+
+    direct_value = None
+    match = re.search(
+        r"(?i)\\bDIRECT\\s*:\\s*([+-]?\\d+(?:\\.\\d+)?)\\s*%",
+        message_text,
+    )
+    if match:
+        direct_value = _fixed1h_safe_float(match.group(1))
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    trigger = {
+        "state": direction,
+        "state_source": "MAIN",
+        "last_trigger": direction,
+        "last_trigger_type": "DIRECT",
+        "last_trigger_value": direct_value,
+        "last_trigger_time": now_ist.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_trigger_source": "MAIN",
+        "saved_at_utc": now_utc.isoformat(),
+        "saved_at_ist": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+    }
+
+    # Authoritative copy: the dashboard feed cannot overwrite this file.
+    _fixed1h_main_trigger_save(trigger)
+
+    # Immediate browser update as well.  Even if a simultaneous dashboard
+    # update races with this write, the NEXT dashboard update re-applies the
+    # authoritative MAIN trigger from the separate file above.
+    try:
+        state = _fixed1h_load()
+        state.update(trigger)
+        state["updated_at_utc"] = now_utc.isoformat()
+        state["updated_at_ist"] = now_ist.strftime("%d-%m-%Y %H:%M:%S")
+        _fixed1h_save(state)
+    except Exception as exc:
+        print(
+            f"[FIXED1H MAIN -> DASHBOARD SYNC ERROR] {exc}",
+            flush=True,
+        )
+
+    print(
+        "[FIXED1H MAIN -> DASHBOARD] "
+        f"{direction} | DIRECT={direct_value} "
+        f"| TIME={trigger['last_trigger_time']}",
+        flush=True,
+    )
+
+    return trigger
 
 
 def _fixed1h_send_pushover(title, message):
@@ -2336,6 +2493,27 @@ def fixed1h_dashboard_webhook():
         ZoneInfo("Asia/Kolkata")
     )
 
+    # MAIN /webhook is authoritative for signal state + LAST TRIGGER.
+    # The dashboard Pine only supplies live DIRECT / stock values.
+    # This prevents an old Pine last_trigger (for example 21-Sep) from
+    # overwriting a newer real MAIN BUY/SELL on every dashboard refresh.
+    main_trigger = _fixed1h_main_trigger_load()
+
+    incoming_state = str(
+        data.get("state", "NONE")
+    ).upper()
+
+    state_value = str(
+        main_trigger.get("state")
+        or incoming_state
+    ).upper()
+
+    last_trigger_value = (
+        _fixed1h_safe_float(main_trigger.get("last_trigger_value"))
+        if main_trigger
+        else _fixed1h_safe_float(data.get("last_trigger_value"))
+    )
+
     state = {
         "updated_at_utc": now_utc.isoformat(),
         "updated_at_ist": now_ist.strftime(
@@ -2350,9 +2528,10 @@ def fixed1h_dashboard_webhook():
         "direct": _fixed1h_safe_float(
             data.get("direct")
         ),
-        "state": str(
-            data.get("state", "NONE")
-        ).upper(),
+        "state": state_value,
+        "state_source": (
+            "MAIN" if main_trigger else "DASHBOARD"
+        ),
         "threshold": _fixed1h_safe_float(
             data.get("threshold")
         ),
@@ -2360,16 +2539,23 @@ def fixed1h_dashboard_webhook():
             data.get("total_weight")
         ),
         "last_trigger": str(
-            data.get("last_trigger", "NONE")
+            main_trigger.get("last_trigger")
+            if main_trigger
+            else data.get("last_trigger", "NONE")
         ).upper(),
         "last_trigger_type": str(
-            data.get("last_trigger_type", "NONE")
+            main_trigger.get("last_trigger_type")
+            if main_trigger
+            else data.get("last_trigger_type", "NONE")
         ).upper(),
-        "last_trigger_value": _fixed1h_safe_float(
-            data.get("last_trigger_value")
-        ),
+        "last_trigger_value": last_trigger_value,
         "last_trigger_time": str(
-            data.get("last_trigger_time", "NONE")
+            main_trigger.get("last_trigger_time")
+            if main_trigger
+            else data.get("last_trigger_time", "NONE")
+        ),
+        "last_trigger_source": (
+            "MAIN" if main_trigger else "DASHBOARD"
         ),
         "stocks": stocks,
     }
@@ -2398,6 +2584,8 @@ def fixed1h_dashboard_webhook():
         f"BASE={state['base_time']} "
         f"| DIRECT={state['direct']} "
         f"| STATE={state['state']} "
+        f"| TRIGGER={state['last_trigger']} "
+        f"| SOURCE={state.get('last_trigger_source')} "
         f"| STOCKS={len(stocks)}",
         flush=True,
     )
