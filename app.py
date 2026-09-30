@@ -68,9 +68,15 @@ def send_pushover(title, message):
         "BANKNIFTY TOP-5" in title_upper
     )
 
-    if not (latest_qqq_last4 or nifty_allowed or banknifty_allowed):
+    # NIY1: allow the dedicated 15-minute sequential alerts
+    # through the existing main /webhook -> Pushover path.
+    niy1_allowed = (
+        "NIY1" in title_upper
+    )
+
+    if not (latest_qqq_last4 or nifty_allowed or banknifty_allowed or niy1_allowed):
         print(
-            f"[PUSHOVER SILENT - NQ + NIFTY + BANKNIFTY ONLY] {title}",
+            f"[PUSHOVER SILENT - NQ + NIFTY + BANKNIFTY + NIY1 ONLY] {title}",
             flush=True,
         )
         return False
@@ -4492,4 +4498,3 @@ setInterval(refreshDashboard, 5000);
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate",
     }
-
