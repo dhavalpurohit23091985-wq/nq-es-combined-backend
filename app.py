@@ -4696,7 +4696,7 @@ setInterval(refreshDashboard, 5000);
 # ============================================================
 
 COINGLASS_4H_DASHBOARD_STATE_FILE = os.path.join(
-    "/var/data",
+    "/tmp",
     "coinglass_top10_dashboard_4h.json",
 )
 COINGLASS_4H_DASHBOARD_LOCK = threading.Lock()
@@ -5150,4 +5150,3 @@ setInterval(
         "Cache-Control":
             "no-store, no-cache, must-revalidate",
     }
-
