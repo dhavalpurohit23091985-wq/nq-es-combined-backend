@@ -4328,7 +4328,7 @@ refresh();setInterval(refresh,5000)
 # ============================================================
 
 COINGLASS_DASHBOARD_STATE_FILE = os.path.join(
-    "/var/data",
+    "/tmp",
     "coinglass_top10_dashboard.json",
 )
 COINGLASS_DASHBOARD_LOCK = threading.Lock()
