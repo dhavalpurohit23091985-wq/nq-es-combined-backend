@@ -6,6 +6,7 @@ import re
 import json
 import fcntl
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -5150,3 +5151,269 @@ setInterval(
         "Cache-Control":
             "no-store, no-cache, must-revalidate",
     }
+
+# ============================================================
+# COINGLASS FEED WATCHDOG — 1H + 4H
+# ============================================================
+# Independent of Chrome/Tampermonkey execution.
+# Checks the timestamps already stored by the 1H and 4H dashboard feeds.
+# If a feed is older than 3 minutes, one Pushover STALE alert is sent.
+# No repeat STALE spam while it remains stale.
+# When the feed becomes fresh again, one RECOVERED alert is sent.
+
+COINGLASS_WATCHDOG_CHECK_SECONDS = 60
+COINGLASS_WATCHDOG_STALE_SECONDS = 180
+COINGLASS_WATCHDOG_STARTUP_GRACE_SECONDS = 180
+COINGLASS_WATCHDOG_LOCK_FILE = "/tmp/coinglass_feed_watchdog.lock"
+
+_COINGLASS_WATCHDOG_STARTED_MONO = time.monotonic()
+
+
+def _coinglass_watchdog_send_pushover(title, message):
+    """Dedicated watchdog Pushover sender; bypasses trading-alert filters."""
+    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        print(
+            "[COINGLASS WATCHDOG] Pushover not configured",
+            flush=True,
+        )
+        return False
+
+    try:
+        response = requests.post(
+            PUSHOVER_URL,
+            data={
+                "token": PUSHOVER_TOKEN,
+                "user": PUSHOVER_USER,
+                "title": title,
+                "message": message,
+                "priority": 0,
+            },
+            timeout=10,
+        )
+
+        if not response.ok:
+            print(
+                f"[COINGLASS WATCHDOG PUSHOVER FAILED] HTTP {response.status_code}",
+                flush=True,
+            )
+
+        return response.ok
+
+    except requests.RequestException as exc:
+        print(
+            f"[COINGLASS WATCHDOG PUSHOVER ERROR] {exc}",
+            flush=True,
+        )
+        return False
+
+
+def _coinglass_watchdog_parse_utc(value):
+    if not value:
+        return None
+
+    try:
+        text = str(value).strip()
+
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(text)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except (TypeError, ValueError):
+        return None
+
+
+def _coinglass_watchdog_feed_info(label, loader):
+    try:
+        data = loader()
+    except Exception as exc:
+        return {
+            "label": label,
+            "fresh": False,
+            "age_seconds": None,
+            "updated_at_ist": None,
+            "reason": f"loader error: {type(exc).__name__}",
+        }
+
+    if not isinstance(data, dict):
+        data = {}
+
+    updated_utc = _coinglass_watchdog_parse_utc(
+        data.get("updated_at_utc")
+    )
+
+    updated_ist = data.get("updated_at_ist")
+
+    if updated_utc is None:
+        return {
+            "label": label,
+            "fresh": False,
+            "age_seconds": None,
+            "updated_at_ist": updated_ist,
+            "reason": "no valid feed timestamp",
+        }
+
+    age_seconds = max(
+        0.0,
+        (datetime.now(timezone.utc) - updated_utc).total_seconds(),
+    )
+
+    return {
+        "label": label,
+        "fresh": age_seconds <= COINGLASS_WATCHDOG_STALE_SECONDS,
+        "age_seconds": age_seconds,
+        "updated_at_ist": updated_ist,
+        "reason": None,
+    }
+
+
+def _coinglass_watchdog_age_text(age_seconds):
+    if age_seconds is None:
+        return "unknown"
+
+    total = int(round(age_seconds))
+    minutes, seconds = divmod(total, 60)
+
+    if minutes:
+        return f"{minutes}m {seconds}s"
+
+    return f"{seconds}s"
+
+
+def _coinglass_feed_watchdog_loop():
+    # Prevent duplicate watchdog threads if Gunicorn runs more than one worker.
+    try:
+        lock_handle = open(
+            COINGLASS_WATCHDOG_LOCK_FILE,
+            "a+",
+            encoding="utf-8",
+        )
+        fcntl.flock(
+            lock_handle.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except (OSError, BlockingIOError):
+        print(
+            "[COINGLASS WATCHDOG] Another worker already owns watchdog lock",
+            flush=True,
+        )
+        return
+
+    print(
+        "[COINGLASS WATCHDOG] Started — checking 1H + 4H every 60s; stale > 180s",
+        flush=True,
+    )
+
+    last_state = {
+        "1H": "UNKNOWN",
+        "4H": "UNKNOWN",
+    }
+
+    while True:
+        try:
+            uptime_seconds = (
+                time.monotonic()
+                - _COINGLASS_WATCHDOG_STARTED_MONO
+            )
+
+            feeds = [
+                _coinglass_watchdog_feed_info(
+                    "1H",
+                    _coinglass_dashboard_load,
+                ),
+                _coinglass_watchdog_feed_info(
+                    "4H",
+                    _coinglass_4h_dashboard_load,
+                ),
+            ]
+
+            for info in feeds:
+                label = info["label"]
+                state = "FRESH" if info["fresh"] else "STALE"
+                previous = last_state.get(label, "UNKNOWN")
+
+                # Give Render/feed time to repopulate /tmp after restart/redeploy.
+                if (
+                    state == "STALE"
+                    and uptime_seconds
+                    < COINGLASS_WATCHDOG_STARTUP_GRACE_SECONDS
+                ):
+                    last_state[label] = "UNKNOWN"
+                    continue
+
+                if state == "STALE" and previous != "STALE":
+                    age_text = _coinglass_watchdog_age_text(
+                        info["age_seconds"]
+                    )
+                    updated_text = (
+                        info["updated_at_ist"]
+                        or "not available"
+                    )
+                    reason = info.get("reason")
+
+                    message = (
+                        f"CoinGlass {label} feed has stopped updating.\n"
+                        f"Feed age: {age_text}\n"
+                        f"Last update: {updated_text} IST\n"
+                        f"Stale limit: {COINGLASS_WATCHDOG_STALE_SECONDS // 60} minutes"
+                    )
+
+                    if reason:
+                        message += f"\nReason: {reason}"
+
+                    _coinglass_watchdog_send_pushover(
+                        f"COINGLASS {label} FEED STALE",
+                        message,
+                    )
+
+                    print(
+                        f"[COINGLASS WATCHDOG] {label} STALE | age={age_text}",
+                        flush=True,
+                    )
+
+                elif state == "FRESH" and previous == "STALE":
+                    updated_text = (
+                        info["updated_at_ist"]
+                        or "available"
+                    )
+
+                    _coinglass_watchdog_send_pushover(
+                        f"COINGLASS {label} FEED RECOVERED",
+                        (
+                            f"CoinGlass {label} feed is updating again.\n"
+                            f"Latest update: {updated_text} IST"
+                        ),
+                    )
+
+                    print(
+                        f"[COINGLASS WATCHDOG] {label} RECOVERED",
+                        flush=True,
+                    )
+
+                last_state[label] = state
+
+        except Exception as exc:
+            print(
+                f"[COINGLASS WATCHDOG LOOP ERROR] {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+        time.sleep(COINGLASS_WATCHDOG_CHECK_SECONDS)
+
+
+def _start_coinglass_feed_watchdog():
+    thread = threading.Thread(
+        target=_coinglass_feed_watchdog_loop,
+        name="coinglass-feed-watchdog",
+        daemon=True,
+    )
+    thread.start()
+
+
+_start_coinglass_feed_watchdog()
+
