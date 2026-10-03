@@ -5153,6 +5153,126 @@ setInterval(
     }
 
 # ============================================================
+# COINGLASS FEED DIAGNOSTICS — 1H + 4H
+# ============================================================
+# Browser/Tampermonkey feeds report their current stage here.
+# Watchdog uses this to distinguish parser/feed failures from a
+# missing browser heartbeat. This does not change trading alerts.
+
+COINGLASS_DIAGNOSTIC_STATE_FILE = "/tmp/coinglass_feed_diagnostics.json"
+COINGLASS_DIAGNOSTIC_LOCK = threading.Lock()
+
+
+def _coinglass_diagnostic_load():
+    try:
+        with COINGLASS_DIAGNOSTIC_LOCK:
+            with open(
+                COINGLASS_DIAGNOSTIC_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(
+            f"[COINGLASS DIAGNOSTIC READ ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+    return {}
+
+
+def _coinglass_diagnostic_save(data):
+    tmp = (
+        COINGLASS_DIAGNOSTIC_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with COINGLASS_DIAGNOSTIC_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, COINGLASS_DIAGNOSTIC_STATE_FILE)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+@app.post("/coinglass-feed-diagnostic-webhook")
+def coinglass_feed_diagnostic_webhook():
+    secret = request.args.get("secret", "")
+
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    timeframe = str(data.get("timeframe", "")).strip().upper()
+
+    if timeframe not in {"1H", "4H"}:
+        return jsonify({
+            "ok": False,
+            "error": "timeframe_must_be_1H_or_4H",
+        }), 400
+
+    stage = str(data.get("stage", "unknown")).strip()[:80]
+    status = str(data.get("status", "OK")).strip().upper()[:20]
+    detail = str(data.get("detail", "")).strip()[:500]
+    version = str(data.get("version", "")).strip()[:40]
+    client_time = str(data.get("client_time", "")).strip()[:80]
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    state = _coinglass_diagnostic_load()
+    state[timeframe] = {
+        "received_at_utc": now_utc.isoformat(),
+        "received_at_ist": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+        "stage": stage,
+        "status": status,
+        "detail": detail,
+        "version": version,
+        "client_time": client_time,
+    }
+
+    try:
+        _coinglass_diagnostic_save(state)
+    except Exception as exc:
+        print(
+            f"[COINGLASS DIAGNOSTIC SAVE ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return jsonify({"ok": False, "error": "save_failed"}), 500
+
+    print(
+        f"[COINGLASS DIAGNOSTIC] {timeframe} | {status} | {stage} | {detail[:160]}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "timeframe": timeframe,
+        "stage": stage,
+        "status": status,
+        "received_at_ist": state[timeframe]["received_at_ist"],
+    }), 200
+
+
+@app.get("/coinglass-feed-diagnostic-data")
+def coinglass_feed_diagnostic_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_diagnostic_load(),
+    })
+
+
+# ============================================================
 # COINGLASS FEED WATCHDOG — 1H + 4H
 # ============================================================
 # Independent of Chrome/Tampermonkey execution.
@@ -5285,6 +5405,67 @@ def _coinglass_watchdog_age_text(age_seconds):
     return f"{seconds}s"
 
 
+def _coinglass_watchdog_diagnostic_reason(label):
+    diagnostics = _coinglass_diagnostic_load()
+    info = diagnostics.get(label, {}) if isinstance(diagnostics, dict) else {}
+
+    if not isinstance(info, dict) or not info:
+        return (
+            "No browser heartbeat received. "
+            "Possible causes: feed script off/not loaded, CoinGlass tab closed, "
+            "Chrome/RDP session stopped, VPS/network issue."
+        )
+
+    received_utc = _coinglass_watchdog_parse_utc(
+        info.get("received_at_utc")
+    )
+
+    if received_utc is None:
+        return "Diagnostic heartbeat exists but its timestamp is invalid."
+
+    heartbeat_age = max(
+        0.0,
+        (datetime.now(timezone.utc) - received_utc).total_seconds(),
+    )
+
+    if heartbeat_age > COINGLASS_WATCHDOG_STALE_SECONDS:
+        return (
+            "No recent browser heartbeat "
+            f"({_coinglass_watchdog_age_text(heartbeat_age)} old). "
+            "Possible causes: feed script off/not loaded, CoinGlass tab closed, "
+            "Chrome/RDP session stopped, VPS/network issue."
+        )
+
+    stage = str(info.get("stage", "unknown") or "unknown")
+    status = str(info.get("status", "UNKNOWN") or "UNKNOWN").upper()
+    detail = str(info.get("detail", "") or "").strip()
+    version = str(info.get("version", "") or "").strip()
+
+    prefix = "Browser/script heartbeat is alive. "
+    if version:
+        prefix += f"Feed version {version}. "
+
+    if status == "ERROR":
+        if detail:
+            return prefix + f"Failure stage: {stage}. Detail: {detail}"
+        return prefix + f"Failure stage: {stage}."
+
+    if stage == "cycle_start":
+        return prefix + "Feed cycle started but did not reach data collection/post."
+
+    if stage in {"trades_verified", "collect_ok"}:
+        return prefix + f"Last successful stage: {stage}; data POST did not complete."
+
+    if stage == "data_post_ok":
+        return (
+            prefix
+            + "Feed reports a successful Render POST, but dashboard timestamp is stale; "
+            "check backend save/state handling."
+        )
+
+    return prefix + f"Last reported stage: {stage} ({status})."
+
+
 def _coinglass_feed_watchdog_loop():
     # Prevent duplicate watchdog threads if Gunicorn runs more than one worker.
     try:
@@ -5355,6 +5536,8 @@ def _coinglass_feed_watchdog_loop():
                         or "not available"
                     )
                     reason = info.get("reason")
+                    if not reason:
+                        reason = _coinglass_watchdog_diagnostic_reason(label)
 
                     message = (
                         f"CoinGlass {label} feed has stopped updating.\n"
