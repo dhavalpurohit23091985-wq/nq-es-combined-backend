@@ -4324,7 +4324,7 @@ refresh();setInterval(refresh,5000)
 
 # ============================================================
 # COINGLASS LIQUIDATION TRADES DASHBOARD
-# BTC + XAU always included + 8 highest-ranked unique assets.
+# FIXED 8 always included + next 2 highest-ranked non-fixed assets.
 # DATA ONLY: this route never sends Pushover.
 # ============================================================
 
@@ -4333,6 +4333,82 @@ COINGLASS_DASHBOARD_STATE_FILE = os.path.join(
     "coinglass_top10_dashboard.json",
 )
 COINGLASS_DASHBOARD_LOCK = threading.Lock()
+
+
+# ============================================================
+# COINGLASS FIXED-8 + NEXT-2 SELECTION
+# Shared by BOTH 1H and 4H dashboard webhooks.
+# Bad/old payloads that omit any fixed asset are rejected so
+# they can never overwrite a good dashboard state.
+# ============================================================
+
+COINGLASS_FIXED_ASSETS = (
+    "BTC",
+    "XAU",
+    "ETH",
+    "SOL",
+    "XRP",
+    "NEAR",
+    "DOGE",
+    "ZEC",
+)
+COINGLASS_FIXED_ASSET_SET = set(COINGLASS_FIXED_ASSETS)
+
+
+def _select_coinglass_fixed8_plus2(parsed_assets):
+    by_symbol = {
+        str(item.get("symbol", "")).upper(): item
+        for item in parsed_assets
+        if isinstance(item, dict)
+        and str(item.get("symbol", "")).strip()
+    }
+
+    missing_fixed = [
+        symbol
+        for symbol in COINGLASS_FIXED_ASSETS
+        if symbol not in by_symbol
+    ]
+
+    if missing_fixed:
+        return None, {
+            "error": "fixed_assets_missing",
+            "missing": missing_fixed,
+        }
+
+    ranked_non_fixed = sorted(
+        (
+            item
+            for item in parsed_assets
+            if str(item.get("symbol", "")).upper()
+            not in COINGLASS_FIXED_ASSET_SET
+        ),
+        key=lambda item: (
+            int(item.get("rank", 999999)),
+            str(item.get("symbol", "")),
+        ),
+    )
+
+    if len(ranked_non_fixed) < 2:
+        return None, {
+            "error": "ranked_assets_missing",
+            "available_non_fixed": len(ranked_non_fixed),
+        }
+
+    selected = [
+        by_symbol[symbol]
+        for symbol in COINGLASS_FIXED_ASSETS
+    ] + ranked_non_fixed[:2]
+
+    # Keep browser order aligned with CoinGlass ranking while
+    # guaranteeing the fixed eight can never disappear.
+    selected.sort(
+        key=lambda item: (
+            int(item.get("rank", 999999)),
+            str(item.get("symbol", "")),
+        )
+    )
+
+    return selected, None
 
 
 def _coinglass_dashboard_load():
@@ -4449,9 +4525,23 @@ def coinglass_dashboard_webhook():
         })
         seen.add(symbol)
 
-    # Monkey sends the already-selected 10 rows:
-    # BTC + XAU compulsory, remaining 8 by CoinGlass ranking.
-    assets = assets[:10]
+    selected_assets, selection_error = (
+        _select_coinglass_fixed8_plus2(assets)
+    )
+
+    if selection_error:
+        print(
+            "[COINGLASS DASHBOARD REJECTED] "
+            + json.dumps(selection_error, sort_keys=True),
+            flush=True,
+        )
+        return jsonify({
+            "ok": False,
+            **selection_error,
+            "required_fixed": list(COINGLASS_FIXED_ASSETS),
+        }), 422
+
+    assets = selected_assets
 
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
@@ -4582,7 +4672,7 @@ td {
 <div class="container">
     <h1>COINGLASS TOP-10 DASHBOARD</h1>
     <div class="subtitle">
-        LIQUIDATION TRADES • 1H LONG vs 1H SHORT • BTC + XAU ALWAYS INCLUDED
+        LIQUIDATION TRADES • 1H LONG vs 1H SHORT • FIXED 8 + NEXT 2 RANKED
     </div>
 
     <div class="card">
@@ -4606,7 +4696,7 @@ td {
     </div>
 
     <div class="footer">
-        BTC + XAU fixed • Remaining 8 follow CoinGlass ranking<br>
+        FIXED: BTC XAU ETH SOL XRP NEAR DOGE ZEC • NEXT 2 follow CoinGlass ranking<br>
         Feed update: <span id="updated">--</span> IST<br>
         <span id="status">Loading...</span>
     </div>
@@ -4655,7 +4745,10 @@ async function refreshDashboard() {
                 stronger === "LONG" ? "long" :
                 stronger === "SHORT" ? "short" : "equal";
             const fixed =
-                item.symbol === "BTC" || item.symbol === "XAU"
+                [
+                    "BTC", "XAU", "ETH", "SOL",
+                    "XRP", "NEAR", "DOGE", "ZEC"
+                ].includes(item.symbol)
                 ? " fixed" : "";
 
             html += "<tr>"
@@ -4692,7 +4785,7 @@ setInterval(refreshDashboard, 5000);
 # ============================================================
 # COINGLASS LIQUIDATION TRADES DASHBOARD — 4H
 # Separate from existing 1H dashboard.
-# BTC + XAU always included + remaining 8 CoinGlass-ranked assets.
+# FIXED 8 always included + next 2 CoinGlass-ranked non-fixed assets.
 # DATA ONLY: this route never sends Pushover.
 # ============================================================
 
@@ -4830,7 +4923,23 @@ def coinglass_dashboard_4h_webhook():
 
         seen.add(symbol)
 
-    assets = assets[:10]
+    selected_assets, selection_error = (
+        _select_coinglass_fixed8_plus2(assets)
+    )
+
+    if selection_error:
+        print(
+            "[COINGLASS 4H DASHBOARD REJECTED] "
+            + json.dumps(selection_error, sort_keys=True),
+            flush=True,
+        )
+        return jsonify({
+            "ok": False,
+            **selection_error,
+            "required_fixed": list(COINGLASS_FIXED_ASSETS),
+        }), 422
+
+    assets = selected_assets
 
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(
@@ -4974,7 +5083,7 @@ td {
     <h1>COINGLASS TOP-10 DASHBOARD — 4H</h1>
 
     <div class="subtitle">
-        LIQUIDATION TRADES • 4H LONG vs 4H SHORT • BTC + XAU ALWAYS INCLUDED
+        LIQUIDATION TRADES • 4H LONG vs 4H SHORT • FIXED 8 + NEXT 2 RANKED
     </div>
 
     <div class="card">
@@ -5001,7 +5110,7 @@ td {
     </div>
 
     <div class="footer">
-        BTC + XAU fixed • Remaining 8 follow CoinGlass ranking<br>
+        FIXED: BTC XAU ETH SOL XRP NEAR DOGE ZEC • NEXT 2 follow CoinGlass ranking<br>
         Feed update: <span id="updated">--</span> IST<br>
         <span id="status">Loading...</span>
     </div>
@@ -5084,8 +5193,10 @@ async function refreshDashboard() {
                     : "equal";
 
                 const fixed =
-                    item.symbol === "BTC"
-                    || item.symbol === "XAU"
+                    [
+                        "BTC", "XAU", "ETH", "SOL",
+                        "XRP", "NEAR", "DOGE", "ZEC"
+                    ].includes(item.symbol)
                     ? " fixed"
                     : "";
 
@@ -5599,4 +5710,3 @@ def _start_coinglass_feed_watchdog():
 
 
 _start_coinglass_feed_watchdog()
-
