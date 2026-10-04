@@ -5268,7 +5268,7 @@ setInterval(
 # ============================================================
 # COINGLASS LIQUIDATION VALUE DASHBOARD — 4H
 # COMPLETELY SEPARATE from existing Liquidation Trades dashboards.
-# FIXED 9 always included + next 1 CoinGlass-ranked non-fixed asset.
+# FIXED 8 always included + next 2 CoinGlass-ranked non-fixed assets.
 # DATA ONLY: these routes NEVER send Pushover.
 #
 # Thresholds:
@@ -5293,7 +5293,6 @@ COINGLASS_VALUE_FIXED_ASSETS = (
     "XRP",
     "NEAR",
     "DOGE",
-    "ETC",
     "ZEC",
     "XAU",
 )
@@ -5317,7 +5316,7 @@ def _coinglass_value_4h_threshold(symbol):
     return 500_000.0
 
 
-def _select_coinglass_value_fixed9_plus1(parsed_assets):
+def _select_coinglass_value_fixed8_plus2(parsed_assets):
     by_symbol = {
         str(item.get("symbol", "")).strip().upper(): item
         for item in parsed_assets
@@ -5350,19 +5349,19 @@ def _select_coinglass_value_fixed9_plus1(parsed_assets):
         ),
     )
 
-    if len(ranked_non_fixed) < 1:
+    if len(ranked_non_fixed) < 2:
         return None, {
-            "error": "ranked_asset_missing",
+            "error": "ranked_assets_missing",
             "available_non_fixed": len(ranked_non_fixed),
         }
 
     selected = [
         by_symbol[symbol]
         for symbol in COINGLASS_VALUE_FIXED_ASSETS
-    ] + ranked_non_fixed[:1]
+    ] + ranked_non_fixed[:2]
 
     # Display in CoinGlass ranking order while guaranteeing
-    # that all nine fixed assets are always present.
+    # that all eight fixed assets are always present.
     selected.sort(
         key=lambda item: (
             int(item.get("rank", 999999)),
@@ -5525,7 +5524,7 @@ def coinglass_liquidation_value_4h_webhook():
         seen.add(symbol)
 
     selected_assets, selection_error = (
-        _select_coinglass_value_fixed9_plus1(
+        _select_coinglass_value_fixed8_plus2(
             assets
         )
     )
@@ -5709,7 +5708,7 @@ td {
     <h1>COINGLASS LIQUIDATION VALUE — 4H</h1>
 
     <div class="subtitle">
-        DEFAULT LIQUIDATION VALUE MODE • FIXED 9 + NEXT 1 RANKED<br>
+        DEFAULT LIQUIDATION VALUE MODE • FIXED 8 + NEXT 2 RANKED<br>
         BTC / ETH / SOL = $1M GAP • ALL OTHERS = $500K GAP
     </div>
 
@@ -5739,7 +5738,7 @@ td {
     </div>
 
     <div class="footer">
-        FIXED: BTC ETH SOL XRP NEAR DOGE ETC ZEC XAU • NEXT 1 follows CoinGlass ranking<br>
+        FIXED: BTC ETH SOL XRP NEAR DOGE ZEC XAU • NEXT 2 follow CoinGlass ranking<br>
         SHORT-LONG threshold = BUY • LONG-SHORT threshold = SELL<br>
         Feed update: <span id="updated">--</span> IST<br>
         <span id="status">Loading...</span>
@@ -5845,7 +5844,7 @@ async function refreshDashboard() {
                 const fixed =
                     [
                         "BTC", "ETH", "SOL", "XRP", "NEAR",
-                        "DOGE", "ETC", "ZEC", "XAU"
+                        "DOGE", "ZEC", "XAU"
                     ].includes(item.symbol)
                     ? " fixed"
                     : "";
