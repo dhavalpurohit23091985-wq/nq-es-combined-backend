@@ -6627,12 +6627,12 @@ def coinglass_feed_diagnostic_data():
 # ============================================================
 # Independent of Chrome/Tampermonkey execution.
 # Checks the timestamps already stored by the 1H and 4H dashboard feeds.
-# If a feed is older than 3 minutes, one Pushover STALE alert is sent.
+# If a feed is older than 5 minutes, one Pushover STALE alert is sent.
 # No repeat STALE spam while it remains stale.
 # When the feed becomes fresh again, one RECOVERED alert is sent.
 
 COINGLASS_WATCHDOG_CHECK_SECONDS = 60
-COINGLASS_WATCHDOG_STALE_SECONDS = 180
+COINGLASS_WATCHDOG_STALE_SECONDS = 300
 COINGLASS_WATCHDOG_STARTUP_GRACE_SECONDS = 180
 COINGLASS_WATCHDOG_LOCK_FILE = "/tmp/coinglass_feed_watchdog.lock"
 
@@ -6836,7 +6836,7 @@ def _coinglass_feed_watchdog_loop():
         return
 
     print(
-        "[COINGLASS WATCHDOG] Started — checking 1H + 4H every 60s; stale > 180s",
+        "[COINGLASS WATCHDOG] Started — checking 1H + 4H every 60s; stale > 300s",
         flush=True,
     )
 
