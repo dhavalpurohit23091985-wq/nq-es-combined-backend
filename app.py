@@ -6633,7 +6633,7 @@ def coinglass_feed_diagnostic_data():
 # ============================================================
 
 COINGLASS_VALUE_ALERT_ENGINE_STATE_FILE = os.path.join(
-    "/var/data",
+    "/tmp",
     "coinglass_value_alert_engine.json",
 )
 COINGLASS_VALUE_ALERT_ENGINE_LOCK = threading.Lock()
