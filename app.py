@@ -7364,6 +7364,701 @@ setInterval(refreshDashboard, 5000);
     }
 
 
+
+# ============================================================
+# COINGLASS LIQUIDATION TRADES — COMBINED 1H + 4H DASHBOARD
+# DISPLAY ONLY.
+# Reads the EXISTING 1H and 4H Liquidation Trades dashboard state.
+# Does NOT change webhook logic, 50-gap alert logic, strict alternation,
+# Pushover, Tampermonkey feeds, or auto-recovery.
+# ============================================================
+
+
+def _coinglass_trades_combined_parse_time(value):
+    try:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("empty")
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _coinglass_trades_combined_state():
+    state_1h = _coinglass_dashboard_load()
+    state_4h = _coinglass_4h_dashboard_load()
+
+    assets_1h = state_1h.get("assets", [])
+    assets_4h = state_4h.get("assets", [])
+
+    if not isinstance(assets_1h, list):
+        assets_1h = []
+    if not isinstance(assets_4h, list):
+        assets_4h = []
+
+    map_1h = {
+        str(item.get("symbol", "")).strip().upper(): item
+        for item in assets_1h
+        if isinstance(item, dict)
+        and str(item.get("symbol", "")).strip()
+    }
+
+    map_4h = {
+        str(item.get("symbol", "")).strip().upper(): item
+        for item in assets_4h
+        if isinstance(item, dict)
+        and str(item.get("symbol", "")).strip()
+    }
+
+    time_1h = _coinglass_trades_combined_parse_time(
+        state_1h.get("updated_at_utc")
+    )
+    time_4h = _coinglass_trades_combined_parse_time(
+        state_4h.get("updated_at_utc")
+    )
+
+    # Use the freshest feed's current FIXED8+2 ranking as display order.
+    # If one feed is temporarily empty, fall back to the other one.
+    if assets_1h and (
+        not assets_4h
+        or time_1h >= time_4h
+    ):
+        primary_assets = assets_1h
+        secondary_assets = assets_4h
+    else:
+        primary_assets = assets_4h
+        secondary_assets = assets_1h
+
+    symbols = []
+    seen = set()
+
+    for source in (primary_assets, secondary_assets):
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = str(
+                item.get("symbol", "")
+            ).strip().upper()
+
+            if not symbol or symbol in seen:
+                continue
+
+            symbols.append(symbol)
+            seen.add(symbol)
+
+            if len(symbols) >= 10:
+                break
+
+        if len(symbols) >= 10:
+            break
+
+    rows = []
+
+    for symbol in symbols:
+        item_1h = map_1h.get(symbol)
+        item_4h = map_4h.get(symbol)
+
+        rank_values = []
+        for item in (item_1h, item_4h):
+            if not isinstance(item, dict):
+                continue
+            try:
+                rank_values.append(
+                    int(item.get("rank", 999999))
+                )
+            except (TypeError, ValueError):
+                pass
+
+        rank = min(rank_values) if rank_values else 999999
+
+        rows.append({
+            "rank": rank,
+            "symbol": symbol,
+            "is_fixed": symbol in COINGLASS_FIXED_ASSET_SET,
+            "one_hour": item_1h,
+            "four_hour": item_4h,
+        })
+
+    return {
+        "updated_at_1h_utc": state_1h.get("updated_at_utc"),
+        "updated_at_1h_ist": state_1h.get("updated_at_ist"),
+        "updated_at_4h_utc": state_4h.get("updated_at_utc"),
+        "updated_at_4h_ist": state_4h.get("updated_at_ist"),
+        "gap_threshold": 50,
+        "assets": rows,
+    }
+
+
+@app.get("/coinglass-liquidation-trades-combined-data")
+def coinglass_liquidation_trades_combined_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_trades_combined_state(),
+    })
+
+
+@app.get("/coinglass-liquidation-trades")
+@app.get("/coinglass-liquidation-trades-combined")
+def coinglass_liquidation_trades_combined():
+    html = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoinGlass 1H + 4H Liquidation Trades Dashboard</title>
+
+<style>
+:root {
+    color-scheme: dark;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 18px;
+    background: #0d1117;
+    color: #f0f6fc;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+}
+
+h1 {
+    text-align: center;
+    margin: 0 0 7px;
+    font-size: 28px;
+}
+
+.subtitle {
+    text-align: center;
+    color: #8b949e;
+    margin-bottom: 16px;
+    line-height: 1.55;
+}
+
+.update-strip {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.update-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 10px 12px;
+    text-align: center;
+    color: #8b949e;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.update-box strong {
+    color: #f0f6fc;
+}
+
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    min-width: 1030px;
+    border-collapse: collapse;
+}
+
+th {
+    background: #21262d;
+    padding: 13px 8px;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+th.group-1h {
+    box-shadow: inset 0 -3px 0 #58a6ff;
+}
+
+th.group-4h {
+    box-shadow: inset 0 -3px 0 #a371f7;
+}
+
+td {
+    padding: 13px 8px;
+    text-align: center;
+    border-top: 1px solid #30363d;
+    font-size: 14px;
+    white-space: nowrap;
+}
+
+.asset {
+    font-weight: 800;
+    font-size: 17px;
+}
+
+.fixed {
+    color: #58a6ff;
+}
+
+.long {
+    color: #3fb950;
+    font-weight: 700;
+}
+
+.short {
+    color: #f85149;
+    font-weight: 700;
+}
+
+.equal {
+    color: #d29922;
+    font-weight: 700;
+}
+
+.gap {
+    font-weight: 800;
+}
+
+.sep-left {
+    border-left: 2px solid #30363d;
+}
+
+.mobile-list {
+    display: none;
+}
+
+.asset-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 13px;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+.asset-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.asset-name {
+    font-size: 21px;
+    font-weight: 900;
+}
+
+.rank-note {
+    color: #8b949e;
+    font-size: 12px;
+    text-align: right;
+}
+
+.tf-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 9px;
+}
+
+.tf-box {
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 10px;
+    background: #0d1117;
+}
+
+.tf-title {
+    font-weight: 900;
+    text-align: center;
+    margin-bottom: 9px;
+    font-size: 16px;
+}
+
+.tf-title.one {
+    color: #58a6ff;
+}
+
+.tf-title.four {
+    color: #a371f7;
+}
+
+.metric {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 13px;
+}
+
+.metric-label {
+    color: #8b949e;
+}
+
+.stronger-line {
+    text-align: center;
+    margin-top: 7px;
+    padding-top: 7px;
+    border-top: 1px solid #30363d;
+    font-size: 15px;
+}
+
+.footer {
+    text-align: center;
+    color: #8b949e;
+    margin-top: 16px;
+    line-height: 1.65;
+    font-size: 13px;
+}
+
+.status-live {
+    color: #3fb950;
+    font-weight: 800;
+}
+
+.status-stale {
+    color: #f85149;
+    font-weight: 800;
+}
+
+@media (max-width: 780px) {
+    body {
+        padding: 10px;
+    }
+
+    h1 {
+        font-size: 21px;
+    }
+
+    .subtitle {
+        font-size: 13px;
+    }
+
+    .desktop-card {
+        display: none;
+    }
+
+    .mobile-list {
+        display: block;
+    }
+
+    .update-strip {
+        grid-template-columns: 1fr 1fr;
+        gap: 7px;
+    }
+
+    .update-box {
+        padding: 8px 5px;
+        font-size: 11px;
+    }
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+    <h1>COINGLASS LIQUIDATION TRADES — 1H + 4H</h1>
+
+    <div class="subtitle">
+        FIXED 8 + NEXT 2 COINGLASS RANKED<br>
+        CURRENT LONG / SHORT TRADE COUNTS • 50-TRADE ALERT LOGIC UNCHANGED<br>
+        EXISTING STRICT BUY→SELL→BUY ALTERNATION REMAINS UNCHANGED
+    </div>
+
+    <div class="update-strip">
+        <div class="update-box">
+            <strong>1H FEED</strong><br>
+            <span id="updated1h">--</span><br>
+            <span id="age1h">--</span>
+        </div>
+        <div class="update-box">
+            <strong>4H FEED</strong><br>
+            <span id="updated4h">--</span><br>
+            <span id="age4h">--</span>
+        </div>
+    </div>
+
+    <div class="card desktop-card">
+        <table>
+            <thead>
+                <tr>
+                    <th rowspan="2">#</th>
+                    <th rowspan="2">ASSET</th>
+                    <th colspan="4" class="group-1h">1 HOUR</th>
+                    <th colspan="4" class="group-4h sep-left">4 HOUR</th>
+                </tr>
+                <tr>
+                    <th>LONG</th>
+                    <th>SHORT</th>
+                    <th>GAP</th>
+                    <th>STRONGER</th>
+                    <th class="sep-left">LONG</th>
+                    <th>SHORT</th>
+                    <th>GAP</th>
+                    <th>STRONGER</th>
+                </tr>
+            </thead>
+            <tbody id="desktopRows">
+                <tr>
+                    <td colspan="10">Waiting for 1H + 4H Trades feeds...</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="mobile-list" id="mobileRows">
+        <div class="asset-card">
+            Waiting for 1H + 4H Trades feeds...
+        </div>
+    </div>
+
+    <div class="footer">
+        Fixed: BTC XAU ETH SOL XRP NEAR DOGE ZEC • Next 2 follow CoinGlass ranking.<br>
+        Existing 1H / 4H alerts and auto-recovery remain unchanged.<br>
+        LIVE • Browser refresh every 5 seconds
+    </div>
+
+</div>
+
+<script>
+function esc(value) {
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function countFmt(value) {
+    const n = Number(value);
+
+    if (!Number.isFinite(n)) {
+        return "--";
+    }
+
+    if (Number.isInteger(n)) {
+        return String(n);
+    }
+
+    return n.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function strongerText(item) {
+    if (!item) {
+        return "--";
+    }
+
+    return String(item.stronger || "EQUAL").toUpperCase();
+}
+
+function strongerClass(item) {
+    const s = strongerText(item);
+
+    if (s === "LONG") {
+        return "long";
+    }
+
+    if (s === "SHORT") {
+        return "short";
+    }
+
+    return "equal";
+}
+
+function valueOrNone(item, key) {
+    if (!item || item[key] === null || item[key] === undefined) {
+        return "--";
+    }
+
+    return countFmt(item[key]);
+}
+
+function ageText(utcText) {
+    if (!utcText) {
+        return {
+            text: "NO DATA",
+            cls: "status-stale"
+        };
+    }
+
+    const t = Date.parse(utcText);
+
+    if (!Number.isFinite(t)) {
+        return {
+            text: "UNKNOWN",
+            cls: "status-stale"
+        };
+    }
+
+    const minutes = Math.max(
+        0,
+        (Date.now() - t) / 60000
+    );
+
+    if (minutes >= 5) {
+        return {
+            text: "STALE • " + minutes.toFixed(1) + " min",
+            cls: "status-stale"
+        };
+    }
+
+    return {
+        text: "LIVE • " + minutes.toFixed(1) + " min",
+        cls: "status-live"
+    };
+}
+
+function metricHtml(label, value, cls) {
+    return (
+        '<div class="metric">'
+        + '<span class="metric-label">'
+        + esc(label)
+        + '</span>'
+        + '<span class="'
+        + esc(cls || "")
+        + '">'
+        + esc(value)
+        + '</span>'
+        + '</div>'
+    );
+}
+
+async function refreshDashboard() {
+    try {
+        const response = await fetch(
+            "/coinglass-liquidation-trades-combined-data?ts="
+            + Date.now(),
+            {
+                cache: "no-store"
+            }
+        );
+
+        const data = await response.json();
+        const assets = Array.isArray(data.assets)
+            ? data.assets
+            : [];
+
+        document.getElementById("updated1h").textContent =
+            data.updated_at_1h_ist || "--";
+        document.getElementById("updated4h").textContent =
+            data.updated_at_4h_ist || "--";
+
+        const age1 = ageText(data.updated_at_1h_utc);
+        const age4 = ageText(data.updated_at_4h_utc);
+
+        const age1h = document.getElementById("age1h");
+        const age4h = document.getElementById("age4h");
+
+        age1h.textContent = age1.text;
+        age1h.className = age1.cls;
+        age4h.textContent = age4.text;
+        age4h.className = age4.cls;
+
+        if (assets.length === 0) {
+            document.getElementById("desktopRows").innerHTML =
+                '<tr><td colspan="10">Waiting for 1H + 4H Trades feeds...</td></tr>';
+
+            document.getElementById("mobileRows").innerHTML =
+                '<div class="asset-card">Waiting for 1H + 4H Trades feeds...</div>';
+
+            return;
+        }
+
+        let desktop = "";
+        let mobile = "";
+
+        assets.forEach((row, index) => {
+            const one = row.one_hour || null;
+            const four = row.four_hour || null;
+            const symbol = String(row.symbol || "--").toUpperCase();
+            const fixedClass = row.is_fixed ? " fixed" : "";
+
+            desktop +=
+                "<tr>"
+                + "<td>" + esc(index + 1) + "</td>"
+                + '<td class="asset' + fixedClass + '">' + esc(symbol) + "</td>"
+                + '<td class="long">' + esc(valueOrNone(one, "long")) + "</td>"
+                + '<td class="short">' + esc(valueOrNone(one, "short")) + "</td>"
+                + '<td class="gap">' + esc(valueOrNone(one, "difference")) + "</td>"
+                + '<td class="' + strongerClass(one) + '">' + esc(strongerText(one)) + "</td>"
+                + '<td class="long sep-left">' + esc(valueOrNone(four, "long")) + "</td>"
+                + '<td class="short">' + esc(valueOrNone(four, "short")) + "</td>"
+                + '<td class="gap">' + esc(valueOrNone(four, "difference")) + "</td>"
+                + '<td class="' + strongerClass(four) + '">' + esc(strongerText(four)) + "</td>"
+                + "</tr>";
+
+            mobile +=
+                '<div class="asset-card">'
+                + '<div class="asset-head">'
+                + '<div class="asset-name' + fixedClass + '">' + esc(symbol) + '</div>'
+                + '<div class="rank-note">#' + esc(index + 1) + '<br>50 GAP</div>'
+                + '</div>'
+                + '<div class="tf-grid">'
+                + '<div class="tf-box">'
+                + '<div class="tf-title one">1H</div>'
+                + metricHtml("LONG", valueOrNone(one, "long"), "long")
+                + metricHtml("SHORT", valueOrNone(one, "short"), "short")
+                + metricHtml("GAP", valueOrNone(one, "difference"), "gap")
+                + '<div class="stronger-line ' + strongerClass(one) + '">'
+                + esc(strongerText(one))
+                + '</div>'
+                + '</div>'
+                + '<div class="tf-box">'
+                + '<div class="tf-title four">4H</div>'
+                + metricHtml("LONG", valueOrNone(four, "long"), "long")
+                + metricHtml("SHORT", valueOrNone(four, "short"), "short")
+                + metricHtml("GAP", valueOrNone(four, "difference"), "gap")
+                + '<div class="stronger-line ' + strongerClass(four) + '">'
+                + esc(strongerText(four))
+                + '</div>'
+                + '</div>'
+                + '</div>'
+                + '</div>';
+        });
+
+        document.getElementById("desktopRows").innerHTML = desktop;
+        document.getElementById("mobileRows").innerHTML = mobile;
+
+    } catch (error) {
+        document.getElementById("desktopRows").innerHTML =
+            '<tr><td colspan="10">Waiting for server...</td></tr>';
+
+        document.getElementById("mobileRows").innerHTML =
+            '<div class="asset-card">Waiting for server...</div>';
+    }
+}
+
+refreshDashboard();
+setInterval(refreshDashboard, 5000);
+</script>
+
+</body>
+</html>
+"""
+
+    return html, 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+    }
+
+
 # ============================================================
 # COINGLASS FEED WATCHDOG — 1H + 4H
 # ============================================================
