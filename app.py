@@ -6647,6 +6647,7 @@ def _coinglass_value_alert_engine_default():
             "version": None,
             "pushover_configured": False,
             "last_alert": None,
+            "last_alert_by_asset": {},
         },
         "4H": {
             "heartbeat_at_utc": None,
@@ -6654,6 +6655,7 @@ def _coinglass_value_alert_engine_default():
             "version": None,
             "pushover_configured": False,
             "last_alert": None,
+            "last_alert_by_asset": {},
         },
     }
 
@@ -6690,6 +6692,31 @@ def _coinglass_value_alert_engine_load():
 
         merged = dict(default[timeframe])
         merged.update(item)
+
+        last_alert_by_asset = merged.get(
+            "last_alert_by_asset"
+        )
+        if not isinstance(last_alert_by_asset, dict):
+            last_alert_by_asset = {}
+
+        # Backward-compatible migration:
+        # preserve the old single last_alert as the first per-asset entry.
+        legacy_last_alert = merged.get("last_alert")
+        if isinstance(legacy_last_alert, dict):
+            legacy_asset = str(
+                legacy_last_alert.get("asset", "")
+            ).strip().upper()
+            if (
+                legacy_asset
+                and legacy_asset not in last_alert_by_asset
+            ):
+                last_alert_by_asset[
+                    legacy_asset
+                ] = legacy_last_alert
+
+        merged[
+            "last_alert_by_asset"
+        ] = last_alert_by_asset
         default[timeframe] = merged
 
     return default
@@ -6812,7 +6839,7 @@ def coinglass_liquidation_value_alert_heartbeat():
             asset
             and signal in {"BUY", "SELL"}
         ):
-            item["last_alert"] = {
+            alert_record = {
                 "asset": asset,
                 "signal": signal,
                 "sent_at_utc": now_utc.isoformat(),
@@ -6820,6 +6847,24 @@ def coinglass_liquidation_value_alert_heartbeat():
                     "%d-%m-%Y %H:%M:%S"
                 ),
             }
+
+            # Keep the existing global latest alert for compatibility.
+            item["last_alert"] = alert_record
+
+            # Also remember the latest successful alert for EACH coin.
+            last_alert_by_asset = item.get(
+                "last_alert_by_asset"
+            )
+            if not isinstance(last_alert_by_asset, dict):
+                last_alert_by_asset = {}
+
+            last_alert_by_asset[
+                asset
+            ] = alert_record
+
+            item[
+                "last_alert_by_asset"
+            ] = last_alert_by_asset
 
     state[timeframe] = item
 
@@ -7270,12 +7315,14 @@ td {
     font-weight: 800;
 }
 
-.last-alert {
-    display: block;
-    margin-top: 4px;
-    color: #c9d1d9;
-    font-size: 12px;
+.coin-last-alert {
+    text-align: center;
+    margin-top: 5px;
+    min-height: 14px;
+    color: #8b949e;
+    font-size: 11px;
     font-weight: 700;
+    line-height: 1.25;
 }
 
 @media (max-width: 780px) {
@@ -7334,7 +7381,6 @@ td {
             <strong>1H ALERT ENGINE</strong><br>
             <span id="alertUpdated1h">--</span><br>
             <span id="alertAge1h">--</span>
-            <span class="last-alert" id="lastAlert1h">LAST ALERT: --</span>
         </div>
 
         <div class="update-box">
@@ -7347,7 +7393,6 @@ td {
             <strong>4H ALERT ENGINE</strong><br>
             <span id="alertUpdated4h">--</span><br>
             <span id="alertAge4h">--</span>
-            <span class="last-alert" id="lastAlert4h">LAST ALERT: --</span>
         </div>
     </div>
 
@@ -7531,33 +7576,45 @@ function alertEngineStatus(engine) {
     };
 }
 
-function lastAlertText(engine) {
-    const item =
-        engine && engine.last_alert
-        ? engine.last_alert
-        : null;
+function coinLastAlertHtml(engine, symbol) {
+    const byAsset =
+        engine
+        && engine.last_alert_by_asset
+        && typeof engine.last_alert_by_asset === "object"
+        ? engine.last_alert_by_asset
+        : {};
+
+    const key = String(symbol || "").toUpperCase();
+    const item = byAsset[key] || null;
 
     if (!item) {
-        return "LAST ALERT: --";
+        return '<div class="coin-last-alert">Last: --</div>';
     }
-
-    const asset =
-        String(item.asset || "--").toUpperCase();
 
     const signal =
         String(item.signal || "--").toUpperCase();
 
     const sent =
-        String(item.sent_at_ist || "--");
+        String(item.sent_at_ist || "");
+
+    const match = sent.match(
+        /(\d{1,2}:\d{2})(?::\d{2})?$/
+    );
+
+    const timeText =
+        match
+        ? match[1]
+        : (sent || "--");
 
     return (
-        "LAST ALERT: "
-        + asset
-        + " "
-        + signal
-        + " • "
-        + sent
-        + " IST"
+        '<div class="coin-last-alert">'
+        + 'Last: <span class="'
+        + signalClass(signal)
+        + '">'
+        + esc(signal)
+        + '</span> • '
+        + esc(timeText)
+        + '</div>'
     );
 }
 
@@ -7600,8 +7657,6 @@ async function refreshDashboard() {
         const alertUpdated4h = document.getElementById("alertUpdated4h");
         const alertAge1h = document.getElementById("alertAge1h");
         const alertAge4h = document.getElementById("alertAge4h");
-        const lastAlert1h = document.getElementById("lastAlert1h");
-        const lastAlert4h = document.getElementById("lastAlert4h");
 
         updated1h.textContent = data.updated_at_1h_ist || "--";
         updated4h.textContent = data.updated_at_4h_ist || "--";
@@ -7629,11 +7684,6 @@ async function refreshDashboard() {
         alertAge4h.textContent = engineStatus4.text;
         alertAge4h.className = engineStatus4.cls;
 
-        lastAlert1h.textContent =
-            lastAlertText(engine1);
-        lastAlert4h.textContent =
-            lastAlertText(engine4);
-
         if (assets.length === 0) {
             document.getElementById("desktopRows").innerHTML =
                 '<tr><td colspan="11">Waiting for 1H + 4H Value feeds...</td></tr>';
@@ -7656,6 +7706,18 @@ async function refreshDashboard() {
             const oneSignal = signalOrNone(one);
             const fourSignal = signalOrNone(four);
 
+            const oneLastAlert =
+                coinLastAlertHtml(
+                    engine1,
+                    symbol
+                );
+
+            const fourLastAlert =
+                coinLastAlertHtml(
+                    engine4,
+                    symbol
+                );
+
             desktop +=
                 "<tr>"
                 + "<td>" + esc(index + 1) + "</td>"
@@ -7665,12 +7727,18 @@ async function refreshDashboard() {
                 + '<td class="long">' + esc(valueOrNone(one, "long")) + "</td>"
                 + '<td class="short">' + esc(valueOrNone(one, "short")) + "</td>"
                 + '<td class="gap">' + esc(valueOrNone(one, "difference")) + "</td>"
-                + '<td class="' + signalClass(oneSignal) + '">' + esc(oneSignal) + "</td>"
+                + '<td class="' + signalClass(oneSignal) + '">'
+                + esc(oneSignal)
+                + oneLastAlert
+                + "</td>"
 
                 + '<td class="long sep-left">' + esc(valueOrNone(four, "long")) + "</td>"
                 + '<td class="short">' + esc(valueOrNone(four, "short")) + "</td>"
                 + '<td class="gap">' + esc(valueOrNone(four, "difference")) + "</td>"
-                + '<td class="' + signalClass(fourSignal) + '">' + esc(fourSignal) + "</td>"
+                + '<td class="' + signalClass(fourSignal) + '">'
+                + esc(fourSignal)
+                + fourLastAlert
+                + "</td>"
                 + "</tr>";
 
             mobile +=
@@ -7696,6 +7764,7 @@ async function refreshDashboard() {
                 + '<div class="signal-line ' + signalClass(oneSignal) + '">'
                 + esc(oneSignal)
                 + "</div>"
+                + oneLastAlert
                 + "</div>"
 
                 + '<div class="tf-box">'
@@ -7706,6 +7775,7 @@ async function refreshDashboard() {
                 + '<div class="signal-line ' + signalClass(fourSignal) + '">'
                 + esc(fourSignal)
                 + "</div>"
+                + fourLastAlert
                 + "</div>"
 
                 + "</div>"
