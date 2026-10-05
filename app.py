@@ -6624,6 +6624,248 @@ def coinglass_feed_diagnostic_data():
 
 
 
+
+# ============================================================
+# COINGLASS LIQUIDATION VALUE ALERT ENGINE HEARTBEAT — 1H + 4H
+# Tracks whether the separate Tampermonkey VALUE ALERT scripts are alive.
+# Also stores LAST ALERT only after the browser script confirms Pushover 2xx.
+# This does NOT create signals and does NOT change thresholds/alternation.
+# ============================================================
+
+COINGLASS_VALUE_ALERT_ENGINE_STATE_FILE = os.path.join(
+    "/var/data",
+    "coinglass_value_alert_engine.json",
+)
+COINGLASS_VALUE_ALERT_ENGINE_LOCK = threading.Lock()
+
+
+def _coinglass_value_alert_engine_default():
+    return {
+        "1H": {
+            "heartbeat_at_utc": None,
+            "heartbeat_at_ist": None,
+            "version": None,
+            "pushover_configured": False,
+            "last_alert": None,
+        },
+        "4H": {
+            "heartbeat_at_utc": None,
+            "heartbeat_at_ist": None,
+            "version": None,
+            "pushover_configured": False,
+            "last_alert": None,
+        },
+    }
+
+
+def _coinglass_value_alert_engine_load():
+    try:
+        with COINGLASS_VALUE_ALERT_ENGINE_LOCK:
+            with open(
+                COINGLASS_VALUE_ALERT_ENGINE_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+
+        if not isinstance(data, dict):
+            data = {}
+
+    except FileNotFoundError:
+        data = {}
+
+    except Exception as exc:
+        print(
+            f"[VALUE ALERT ENGINE READ ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        data = {}
+
+    default = _coinglass_value_alert_engine_default()
+
+    for timeframe in ("1H", "4H"):
+        item = data.get(timeframe)
+        if not isinstance(item, dict):
+            item = {}
+
+        merged = dict(default[timeframe])
+        merged.update(item)
+        default[timeframe] = merged
+
+    return default
+
+
+def _coinglass_value_alert_engine_save(data):
+    os.makedirs(
+        os.path.dirname(
+            COINGLASS_VALUE_ALERT_ENGINE_STATE_FILE
+        ),
+        exist_ok=True,
+    )
+
+    tmp = (
+        COINGLASS_VALUE_ALERT_ENGINE_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with COINGLASS_VALUE_ALERT_ENGINE_LOCK:
+        try:
+            with open(
+                tmp,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    data,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(
+                tmp,
+                COINGLASS_VALUE_ALERT_ENGINE_STATE_FILE,
+            )
+
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+@app.post("/coinglass-liquidation-value-alert-heartbeat")
+def coinglass_liquidation_value_alert_heartbeat():
+    secret = request.args.get("secret", "")
+
+    if (
+        not WEBHOOK_SECRET
+        or secret != WEBHOOK_SECRET
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    timeframe = str(
+        data.get("timeframe", "")
+    ).strip().upper()
+
+    if timeframe not in {"1H", "4H"}:
+        return jsonify({
+            "ok": False,
+            "error": "timeframe_must_be_1H_or_4H",
+        }), 400
+
+    event = str(
+        data.get("event", "heartbeat")
+    ).strip().lower()
+
+    if event not in {"heartbeat", "alert_sent"}:
+        return jsonify({
+            "ok": False,
+            "error": "event_must_be_heartbeat_or_alert_sent",
+        }), 400
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    state = _coinglass_value_alert_engine_load()
+    item = state.get(timeframe)
+
+    if not isinstance(item, dict):
+        item = {}
+
+    item["heartbeat_at_utc"] = now_utc.isoformat()
+    item["heartbeat_at_ist"] = now_ist.strftime(
+        "%d-%m-%Y %H:%M:%S"
+    )
+    item["version"] = str(
+        data.get("version", "")
+    ).strip()[:40]
+    item["pushover_configured"] = bool(
+        data.get("pushover_configured", False)
+    )
+
+    if event == "alert_sent":
+        asset = str(
+            data.get("asset", "")
+        ).strip().upper()[:20]
+
+        signal = str(
+            data.get("signal", "")
+        ).strip().upper()[:10]
+
+        if (
+            asset
+            and signal in {"BUY", "SELL"}
+        ):
+            item["last_alert"] = {
+                "asset": asset,
+                "signal": signal,
+                "sent_at_utc": now_utc.isoformat(),
+                "sent_at_ist": now_ist.strftime(
+                    "%d-%m-%Y %H:%M:%S"
+                ),
+            }
+
+    state[timeframe] = item
+
+    try:
+        _coinglass_value_alert_engine_save(
+            state
+        )
+
+    except Exception as exc:
+        print(
+            f"[VALUE ALERT ENGINE SAVE ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        f"[VALUE ALERT ENGINE] {timeframe} | {event.upper()} | "
+        f"PUSHOVER={'YES' if item['pushover_configured'] else 'NO'}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "timeframe": timeframe,
+        "event": event,
+        "received_at_ist": item[
+            "heartbeat_at_ist"
+        ],
+        "last_alert": item.get(
+            "last_alert"
+        ),
+    }), 200
+
+
+@app.get("/coinglass-liquidation-value-alert-engine-data")
+def coinglass_liquidation_value_alert_engine_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_value_alert_engine_load(),
+    })
+
+
 # ============================================================
 # COINGLASS LIQUIDATION VALUE — COMBINED 1H + 4H DASHBOARD
 # DISPLAY ONLY.
@@ -6651,6 +6893,7 @@ def _coinglass_value_combined_parse_time(value):
 def _coinglass_value_combined_state():
     state_1h = _coinglass_value_1h_dashboard_load()
     state_4h = _coinglass_value_4h_dashboard_load()
+    alert_state = _coinglass_value_alert_engine_load()
 
     assets_1h = state_1h.get("assets", [])
     assets_4h = state_4h.get("assets", [])
@@ -6765,6 +7008,8 @@ def _coinglass_value_combined_state():
         "updated_at_1h_ist": state_1h.get("updated_at_ist"),
         "updated_at_4h_utc": state_4h.get("updated_at_utc"),
         "updated_at_4h_ist": state_4h.get("updated_at_ist"),
+        "alert_engine_1h": alert_state.get("1H", {}),
+        "alert_engine_4h": alert_state.get("4H", {}),
         "assets": rows,
     }
 
@@ -6825,7 +7070,7 @@ h1 {
 
 .update-strip {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(4, 1fr);
     gap: 10px;
     margin-bottom: 14px;
 }
@@ -7020,6 +7265,19 @@ td {
     font-weight: 800;
 }
 
+.status-warn {
+    color: #d29922;
+    font-weight: 800;
+}
+
+.last-alert {
+    display: block;
+    margin-top: 4px;
+    color: #c9d1d9;
+    font-size: 12px;
+    font-weight: 700;
+}
+
 @media (max-width: 780px) {
     body {
         padding: 10px;
@@ -7071,10 +7329,25 @@ td {
             <span id="updated1h">--</span><br>
             <span id="age1h">--</span>
         </div>
+
+        <div class="update-box">
+            <strong>1H ALERT ENGINE</strong><br>
+            <span id="alertUpdated1h">--</span><br>
+            <span id="alertAge1h">--</span>
+            <span class="last-alert" id="lastAlert1h">LAST ALERT: --</span>
+        </div>
+
         <div class="update-box">
             <strong>4H FEED</strong><br>
             <span id="updated4h">--</span><br>
             <span id="age4h">--</span>
+        </div>
+
+        <div class="update-box">
+            <strong>4H ALERT ENGINE</strong><br>
+            <span id="alertUpdated4h">--</span><br>
+            <span id="alertAge4h">--</span>
+            <span class="last-alert" id="lastAlert4h">LAST ALERT: --</span>
         </div>
     </div>
 
@@ -7215,6 +7488,79 @@ function ageText(utcText) {
     };
 }
 
+
+function alertEngineStatus(engine) {
+    if (!engine || !engine.heartbeat_at_utc) {
+        return {
+            text: "NO HEARTBEAT",
+            cls: "status-stale"
+        };
+    }
+
+    const t = Date.parse(engine.heartbeat_at_utc);
+
+    if (!Number.isFinite(t)) {
+        return {
+            text: "UNKNOWN",
+            cls: "status-stale"
+        };
+    }
+
+    const minutes = Math.max(
+        0,
+        (Date.now() - t) / 60000
+    );
+
+    if (minutes >= 5) {
+        return {
+            text: "STALE • " + minutes.toFixed(1) + " min",
+            cls: "status-stale"
+        };
+    }
+
+    if (!engine.pushover_configured) {
+        return {
+            text: "LIVE • PUSHOVER NOT CONFIGURED",
+            cls: "status-warn"
+        };
+    }
+
+    return {
+        text: "LIVE ✅ • " + minutes.toFixed(1) + " min",
+        cls: "status-live"
+    };
+}
+
+function lastAlertText(engine) {
+    const item =
+        engine && engine.last_alert
+        ? engine.last_alert
+        : null;
+
+    if (!item) {
+        return "LAST ALERT: --";
+    }
+
+    const asset =
+        String(item.asset || "--").toUpperCase();
+
+    const signal =
+        String(item.signal || "--").toUpperCase();
+
+    const sent =
+        String(item.sent_at_ist || "--");
+
+    return (
+        "LAST ALERT: "
+        + asset
+        + " "
+        + signal
+        + " • "
+        + sent
+        + " IST"
+    );
+}
+
 function metricHtml(label, value, cls) {
     return (
         '<div class="metric">'
@@ -7250,6 +7596,13 @@ async function refreshDashboard() {
         const age1h = document.getElementById("age1h");
         const age4h = document.getElementById("age4h");
 
+        const alertUpdated1h = document.getElementById("alertUpdated1h");
+        const alertUpdated4h = document.getElementById("alertUpdated4h");
+        const alertAge1h = document.getElementById("alertAge1h");
+        const alertAge4h = document.getElementById("alertAge4h");
+        const lastAlert1h = document.getElementById("lastAlert1h");
+        const lastAlert4h = document.getElementById("lastAlert4h");
+
         updated1h.textContent = data.updated_at_1h_ist || "--";
         updated4h.textContent = data.updated_at_4h_ist || "--";
 
@@ -7260,6 +7613,26 @@ async function refreshDashboard() {
         age1h.className = age1.cls;
         age4h.textContent = age4.text;
         age4h.className = age4.cls;
+
+        const engine1 = data.alert_engine_1h || {};
+        const engine4 = data.alert_engine_4h || {};
+        const engineStatus1 = alertEngineStatus(engine1);
+        const engineStatus4 = alertEngineStatus(engine4);
+
+        alertUpdated1h.textContent =
+            engine1.heartbeat_at_ist || "--";
+        alertUpdated4h.textContent =
+            engine4.heartbeat_at_ist || "--";
+
+        alertAge1h.textContent = engineStatus1.text;
+        alertAge1h.className = engineStatus1.cls;
+        alertAge4h.textContent = engineStatus4.text;
+        alertAge4h.className = engineStatus4.cls;
+
+        lastAlert1h.textContent =
+            lastAlertText(engine1);
+        lastAlert4h.textContent =
+            lastAlertText(engine4);
 
         if (assets.length === 0) {
             document.getElementById("desktopRows").innerHTML =
@@ -7347,6 +7720,11 @@ async function refreshDashboard() {
         document.getElementById("age1h").className = "status-stale";
         document.getElementById("age4h").textContent = "SERVER WAIT";
         document.getElementById("age4h").className = "status-stale";
+
+        document.getElementById("alertAge1h").textContent = "SERVER WAIT";
+        document.getElementById("alertAge1h").className = "status-stale";
+        document.getElementById("alertAge4h").textContent = "SERVER WAIT";
+        document.getElementById("alertAge4h").className = "status-stale";
     }
 }
 
