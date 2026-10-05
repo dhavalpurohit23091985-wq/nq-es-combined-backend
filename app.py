@@ -5921,6 +5921,587 @@ setInterval(
     }
 
 
+
+# ============================================================
+# COINGLASS LIQUIDATION VALUE DASHBOARD — 1H
+# COMPLETELY SEPARATE from existing 4H Liquidation Value and
+# existing Liquidation Trades dashboards.
+# FIXED 8 always included + next 2 CoinGlass-ranked non-fixed assets.
+# DATA ONLY: these routes NEVER send Pushover.
+#
+# Thresholds — SAME AS 4H VALUE:
+#   BTC / ETH / SOL -> $1,000,000 gap
+#   Every other asset -> $500,000 gap
+#
+# Signal convention — SAME AS 4H VALUE:
+#   SHORT liquidation value - LONG liquidation value >= threshold -> BUY
+#   LONG liquidation value - SHORT liquidation value >= threshold -> SELL
+# ============================================================
+
+COINGLASS_VALUE_1H_DASHBOARD_STATE_FILE = os.path.join(
+    "/tmp",
+    "coinglass_liquidation_value_1h.json",
+)
+COINGLASS_VALUE_1H_DASHBOARD_LOCK = threading.Lock()
+
+
+def _coinglass_value_1h_threshold(symbol):
+    symbol = str(symbol or "").strip().upper()
+
+    if symbol in COINGLASS_VALUE_TOP3:
+        return 1_000_000.0
+
+    return 500_000.0
+
+
+def _coinglass_value_1h_dashboard_load():
+    try:
+        with COINGLASS_VALUE_1H_DASHBOARD_LOCK:
+            with open(
+                COINGLASS_VALUE_1H_DASHBOARD_STATE_FILE,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+
+    except FileNotFoundError:
+        pass
+
+    except Exception as exc:
+        print(
+            f"[COINGLASS VALUE 1H DASHBOARD READ ERROR] {exc}",
+            flush=True,
+        )
+
+    return {
+        "updated_at_utc": None,
+        "updated_at_ist": None,
+        "assets": [],
+    }
+
+
+def _coinglass_value_1h_dashboard_save(data):
+    os.makedirs(
+        os.path.dirname(
+            COINGLASS_VALUE_1H_DASHBOARD_STATE_FILE
+        ),
+        exist_ok=True,
+    )
+
+    tmp = (
+        COINGLASS_VALUE_1H_DASHBOARD_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    with COINGLASS_VALUE_1H_DASHBOARD_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    data,
+                    f,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(
+                tmp,
+                COINGLASS_VALUE_1H_DASHBOARD_STATE_FILE,
+            )
+
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+@app.post("/coinglass-liquidation-value-1h-webhook")
+def coinglass_liquidation_value_1h_webhook():
+    secret = request.args.get("secret", "")
+
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+    raw_assets = data.get("assets", [])
+
+    if not isinstance(raw_assets, list):
+        return jsonify({
+            "ok": False,
+            "error": "assets_list_required",
+        }), 400
+
+    assets = []
+    seen = set()
+
+    for item in raw_assets:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = str(
+            item.get("symbol", "")
+        ).strip().upper()
+
+        if not symbol or symbol in seen:
+            continue
+
+        try:
+            rank = int(
+                item.get("rank", 999999)
+            )
+        except (TypeError, ValueError):
+            rank = 999999
+
+        try:
+            long_value = float(item.get("long"))
+            short_value = float(item.get("short"))
+        except (TypeError, ValueError):
+            continue
+
+        if long_value < 0 or short_value < 0:
+            continue
+
+        difference = abs(
+            long_value - short_value
+        )
+
+        if long_value > short_value:
+            stronger = "LONG"
+        elif short_value > long_value:
+            stronger = "SHORT"
+        else:
+            stronger = "EQUAL"
+
+        threshold = _coinglass_value_1h_threshold(
+            symbol
+        )
+
+        if short_value - long_value >= threshold:
+            signal = "BUY"
+        elif long_value - short_value >= threshold:
+            signal = "SELL"
+        else:
+            signal = "NONE"
+
+        assets.append({
+            "rank": rank,
+            "symbol": symbol,
+            "long": long_value,
+            "short": short_value,
+            "difference": difference,
+            "stronger": stronger,
+            "threshold": threshold,
+            "signal": signal,
+        })
+
+        seen.add(symbol)
+
+    selected_assets, selection_error = (
+        _select_coinglass_value_fixed8_plus2(
+            assets
+        )
+    )
+
+    if selection_error:
+        print(
+            "[COINGLASS VALUE 1H DASHBOARD REJECTED] "
+            + json.dumps(
+                selection_error,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            **selection_error,
+            "required_fixed": list(
+                COINGLASS_VALUE_FIXED_ASSETS
+            ),
+        }), 422
+
+    assets = selected_assets
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    state = {
+        "updated_at_utc": now_utc.isoformat(),
+        "updated_at_ist": now_ist.strftime(
+            "%d-%m-%Y %H:%M:%S"
+        ),
+        "assets": assets,
+    }
+
+    try:
+        _coinglass_value_1h_dashboard_save(
+            state
+        )
+
+    except Exception as exc:
+        print(
+            f"[COINGLASS VALUE 1H DASHBOARD SAVE ERROR] {exc}",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        "[COINGLASS VALUE 1H DASHBOARD UPDATE] "
+        + ", ".join(
+            x["symbol"]
+            for x in assets
+        ),
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "mode": "coinglass_1h_liquidation_value_dashboard",
+        "count": len(assets),
+        "updated_at_ist": state[
+            "updated_at_ist"
+        ],
+        "pushover": False,
+    }), 200
+
+
+@app.get("/coinglass-liquidation-value-1h-data")
+def coinglass_liquidation_value_1h_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_value_1h_dashboard_load(),
+    })
+
+
+@app.get("/coinglass-liquidation-value-1h")
+def coinglass_liquidation_value_1h():
+    html = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoinGlass 1H Liquidation Value Dashboard</title>
+
+<style>
+body {
+    margin: 0;
+    padding: 22px;
+    background: #0d1117;
+    color: #f0f6fc;
+    font-family: Arial, Helvetica, sans-serif;
+}
+.container {
+    max-width: 1180px;
+    margin: 0 auto;
+}
+h1 {
+    text-align: center;
+    margin: 0 0 7px;
+}
+.subtitle {
+    text-align: center;
+    color: #8b949e;
+    margin-bottom: 22px;
+    line-height: 1.6;
+}
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    overflow-x: auto;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+th {
+    background: #21262d;
+    padding: 14px 10px;
+    font-size: 13px;
+}
+td {
+    padding: 14px 10px;
+    text-align: center;
+    border-top: 1px solid #30363d;
+    font-size: 15px;
+}
+.asset {
+    font-weight: 800;
+    font-size: 17px;
+}
+.long {
+    color: #3fb950;
+    font-weight: 700;
+}
+.short {
+    color: #f85149;
+    font-weight: 700;
+}
+.equal,
+.none {
+    color: #d29922;
+    font-weight: 700;
+}
+.fixed {
+    color: #58a6ff;
+}
+.buy {
+    color: #3fb950;
+    font-weight: 900;
+}
+.sell {
+    color: #f85149;
+    font-weight: 900;
+}
+.footer {
+    text-align: center;
+    color: #8b949e;
+    margin-top: 18px;
+    line-height: 1.8;
+}
+@media (max-width: 700px) {
+    body { padding: 10px; }
+    h1 { font-size: 20px; }
+    th { font-size: 10px; }
+    td { font-size: 12px; padding: 11px 4px; }
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+    <h1>COINGLASS LIQUIDATION VALUE — 1H</h1>
+
+    <div class="subtitle">
+        DEFAULT LIQUIDATION VALUE MODE • FIXED 8 + NEXT 2 RANKED<br>
+        BTC / ETH / SOL = $1M GAP • ALL OTHERS = $500K GAP
+    </div>
+
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>RANK</th>
+                    <th>ASSET</th>
+                    <th>1H LONG VALUE</th>
+                    <th>1H SHORT VALUE</th>
+                    <th>GAP</th>
+                    <th>THRESHOLD</th>
+                    <th>STRONGER</th>
+                    <th>SIGNAL</th>
+                </tr>
+            </thead>
+
+            <tbody id="rows">
+                <tr>
+                    <td colspan="8">
+                        Waiting for CoinGlass 1H Liquidation Value feed...
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer">
+        FIXED: BTC ETH SOL XRP NEAR DOGE ZEC XAU • NEXT 2 follow CoinGlass ranking<br>
+        SHORT-LONG threshold = BUY • LONG-SHORT threshold = SELL<br>
+        Feed update: <span id="updated">--</span> IST<br>
+        <span id="status">Loading...</span>
+    </div>
+
+</div>
+
+<script>
+function esc(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function money(value) {
+    const n = Number(value);
+
+    if (!Number.isFinite(n)) {
+        return "--";
+    }
+
+    const abs = Math.abs(n);
+
+    if (abs >= 1000000000) {
+        return "$" + (n / 1000000000).toFixed(2) + "B";
+    }
+
+    if (abs >= 1000000) {
+        return "$" + (n / 1000000).toFixed(2) + "M";
+    }
+
+    if (abs >= 1000) {
+        return "$" + (n / 1000).toFixed(1) + "K";
+    }
+
+    return "$" + n.toFixed(2);
+}
+
+async function refreshDashboard() {
+    const status =
+        document.getElementById("status");
+
+    try {
+        const response = await fetch(
+            "/coinglass-liquidation-value-1h-data?ts="
+            + Date.now(),
+            {cache: "no-store"}
+        );
+
+        const data =
+            await response.json();
+
+        const rows =
+            document.getElementById("rows");
+
+        if (
+            !Array.isArray(data.assets)
+            || data.assets.length === 0
+        ) {
+            rows.innerHTML =
+                '<tr><td colspan="8">'
+                + 'Waiting for CoinGlass 1H Liquidation Value feed...'
+                + '</td></tr>';
+
+            status.textContent =
+                "No Liquidation Value feed received yet.";
+
+            return;
+        }
+
+        let html = "";
+
+        data.assets.forEach(
+            (item, index) => {
+
+                const stronger =
+                    String(
+                        item.stronger || "EQUAL"
+                    ).toUpperCase();
+
+                const signal =
+                    String(
+                        item.signal || "NONE"
+                    ).toUpperCase();
+
+                const strongerCls =
+                    stronger === "LONG"
+                    ? "long"
+                    : stronger === "SHORT"
+                    ? "short"
+                    : "equal";
+
+                const signalCls =
+                    signal === "BUY"
+                    ? "buy"
+                    : signal === "SELL"
+                    ? "sell"
+                    : "none";
+
+                const fixed =
+                    [
+                        "BTC", "ETH", "SOL", "XRP", "NEAR",
+                        "DOGE", "ZEC", "XAU"
+                    ].includes(item.symbol)
+                    ? " fixed"
+                    : "";
+
+                html +=
+                    "<tr>"
+                    + "<td>"
+                    + esc(index + 1)
+                    + "</td>"
+                    + '<td class="asset'
+                    + fixed
+                    + '">'
+                    + esc(item.symbol)
+                    + "</td>"
+                    + '<td class="long">'
+                    + esc(money(item.long))
+                    + "</td>"
+                    + '<td class="short">'
+                    + esc(money(item.short))
+                    + "</td>"
+                    + "<td><strong>"
+                    + esc(money(item.difference))
+                    + "</strong></td>"
+                    + "<td>"
+                    + esc(money(item.threshold))
+                    + "</td>"
+                    + '<td class="'
+                    + strongerCls
+                    + '">'
+                    + esc(stronger)
+                    + "</td>"
+                    + '<td class="'
+                    + signalCls
+                    + '">'
+                    + esc(signal)
+                    + "</td>"
+                    + "</tr>";
+            }
+        );
+
+        rows.innerHTML = html;
+
+        document.getElementById(
+            "updated"
+        ).textContent =
+            data.updated_at_ist || "--";
+
+        status.textContent =
+            "LIVE • Browser refresh every 5 seconds";
+
+    } catch (error) {
+        status.textContent =
+            "Waiting for server...";
+    }
+}
+
+refreshDashboard();
+
+setInterval(
+    refreshDashboard,
+    5000
+);
+</script>
+
+</body>
+</html>
+"""
+
+    return html, 200, {
+        "Content-Type":
+            "text/html; charset=utf-8",
+        "Cache-Control":
+            "no-store, no-cache, must-revalidate",
+    }
+
 # ============================================================
 # COINGLASS FEED DIAGNOSTICS — 1H + 4H
 # ============================================================
