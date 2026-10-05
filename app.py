@@ -6912,149 +6912,89 @@ def coinglass_liquidation_value_alert_engine_data():
 
 
 # ============================================================
-# COINGLASS LIQUIDATION VALUE — COMBINED 1H + 4H DASHBOARD
+# COINGLASS LIQUIDATION VALUE — 1H DOMINANCE DASHBOARD
 # DISPLAY ONLY.
-# Reads the EXISTING 1H and 4H Liquidation Value dashboard state.
-# Does NOT change webhook logic, thresholds, alerts, Pushover,
-# Tampermonkey feeds, or auto-recovery.
+# Reads the EXISTING 1H Liquidation Value feed and 1H alert-engine heartbeat.
+# Dashboard signal is DOMINANCE ONLY:
+# SHORT > LONG = BUY | LONG > SHORT = SELL | EQUAL = NONE.
+# No $1M / $500K threshold is used here.
+# 4H backend/feed routes are left untouched; they are simply not shown here.
 # ============================================================
-
-
-def _coinglass_value_combined_parse_time(value):
-    try:
-        text = str(value or "").strip()
-        if not text:
-            raise ValueError("empty")
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-    except Exception:
-        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _coinglass_value_combined_state():
     state_1h = _coinglass_value_1h_dashboard_load()
-    state_4h = _coinglass_value_4h_dashboard_load()
     alert_state = _coinglass_value_alert_engine_load()
 
     assets_1h = state_1h.get("assets", [])
-    assets_4h = state_4h.get("assets", [])
-
     if not isinstance(assets_1h, list):
         assets_1h = []
-    if not isinstance(assets_4h, list):
-        assets_4h = []
-
-    map_1h = {
-        str(item.get("symbol", "")).strip().upper(): item
-        for item in assets_1h
-        if isinstance(item, dict)
-        and str(item.get("symbol", "")).strip()
-    }
-
-    map_4h = {
-        str(item.get("symbol", "")).strip().upper(): item
-        for item in assets_4h
-        if isinstance(item, dict)
-        and str(item.get("symbol", "")).strip()
-    }
-
-    time_1h = _coinglass_value_combined_parse_time(
-        state_1h.get("updated_at_utc")
-    )
-    time_4h = _coinglass_value_combined_parse_time(
-        state_4h.get("updated_at_utc")
-    )
-
-    # Use the freshest feed's current FIXED8+2 ranking as the display order.
-    # If one feed is temporarily empty, use the other one.
-    if assets_1h and (
-        not assets_4h
-        or time_1h >= time_4h
-    ):
-        primary_assets = assets_1h
-        secondary_assets = assets_4h
-    else:
-        primary_assets = assets_4h
-        secondary_assets = assets_1h
-
-    symbols = []
-    seen = set()
-
-    for source in (primary_assets, secondary_assets):
-        for item in source:
-            if not isinstance(item, dict):
-                continue
-
-            symbol = str(
-                item.get("symbol", "")
-            ).strip().upper()
-
-            if not symbol or symbol in seen:
-                continue
-
-            symbols.append(symbol)
-            seen.add(symbol)
-
-            # Each original dashboard is FIXED8 + NEXT2 = 10 assets.
-            # Keep the combined dashboard at the same 10-row size.
-            if len(symbols) >= 10:
-                break
-
-        if len(symbols) >= 10:
-            break
 
     rows = []
 
-    for symbol in symbols:
-        item_1h = map_1h.get(symbol)
-        item_4h = map_4h.get(symbol)
+    for index, item in enumerate(assets_1h[:10], start=1):
+        if not isinstance(item, dict):
+            continue
 
-        rank_values = []
-        for item in (item_1h, item_4h):
-            if not isinstance(item, dict):
-                continue
-            try:
-                rank_values.append(
-                    int(item.get("rank", 999999))
-                )
-            except (TypeError, ValueError):
-                pass
+        symbol = str(
+            item.get("symbol", "")
+        ).strip().upper()
 
-        rank = min(rank_values) if rank_values else 999999
+        if not symbol:
+            continue
 
-        threshold = None
-        for item in (item_1h, item_4h):
-            if not isinstance(item, dict):
-                continue
-            try:
-                threshold = float(item.get("threshold"))
-                break
-            except (TypeError, ValueError):
-                pass
+        try:
+            long_value = float(item.get("long"))
+            short_value = float(item.get("short"))
+        except (TypeError, ValueError):
+            long_value = None
+            short_value = None
 
-        if threshold is None:
-            threshold = _coinglass_value_1h_threshold(symbol)
+        if (
+            long_value is not None
+            and short_value is not None
+        ):
+            difference = abs(
+                long_value - short_value
+            )
+
+            if short_value > long_value:
+                stronger = "SHORT"
+                signal = "BUY"
+            elif long_value > short_value:
+                stronger = "LONG"
+                signal = "SELL"
+            else:
+                stronger = "EQUAL"
+                signal = "NONE"
+        else:
+            difference = None
+            stronger = "EQUAL"
+            signal = "NONE"
+
+        try:
+            rank = int(item.get("rank", index))
+        except (TypeError, ValueError):
+            rank = index
 
         rows.append({
             "rank": rank,
             "symbol": symbol,
-            "threshold": threshold,
             "is_fixed": symbol in COINGLASS_VALUE_FIXED_ASSET_SET,
-            "one_hour": item_1h,
-            "four_hour": item_4h,
+            "one_hour": {
+                **item,
+                "long": long_value,
+                "short": short_value,
+                "difference": difference,
+                "stronger": stronger,
+                "signal": signal,
+            },
         })
 
     return {
         "updated_at_1h_utc": state_1h.get("updated_at_utc"),
         "updated_at_1h_ist": state_1h.get("updated_at_ist"),
-        "updated_at_4h_utc": state_4h.get("updated_at_utc"),
-        "updated_at_4h_ist": state_4h.get("updated_at_ist"),
         "alert_engine_1h": alert_state.get("1H", {}),
-        "alert_engine_4h": alert_state.get("4H", {}),
         "assets": rows,
     }
 
@@ -7076,7 +7016,7 @@ def coinglass_liquidation_value_combined():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CoinGlass 1H + 4H Liquidation Value Dashboard</title>
+<title>CoinGlass 1H Liquidation Dominance Dashboard</title>
 
 <style>
 :root {
@@ -7096,7 +7036,7 @@ body {
 }
 
 .container {
-    max-width: 1450px;
+    max-width: 1050px;
     margin: 0 auto;
 }
 
@@ -7115,7 +7055,7 @@ h1 {
 
 .update-strip {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: 1fr 1fr;
     gap: 10px;
     margin-bottom: 14px;
 }
@@ -7144,7 +7084,7 @@ h1 {
 
 table {
     width: 100%;
-    min-width: 1120px;
+    min-width: 760px;
     border-collapse: collapse;
 }
 
@@ -7157,10 +7097,6 @@ th {
 
 th.group-1h {
     box-shadow: inset 0 -3px 0 #58a6ff;
-}
-
-th.group-4h {
-    box-shadow: inset 0 -3px 0 #a371f7;
 }
 
 td {
@@ -7200,17 +7136,14 @@ td {
     font-weight: 800;
 }
 
-.none {
+.none,
+.equal {
     color: #8b949e;
     font-weight: 700;
 }
 
 .gap {
     font-weight: 800;
-}
-
-.sep-left {
-    border-left: 2px solid #30363d;
 }
 
 .mobile-list {
@@ -7238,46 +7171,34 @@ td {
     font-weight: 900;
 }
 
-.threshold {
+.mode-label {
     color: #8b949e;
     font-size: 12px;
     text-align: right;
-}
-
-.tf-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 9px;
+    font-weight: 700;
 }
 
 .tf-box {
     border: 1px solid #30363d;
     border-radius: 10px;
-    padding: 10px;
+    padding: 12px;
     background: #0d1117;
 }
 
 .tf-title {
+    color: #58a6ff;
     font-weight: 900;
     text-align: center;
     margin-bottom: 9px;
-    font-size: 16px;
-}
-
-.tf-title.one {
-    color: #58a6ff;
-}
-
-.tf-title.four {
-    color: #a371f7;
+    font-size: 17px;
 }
 
 .metric {
     display: flex;
     justify-content: space-between;
     gap: 8px;
-    padding: 3px 0;
-    font-size: 13px;
+    padding: 4px 0;
+    font-size: 14px;
 }
 
 .metric-label {
@@ -7286,10 +7207,10 @@ td {
 
 .signal-line {
     text-align: center;
-    margin-top: 7px;
-    padding-top: 7px;
+    margin-top: 8px;
+    padding-top: 8px;
     border-top: 1px solid #30363d;
-    font-size: 15px;
+    font-size: 17px;
 }
 
 .footer {
@@ -7362,12 +7283,12 @@ td {
 <body>
 <div class="container">
 
-    <h1>COINGLASS LIQUIDATION VALUE — 1H + 4H</h1>
+    <h1>COINGLASS LIQUIDATION VALUE — 1H</h1>
 
     <div class="subtitle">
         FIXED 8 + NEXT 2 COINGLASS RANKED<br>
-        BTC / ETH / SOL = $1M GAP • ALL OTHERS = $500K GAP<br>
-        SHORT−LONG THRESHOLD = BUY • LONG−SHORT THRESHOLD = SELL
+        DOMINANCE ONLY • NO $ GAP THRESHOLD<br>
+        SHORT &gt; LONG = BUY • LONG &gt; SHORT = SELL
     </div>
 
     <div class="update-strip">
@@ -7382,18 +7303,6 @@ td {
             <span id="alertUpdated1h">--</span><br>
             <span id="alertAge1h">--</span>
         </div>
-
-        <div class="update-box">
-            <strong>4H FEED</strong><br>
-            <span id="updated4h">--</span><br>
-            <span id="age4h">--</span>
-        </div>
-
-        <div class="update-box">
-            <strong>4H ALERT ENGINE</strong><br>
-            <span id="alertUpdated4h">--</span><br>
-            <span id="alertAge4h">--</span>
-        </div>
     </div>
 
     <div class="card desktop-card">
@@ -7402,24 +7311,19 @@ td {
                 <tr>
                     <th rowspan="2">#</th>
                     <th rowspan="2">ASSET</th>
-                    <th rowspan="2">THRESHOLD</th>
-                    <th colspan="4" class="group-1h">1 HOUR</th>
-                    <th colspan="4" class="group-4h sep-left">4 HOUR</th>
+                    <th colspan="5" class="group-1h">1 HOUR</th>
                 </tr>
                 <tr>
                     <th>LONG</th>
                     <th>SHORT</th>
                     <th>GAP</th>
-                    <th>SIGNAL</th>
-                    <th class="sep-left">LONG</th>
-                    <th>SHORT</th>
-                    <th>GAP</th>
+                    <th>DOMINANT</th>
                     <th>SIGNAL</th>
                 </tr>
             </thead>
             <tbody id="desktopRows">
                 <tr>
-                    <td colspan="11">Waiting for 1H + 4H Value feeds...</td>
+                    <td colspan="7">Waiting for 1H Value feed...</td>
                 </tr>
             </tbody>
         </table>
@@ -7427,12 +7331,12 @@ td {
 
     <div class="mobile-list" id="mobileRows">
         <div class="asset-card">
-            Waiting for 1H + 4H Value feeds...
+            Waiting for 1H Value feed...
         </div>
     </div>
 
     <div class="footer">
-        Existing 1H / 4H alerts and auto-recovery remain unchanged.<br>
+        Existing 1H feed + 1H alert-engine protection remain unchanged.<br>
         LIVE • Browser refresh every 5 seconds
     </div>
 
@@ -7482,6 +7386,20 @@ function signalClass(signal) {
     return "none";
 }
 
+function dominantClass(side) {
+    const s = String(side || "EQUAL").toUpperCase();
+
+    if (s === "LONG") {
+        return "long";
+    }
+
+    if (s === "SHORT") {
+        return "short";
+    }
+
+    return "equal";
+}
+
 function valueOrNone(item, key) {
     if (!item || item[key] === null || item[key] === undefined) {
         return "--";
@@ -7496,6 +7414,14 @@ function signalOrNone(item) {
     }
 
     return String(item.signal || "NONE").toUpperCase();
+}
+
+function dominantOrEqual(item) {
+    if (!item) {
+        return "EQUAL";
+    }
+
+    return String(item.stronger || "EQUAL").toUpperCase();
 }
 
 function ageText(utcText) {
@@ -7532,7 +7458,6 @@ function ageText(utcText) {
         cls: "status-live"
     };
 }
-
 
 function alertEngineStatus(engine) {
     if (!engine || !engine.heartbeat_at_utc) {
@@ -7649,47 +7574,31 @@ async function refreshDashboard() {
             : [];
 
         const updated1h = document.getElementById("updated1h");
-        const updated4h = document.getElementById("updated4h");
         const age1h = document.getElementById("age1h");
-        const age4h = document.getElementById("age4h");
-
         const alertUpdated1h = document.getElementById("alertUpdated1h");
-        const alertUpdated4h = document.getElementById("alertUpdated4h");
         const alertAge1h = document.getElementById("alertAge1h");
-        const alertAge4h = document.getElementById("alertAge4h");
 
         updated1h.textContent = data.updated_at_1h_ist || "--";
-        updated4h.textContent = data.updated_at_4h_ist || "--";
 
         const age1 = ageText(data.updated_at_1h_utc);
-        const age4 = ageText(data.updated_at_4h_utc);
-
         age1h.textContent = age1.text;
         age1h.className = age1.cls;
-        age4h.textContent = age4.text;
-        age4h.className = age4.cls;
 
         const engine1 = data.alert_engine_1h || {};
-        const engine4 = data.alert_engine_4h || {};
         const engineStatus1 = alertEngineStatus(engine1);
-        const engineStatus4 = alertEngineStatus(engine4);
 
         alertUpdated1h.textContent =
             engine1.heartbeat_at_ist || "--";
-        alertUpdated4h.textContent =
-            engine4.heartbeat_at_ist || "--";
 
         alertAge1h.textContent = engineStatus1.text;
         alertAge1h.className = engineStatus1.cls;
-        alertAge4h.textContent = engineStatus4.text;
-        alertAge4h.className = engineStatus4.cls;
 
         if (assets.length === 0) {
             document.getElementById("desktopRows").innerHTML =
-                '<tr><td colspan="11">Waiting for 1H + 4H Value feeds...</td></tr>';
+                '<tr><td colspan="7">Waiting for 1H Value feed...</td></tr>';
 
             document.getElementById("mobileRows").innerHTML =
-                '<div class="asset-card">Waiting for 1H + 4H Value feeds...</div>';
+                '<div class="asset-card">Waiting for 1H Value feed...</div>';
 
             return;
         }
@@ -7699,12 +7608,11 @@ async function refreshDashboard() {
 
         assets.forEach((row, index) => {
             const one = row.one_hour || null;
-            const four = row.four_hour || null;
             const symbol = String(row.symbol || "--").toUpperCase();
             const fixedClass = row.is_fixed ? " fixed" : "";
 
             const oneSignal = signalOrNone(one);
-            const fourSignal = signalOrNone(four);
+            const dominant = dominantOrEqual(one);
 
             const oneLastAlert =
                 coinLastAlertHtml(
@@ -7712,32 +7620,17 @@ async function refreshDashboard() {
                     symbol
                 );
 
-            const fourLastAlert =
-                coinLastAlertHtml(
-                    engine4,
-                    symbol
-                );
-
             desktop +=
                 "<tr>"
                 + "<td>" + esc(index + 1) + "</td>"
                 + '<td class="asset' + fixedClass + '">' + esc(symbol) + "</td>"
-                + "<td>" + esc(money(row.threshold)) + "</td>"
-
                 + '<td class="long">' + esc(valueOrNone(one, "long")) + "</td>"
                 + '<td class="short">' + esc(valueOrNone(one, "short")) + "</td>"
                 + '<td class="gap">' + esc(valueOrNone(one, "difference")) + "</td>"
+                + '<td class="' + dominantClass(dominant) + '">' + esc(dominant) + "</td>"
                 + '<td class="' + signalClass(oneSignal) + '">'
                 + esc(oneSignal)
                 + oneLastAlert
-                + "</td>"
-
-                + '<td class="long sep-left">' + esc(valueOrNone(four, "long")) + "</td>"
-                + '<td class="short">' + esc(valueOrNone(four, "short")) + "</td>"
-                + '<td class="gap">' + esc(valueOrNone(four, "difference")) + "</td>"
-                + '<td class="' + signalClass(fourSignal) + '">'
-                + esc(fourSignal)
-                + fourLastAlert
                 + "</td>"
                 + "</tr>";
 
@@ -7749,36 +7642,21 @@ async function refreshDashboard() {
                 + " "
                 + esc(symbol)
                 + "</div>"
-                + '<div class="threshold">THRESHOLD<br><strong>'
-                + esc(money(row.threshold))
-                + "</strong></div>"
+                + '<div class="mode-label">1H DOMINANCE</div>'
                 + "</div>"
 
-                + '<div class="tf-grid">'
-
                 + '<div class="tf-box">'
-                + '<div class="tf-title one">1 HOUR</div>'
+                + '<div class="tf-title">1 HOUR</div>'
                 + metricHtml("LONG", valueOrNone(one, "long"), "long")
                 + metricHtml("SHORT", valueOrNone(one, "short"), "short")
                 + metricHtml("GAP", valueOrNone(one, "difference"), "gap")
+                + metricHtml("DOMINANT", dominant, dominantClass(dominant))
                 + '<div class="signal-line ' + signalClass(oneSignal) + '">'
                 + esc(oneSignal)
-                + "</div>"
                 + oneLastAlert
                 + "</div>"
-
-                + '<div class="tf-box">'
-                + '<div class="tf-title four">4 HOUR</div>'
-                + metricHtml("LONG", valueOrNone(four, "long"), "long")
-                + metricHtml("SHORT", valueOrNone(four, "short"), "short")
-                + metricHtml("GAP", valueOrNone(four, "difference"), "gap")
-                + '<div class="signal-line ' + signalClass(fourSignal) + '">'
-                + esc(fourSignal)
-                + "</div>"
-                + fourLastAlert
                 + "</div>"
 
-                + "</div>"
                 + "</div>";
         });
 
@@ -7788,18 +7666,17 @@ async function refreshDashboard() {
     } catch (error) {
         document.getElementById("age1h").textContent = "SERVER WAIT";
         document.getElementById("age1h").className = "status-stale";
-        document.getElementById("age4h").textContent = "SERVER WAIT";
-        document.getElementById("age4h").className = "status-stale";
-
         document.getElementById("alertAge1h").textContent = "SERVER WAIT";
         document.getElementById("alertAge1h").className = "status-stale";
-        document.getElementById("alertAge4h").textContent = "SERVER WAIT";
-        document.getElementById("alertAge4h").className = "status-stale";
     }
 }
 
 refreshDashboard();
-setInterval(refreshDashboard, 5000);
+
+setInterval(
+    refreshDashboard,
+    5000
+);
 </script>
 
 </body>
@@ -7807,10 +7684,11 @@ setInterval(refreshDashboard, 5000);
 """
 
     return html, 200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Content-Type":
+            "text/html; charset=utf-8",
+        "Cache-Control":
+            "no-store, no-cache, must-revalidate",
     }
-
 
 
 # ============================================================
