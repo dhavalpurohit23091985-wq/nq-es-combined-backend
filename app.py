@@ -6978,7 +6978,7 @@ def coinglass_liquidation_value_alert_engine_data():
 # ============================================================
 
 COINGLASS_VALUE_COMBINED_ALERT_STATE_FILE = os.path.join(
-    "/var/data",
+    "/tmp",
     "coinglass_value_combined_2of3_alert.json",
 )
 COINGLASS_VALUE_COMBINED_ALERT_LOCK = threading.Lock()
