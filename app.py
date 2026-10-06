@@ -5324,14 +5324,13 @@ setInterval(
 
 
 # ============================================================
-# COINGLASS LIQUIDATION VALUE DASHBOARD — 4H
-# COMPLETELY SEPARATE from existing Liquidation Trades dashboards.
-# FIXED 8 always included + next 2 CoinGlass-ranked non-fixed assets.
+# COINGLASS LIQUIDATION VALUE DASHBOARD — FINAL 4H
+# FINAL 7 ONLY: BTC, ETH, SOL, XRP, NEAR, XAU, DOGE.
 # DATA ONLY: these routes NEVER send Pushover.
 #
 # Thresholds:
-#   BTC / ETH / SOL -> $1,000,000 gap
-#   Every other asset -> $500,000 gap
+#   BTC / ETH / SOL -> $100,000 gap
+#   XRP / NEAR / XAU / DOGE -> $10,000 gap
 #
 # Signal convention:
 #   SHORT liquidation value - LONG liquidation value >= threshold -> BUY
@@ -5369,9 +5368,15 @@ def _coinglass_value_4h_threshold(symbol):
     symbol = str(symbol or "").strip().upper()
 
     if symbol in COINGLASS_VALUE_TOP3:
-        return 1_000_000.0
+        return 100_000.0
 
-    return 500_000.0
+    if symbol in {"XRP", "NEAR", "XAU", "DOGE"}:
+        return 10_000.0
+
+    # Final 4H feed should contain only the seven configured assets.
+    # Keep unknown assets non-triggering by assigning an effectively
+    # unreachable threshold instead of accidentally using a low default.
+    return float("inf")
 
 
 def _select_coinglass_value_fixed8_plus2(parsed_assets):
