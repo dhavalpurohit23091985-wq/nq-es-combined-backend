@@ -5727,6 +5727,10 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
 .buy { color: #3fb950; font-weight: 900; }
 .sell { color: #f85149; font-weight: 900; }
 .none, .equal { color: #d29922; font-weight: 900; }
+/* GAP COLOR ONLY: SHORT dominance = red, LONG dominance = green */
+.gap-short { color: #f85149; font-weight: 900; }
+.gap-long { color: #3fb950; font-weight: 900; }
+.gap-equal { color: #d29922; font-weight: 900; }
 .live { color: #3fb950; font-weight: 900; }
 .stale { color: #f85149; font-weight: 900; }
 .footer { text-align: center; color: #8b949e; font-size: 12px; line-height: 1.6; margin-top: 14px; }
@@ -5822,6 +5826,10 @@ function signalClass(s) {
     s = String(s || "NONE").toUpperCase();
     return s === "BUY" ? "buy" : s === "SELL" ? "sell" : "none";
 }
+function gapClass(dom) {
+    dom = String(dom || "EQUAL").toUpperCase();
+    return dom === "SHORT" ? "gap-short" : dom === "LONG" ? "gap-long" : "gap-equal";
+}
 function ageInfo(iso) {
     if (!iso) return {text:"NO DATA", cls:"stale"};
     const t = new Date(iso).getTime();
@@ -5868,7 +5876,7 @@ async function refresh() {
                 + '<td class="asset">' + esc(x.symbol) + '</td>'
                 + '<td class="long">' + esc(money(x.long)) + '</td>'
                 + '<td class="short">' + esc(money(x.short)) + '</td>'
-                + '<td><strong>' + esc(money(x.difference)) + '</strong></td>'
+                + '<td class="' + gapClass(dom) + '"><strong>' + esc(money(x.difference)) + '</strong></td>'
                 + '<td>' + esc(money(x.threshold)) + '</td>'
                 + '<td class="' + (dom === 'SHORT' ? 'buy' : dom === 'LONG' ? 'sell' : 'equal') + '">' + esc(dom) + '</td>'
                 + '<td class="' + signalClass(sig) + '">' + esc(sig) + '</td>'
@@ -5880,7 +5888,7 @@ async function refresh() {
                 + '<div class="metrics">'
                 + '<div class="metric"><span>LONG</span><strong>' + esc(money(x.long)) + '</strong></div>'
                 + '<div class="metric"><span>SHORT</span><strong>' + esc(money(x.short)) + '</strong></div>'
-                + '<div class="metric"><span>GAP</span><strong>' + esc(money(x.difference)) + '</strong></div>'
+                + '<div class="metric"><span>GAP</span><strong class="' + gapClass(dom) + '">' + esc(money(x.difference)) + '</strong></div>'
                 + '<div class="metric"><span>MIN GAP</span><strong>' + esc(money(x.threshold)) + '</strong></div>'
                 + '<div class="metric"><span>DOM</span><strong>' + esc(dom) + '</strong></div>'
                 + '<div class="metric"><span>LAST</span><strong>' + lastAlert(engine, String(x.symbol || '').toUpperCase()) + '</strong></div>'
