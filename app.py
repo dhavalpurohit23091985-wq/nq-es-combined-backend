@@ -7066,7 +7066,10 @@ def _coinglass_value_combined_alert_save_unlocked(data):
             pass
 
 
-@app.post("/coinglass-liquidation-value-combined-alert-heartbeat")
+@app.route(
+    "/coinglass-liquidation-value-combined-alert-heartbeat",
+    methods=["GET", "POST"],
+)
 def coinglass_liquidation_value_combined_alert_heartbeat():
     secret = request.args.get("secret", "")
 
@@ -7079,12 +7082,25 @@ def coinglass_liquidation_value_combined_alert_heartbeat():
             "error": "unauthorized",
         }), 401
 
-    data = (
-        request.get_json(
-            silent=True
+    # GET is supported for the Tampermonkey combined heartbeat because
+    # the same browser already reaches the Render 1H data endpoint by GET.
+    # POST remains supported for backward compatibility.
+    if request.method == "GET":
+        data = {
+            "event": request.args.get("event", "heartbeat"),
+            "version": request.args.get("version", ""),
+            "signal": request.args.get("signal", ""),
+            "pushover_configured": str(
+                request.args.get("pushover_configured", "")
+            ).strip().lower() in {"1", "true", "yes", "on"},
+        }
+    else:
+        data = (
+            request.get_json(
+                silent=True
+            )
+            or {}
         )
-        or {}
-    )
 
     event = str(
         data.get("event", "heartbeat")
