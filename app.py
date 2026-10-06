@@ -1711,6 +1711,64 @@ h1 {
     margin-bottom: 25px;
 }
 
+.combined-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 13px;
+    padding: 15px;
+    margin-bottom: 14px;
+    text-align: center;
+}
+
+.combined-title {
+    color: #58a6ff;
+    font-size: 18px;
+    font-weight: 900;
+    margin-bottom: 4px;
+}
+
+.combined-rule {
+    color: #8b949e;
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 12px;
+}
+
+.combined-coins {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.combined-coin {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 9px;
+    padding: 9px 6px;
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.combined-main {
+    border-top: 1px solid #30363d;
+    padding-top: 11px;
+}
+
+.combined-signal {
+    font-size: 24px;
+    font-weight: 900;
+}
+
+.combined-counts,
+.combined-last,
+.combined-engine {
+    margin-top: 5px;
+    color: #8b949e;
+    font-size: 12px;
+    font-weight: 700;
+}
+
 .card {
     background: #161b22;
     border: 1px solid #30363d;
@@ -6911,6 +6969,215 @@ def coinglass_liquidation_value_alert_engine_data():
     })
 
 
+
+# ============================================================
+# COINGLASS BTC + ETH + SOL 2-OF-3 COMBINED ALERT STATE
+# Separate from the existing individual 1H alert-engine heartbeat.
+# The browser script posts a heartbeat every 30 seconds and posts
+# alert_sent ONLY after Pushover confirms HTTP 2xx.
+# ============================================================
+
+COINGLASS_VALUE_COMBINED_ALERT_STATE_FILE = os.path.join(
+    "/var/data",
+    "coinglass_value_combined_2of3_alert.json",
+)
+COINGLASS_VALUE_COMBINED_ALERT_LOCK = threading.Lock()
+
+
+def _coinglass_value_combined_alert_default():
+    return {
+        "heartbeat_at_utc": None,
+        "heartbeat_at_ist": None,
+        "version": None,
+        "pushover_configured": False,
+        "last_alert": None,
+    }
+
+
+def _coinglass_value_combined_alert_load_unlocked():
+    try:
+        with open(
+            COINGLASS_VALUE_COMBINED_ALERT_STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            state = _coinglass_value_combined_alert_default()
+            state.update(data)
+            return state
+
+    except FileNotFoundError:
+        pass
+
+    except Exception as exc:
+        print(
+            f"[VALUE 2OF3 ALERT READ ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    return _coinglass_value_combined_alert_default()
+
+
+def _coinglass_value_combined_alert_load():
+    with COINGLASS_VALUE_COMBINED_ALERT_LOCK:
+        return _coinglass_value_combined_alert_load_unlocked()
+
+
+def _coinglass_value_combined_alert_save_unlocked(data):
+    os.makedirs(
+        os.path.dirname(
+            COINGLASS_VALUE_COMBINED_ALERT_STATE_FILE
+        ),
+        exist_ok=True,
+    )
+
+    tmp = (
+        COINGLASS_VALUE_COMBINED_ALERT_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    try:
+        with open(
+            tmp,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                data,
+                f,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(
+            tmp,
+            COINGLASS_VALUE_COMBINED_ALERT_STATE_FILE,
+        )
+
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+@app.post("/coinglass-liquidation-value-combined-alert-heartbeat")
+def coinglass_liquidation_value_combined_alert_heartbeat():
+    secret = request.args.get("secret", "")
+
+    if (
+        not WEBHOOK_SECRET
+        or secret != WEBHOOK_SECRET
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    event = str(
+        data.get("event", "heartbeat")
+    ).strip().lower()
+
+    if event not in {"heartbeat", "alert_sent"}:
+        return jsonify({
+            "ok": False,
+            "error": "event_must_be_heartbeat_or_alert_sent",
+        }), 400
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    try:
+        # Atomic read -> update -> save so a heartbeat can never erase
+        # a newly saved Last Combined alert.
+        with COINGLASS_VALUE_COMBINED_ALERT_LOCK:
+            state = _coinglass_value_combined_alert_load_unlocked()
+
+            state["heartbeat_at_utc"] = now_utc.isoformat()
+            state["heartbeat_at_ist"] = now_ist.strftime(
+                "%d-%m-%Y %H:%M:%S"
+            )
+            state["version"] = str(
+                data.get("version", "")
+            ).strip()[:40]
+            state["pushover_configured"] = bool(
+                data.get("pushover_configured", False)
+            )
+
+            if event == "alert_sent":
+                signal = str(
+                    data.get("signal", "")
+                ).strip().upper()[:10]
+
+                if signal not in {"BUY", "SELL"}:
+                    return jsonify({
+                        "ok": False,
+                        "error": "signal_must_be_BUY_or_SELL",
+                    }), 400
+
+                state["last_alert"] = {
+                    "signal": signal,
+                    "sent_at_utc": now_utc.isoformat(),
+                    "sent_at_ist": now_ist.strftime(
+                        "%d-%m-%Y %H:%M:%S"
+                    ),
+                }
+
+            _coinglass_value_combined_alert_save_unlocked(
+                state
+            )
+
+    except Exception as exc:
+        print(
+            f"[VALUE 2OF3 ALERT SAVE ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        f"[VALUE 2OF3 ALERT ENGINE] {event.upper()} | "
+        f"PUSHOVER={'YES' if state['pushover_configured'] else 'NO'}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "event": event,
+        "received_at_ist": state[
+            "heartbeat_at_ist"
+        ],
+        "last_alert": state.get(
+            "last_alert"
+        ),
+    }), 200
+
+
+@app.get("/coinglass-liquidation-value-combined-alert-data")
+def coinglass_liquidation_value_combined_alert_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_value_combined_alert_load(),
+    })
+
+
 # ============================================================
 # COINGLASS LIQUIDATION VALUE — 1H DOMINANCE DASHBOARD
 # DISPLAY ONLY.
@@ -6928,6 +7195,9 @@ COINGLASS_VALUE_DOMINANCE_MIN_GAP = 100_000.0
 def _coinglass_value_combined_state():
     state_1h = _coinglass_value_1h_dashboard_load()
     alert_state = _coinglass_value_alert_engine_load()
+    combined_alert_state = (
+        _coinglass_value_combined_alert_load()
+    )
 
     assets_1h = state_1h.get("assets", [])
     if not isinstance(assets_1h, list):
@@ -7001,10 +7271,64 @@ def _coinglass_value_combined_state():
             },
         })
 
+    target_symbols = ("BTC", "ETH", "SOL")
+    target_rows = {
+        str(row.get("symbol", "")).upper(): row
+        for row in rows
+        if isinstance(row, dict)
+    }
+
+    combined_components = []
+    buy_count = 0
+    sell_count = 0
+
+    for symbol in target_symbols:
+        row = target_rows.get(symbol, {})
+        one_hour = (
+            row.get("one_hour", {})
+            if isinstance(row, dict)
+            else {}
+        )
+        if not isinstance(one_hour, dict):
+            one_hour = {}
+
+        component_signal = str(
+            one_hour.get("signal", "NONE")
+        ).strip().upper()
+
+        if component_signal == "BUY":
+            buy_count += 1
+        elif component_signal == "SELL":
+            sell_count += 1
+        else:
+            component_signal = "NONE"
+
+        combined_components.append({
+            "symbol": symbol,
+            "signal": component_signal,
+            "long": one_hour.get("long"),
+            "short": one_hour.get("short"),
+            "difference": one_hour.get("difference"),
+        })
+
+    if buy_count >= 2:
+        combined_signal = "BUY"
+    elif sell_count >= 2:
+        combined_signal = "SELL"
+    else:
+        combined_signal = "NONE"
+
     return {
         "updated_at_1h_utc": state_1h.get("updated_at_utc"),
         "updated_at_1h_ist": state_1h.get("updated_at_ist"),
         "alert_engine_1h": alert_state.get("1H", {}),
+        "combined_2of3": {
+            "signal": combined_signal,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "components": combined_components,
+            "alert_engine": combined_alert_state,
+        },
         "assets": rows,
     }
 
@@ -7286,6 +7610,27 @@ td {
         padding: 8px 5px;
         font-size: 11px;
     }
+
+    .combined-card {
+        padding: 12px 9px;
+    }
+
+    .combined-title {
+        font-size: 16px;
+    }
+
+    .combined-coins {
+        gap: 5px;
+    }
+
+    .combined-coin {
+        padding: 8px 3px;
+        font-size: 11px;
+    }
+
+    .combined-signal {
+        font-size: 21px;
+    }
 }
 </style>
 </head>
@@ -7312,6 +7657,52 @@ td {
             <strong>1H ALERT ENGINE</strong><br>
             <span id="alertUpdated1h">--</span><br>
             <span id="alertAge1h">--</span>
+        </div>
+    </div>
+
+    <div class="combined-card">
+        <div class="combined-title">
+            BTC + ETH + SOL • 2 OF 3 COMBINED
+        </div>
+
+        <div class="combined-rule">
+            EACH COIN MUST PASS MINIMUM $100K GAP
+        </div>
+
+        <div class="combined-coins" id="combinedCoins">
+            <div class="combined-coin">BTC: --</div>
+            <div class="combined-coin">ETH: --</div>
+            <div class="combined-coin">SOL: --</div>
+        </div>
+
+        <div class="combined-main">
+            <div
+                class="combined-signal none"
+                id="combinedSignal"
+            >
+                NONE
+            </div>
+
+            <div
+                class="combined-counts"
+                id="combinedCounts"
+            >
+                BUY 0/3 • SELL 0/3
+            </div>
+
+            <div
+                class="combined-last"
+                id="combinedLast"
+            >
+                Last Combined: --
+            </div>
+
+            <div
+                class="combined-engine"
+                id="combinedEngine"
+            >
+                2OF3 Engine: --
+            </div>
         </div>
     </div>
 
@@ -7346,7 +7737,8 @@ td {
     </div>
 
     <div class="footer">
-        Existing 1H feed + 1H alert-engine protection remain unchanged.<br>
+        Existing 1H feed + individual alert-engine protection remain unchanged.<br>
+        BTC/ETH/SOL 2-of-3 combined card uses the same $100K per-coin rule.<br>
         LIVE • Browser refresh every 5 seconds
     </div>
 
@@ -7553,6 +7945,142 @@ function coinLastAlertHtml(engine, symbol) {
     );
 }
 
+function compactTime(sentAtIst) {
+    const sent = String(sentAtIst || "");
+    const match = sent.match(
+        /(\d{1,2}:\d{2})(?::\d{2})?$/
+    );
+
+    return match
+        ? match[1]
+        : (sent || "--");
+}
+
+function renderCombined(combined) {
+    const block =
+        combined
+        && typeof combined === "object"
+        ? combined
+        : {};
+
+    const components =
+        Array.isArray(block.components)
+        ? block.components
+        : [];
+
+    const bySymbol = {};
+
+    components.forEach((item) => {
+        const symbol =
+            String(item.symbol || "").toUpperCase();
+
+        if (symbol) {
+            bySymbol[symbol] = item;
+        }
+    });
+
+    const coinHtml = ["BTC", "ETH", "SOL"]
+        .map((symbol) => {
+            const item = bySymbol[symbol] || {};
+            const sig =
+                String(item.signal || "NONE").toUpperCase();
+
+            return (
+                '<div class="combined-coin">'
+                + esc(symbol)
+                + ': <span class="'
+                + signalClass(sig)
+                + '">'
+                + esc(sig)
+                + '</span>'
+                + '</div>'
+            );
+        })
+        .join("");
+
+    document.getElementById(
+        "combinedCoins"
+    ).innerHTML = coinHtml;
+
+    const signal =
+        String(block.signal || "NONE").toUpperCase();
+
+    const signalEl =
+        document.getElementById(
+            "combinedSignal"
+        );
+
+    signalEl.textContent =
+        "COMBINED " + signal;
+
+    signalEl.className =
+        "combined-signal "
+        + signalClass(signal);
+
+    document.getElementById(
+        "combinedCounts"
+    ).textContent =
+        "BUY "
+        + Number(block.buy_count || 0)
+        + "/3 • SELL "
+        + Number(block.sell_count || 0)
+        + "/3";
+
+    const engine =
+        block.alert_engine
+        && typeof block.alert_engine === "object"
+        ? block.alert_engine
+        : {};
+
+    const last =
+        engine.last_alert
+        && typeof engine.last_alert === "object"
+        ? engine.last_alert
+        : null;
+
+    if (last) {
+        const lastSignal =
+            String(last.signal || "--").toUpperCase();
+
+        document.getElementById(
+            "combinedLast"
+        ).innerHTML =
+            'Last Combined: <span class="'
+            + signalClass(lastSignal)
+            + '">'
+            + esc(lastSignal)
+            + '</span> • '
+            + esc(
+                compactTime(
+                    last.sent_at_ist
+                )
+            );
+    } else {
+        document.getElementById(
+            "combinedLast"
+        ).textContent =
+            "Last Combined: --";
+    }
+
+    const status =
+        alertEngineStatus(
+            engine
+        );
+
+    const engineEl =
+        document.getElementById(
+            "combinedEngine"
+        );
+
+    engineEl.textContent =
+        "2OF3 Engine: "
+        + status.text;
+
+    engineEl.className =
+        "combined-engine "
+        + status.cls;
+}
+
 function metricHtml(label, value, cls) {
     return (
         '<div class="metric">'
@@ -7602,6 +8130,10 @@ async function refreshDashboard() {
 
         alertAge1h.textContent = engineStatus1.text;
         alertAge1h.className = engineStatus1.cls;
+
+        renderCombined(
+            data.combined_2of3 || {}
+        );
 
         if (assets.length === 0) {
             document.getElementById("desktopRows").innerHTML =
