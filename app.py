@@ -7195,6 +7195,227 @@ def coinglass_liquidation_value_combined_alert_data():
 
 
 # ============================================================
+# COINGLASS 10-COIN TOTAL DOMINANCE ALERT STATE
+# Separate from individual $100K alert engine and BTC/ETH/SOL 2OF3.
+# NO GAP FILTER for the Total Dominance vote:
+# SHORT > LONG = BUY | LONG > SHORT = SELL | EQUAL = NONE.
+# Browser script sends heartbeat every 30 sec and alert_sent only
+# after Pushover confirms HTTP 2xx.
+# ============================================================
+
+COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_STATE_FILE = os.path.join(
+    "/tmp",
+    "coinglass_value_total_dominance_alert.json",
+)
+COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_LOCK = threading.Lock()
+
+
+def _coinglass_value_total_dominance_alert_default():
+    return {
+        "heartbeat_at_utc": None,
+        "heartbeat_at_ist": None,
+        "version": None,
+        "pushover_configured": False,
+        "last_alert": None,
+    }
+
+
+def _coinglass_value_total_dominance_alert_load_unlocked():
+    try:
+        with open(
+            COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            state = _coinglass_value_total_dominance_alert_default()
+            state.update(data)
+            return state
+
+    except FileNotFoundError:
+        pass
+
+    except Exception as exc:
+        print(
+            f"[VALUE TOTAL DOMINANCE READ ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+    return _coinglass_value_total_dominance_alert_default()
+
+
+def _coinglass_value_total_dominance_alert_load():
+    with COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_LOCK:
+        return _coinglass_value_total_dominance_alert_load_unlocked()
+
+
+def _coinglass_value_total_dominance_alert_save_unlocked(data):
+    os.makedirs(
+        os.path.dirname(
+            COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_STATE_FILE
+        ),
+        exist_ok=True,
+    )
+
+    tmp = (
+        COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_STATE_FILE
+        + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+
+    try:
+        with open(
+            tmp,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                data,
+                f,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(
+            tmp,
+            COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_STATE_FILE,
+        )
+
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+@app.route(
+    "/coinglass-liquidation-value-total-dominance-heartbeat",
+    methods=["GET", "POST"],
+)
+def coinglass_liquidation_value_total_dominance_heartbeat():
+    secret = request.args.get("secret", "")
+
+    if (
+        not WEBHOOK_SECRET
+        or secret != WEBHOOK_SECRET
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "unauthorized",
+        }), 401
+
+    if request.method == "GET":
+        data = {
+            "event": request.args.get("event", "heartbeat"),
+            "version": request.args.get("version", ""),
+            "signal": request.args.get("signal", ""),
+            "pushover_configured": str(
+                request.args.get("pushover_configured", "")
+            ).strip().lower() in {"1", "true", "yes", "on"},
+        }
+    else:
+        data = (
+            request.get_json(
+                silent=True
+            )
+            or {}
+        )
+
+    event = str(
+        data.get("event", "heartbeat")
+    ).strip().lower()
+
+    if event not in {"heartbeat", "alert_sent"}:
+        return jsonify({
+            "ok": False,
+            "error": "event_must_be_heartbeat_or_alert_sent",
+        }), 400
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(
+        ZoneInfo("Asia/Kolkata")
+    )
+
+    try:
+        with COINGLASS_VALUE_TOTAL_DOMINANCE_ALERT_LOCK:
+            state = _coinglass_value_total_dominance_alert_load_unlocked()
+
+            state["heartbeat_at_utc"] = now_utc.isoformat()
+            state["heartbeat_at_ist"] = now_ist.strftime(
+                "%d-%m-%Y %H:%M:%S"
+            )
+            state["version"] = str(
+                data.get("version", "")
+            ).strip()[:40]
+            state["pushover_configured"] = bool(
+                data.get("pushover_configured", False)
+            )
+
+            if event == "alert_sent":
+                signal = str(
+                    data.get("signal", "")
+                ).strip().upper()[:10]
+
+                if signal not in {"BUY", "SELL"}:
+                    return jsonify({
+                        "ok": False,
+                        "error": "signal_must_be_BUY_or_SELL",
+                    }), 400
+
+                state["last_alert"] = {
+                    "signal": signal,
+                    "sent_at_utc": now_utc.isoformat(),
+                    "sent_at_ist": now_ist.strftime(
+                        "%d-%m-%Y %H:%M:%S"
+                    ),
+                }
+
+            _coinglass_value_total_dominance_alert_save_unlocked(
+                state
+            )
+
+    except Exception as exc:
+        print(
+            f"[VALUE TOTAL DOMINANCE SAVE ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "save_failed",
+        }), 500
+
+    print(
+        f"[VALUE TOTAL DOMINANCE ENGINE] {event.upper()} | "
+        f"PUSHOVER={'YES' if state['pushover_configured'] else 'NO'}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "event": event,
+        "received_at_ist": state[
+            "heartbeat_at_ist"
+        ],
+        "last_alert": state.get(
+            "last_alert"
+        ),
+    }), 200
+
+
+@app.get("/coinglass-liquidation-value-total-dominance-alert-data")
+def coinglass_liquidation_value_total_dominance_alert_data():
+    return jsonify({
+        "ok": True,
+        **_coinglass_value_total_dominance_alert_load(),
+    })
+
+
+# ============================================================
 # COINGLASS LIQUIDATION VALUE — 1H DOMINANCE DASHBOARD
 # DISPLAY ONLY.
 # Reads the EXISTING 1H Liquidation Value feed and 1H alert-engine heartbeat.
@@ -7213,6 +7434,9 @@ def _coinglass_value_combined_state():
     alert_state = _coinglass_value_alert_engine_load()
     combined_alert_state = (
         _coinglass_value_combined_alert_load()
+    )
+    total_dominance_alert_state = (
+        _coinglass_value_total_dominance_alert_load()
     )
 
     assets_1h = state_1h.get("assets", [])
@@ -7334,6 +7558,52 @@ def _coinglass_value_combined_state():
     else:
         combined_signal = "NONE"
 
+    # 10-coin TOTAL DOMINANCE uses ONLY dominant side, with NO gap filter.
+    total_components = []
+    total_buy_count = 0
+    total_sell_count = 0
+    total_none_count = 0
+
+    for row in rows:
+        one_hour = (
+            row.get("one_hour", {})
+            if isinstance(row, dict)
+            else {}
+        )
+        if not isinstance(one_hour, dict):
+            one_hour = {}
+
+        dominant_side = str(
+            one_hour.get("stronger", "EQUAL")
+        ).strip().upper()
+
+        if dominant_side == "SHORT":
+            total_vote = "BUY"
+            total_buy_count += 1
+        elif dominant_side == "LONG":
+            total_vote = "SELL"
+            total_sell_count += 1
+        else:
+            dominant_side = "EQUAL"
+            total_vote = "NONE"
+            total_none_count += 1
+
+        total_components.append({
+            "symbol": str(row.get("symbol", "")).upper(),
+            "dominant": dominant_side,
+            "signal": total_vote,
+            "long": one_hour.get("long"),
+            "short": one_hour.get("short"),
+            "difference": one_hour.get("difference"),
+        })
+
+    if total_buy_count > total_sell_count:
+        total_dominance_signal = "BUY"
+    elif total_sell_count > total_buy_count:
+        total_dominance_signal = "SELL"
+    else:
+        total_dominance_signal = "NONE"
+
     return {
         "updated_at_1h_utc": state_1h.get("updated_at_utc"),
         "updated_at_1h_ist": state_1h.get("updated_at_ist"),
@@ -7344,6 +7614,14 @@ def _coinglass_value_combined_state():
             "sell_count": sell_count,
             "components": combined_components,
             "alert_engine": combined_alert_state,
+        },
+        "total_dominance": {
+            "signal": total_dominance_signal,
+            "buy_count": total_buy_count,
+            "sell_count": total_sell_count,
+            "none_count": total_none_count,
+            "components": total_components,
+            "alert_engine": total_dominance_alert_state,
         },
         "assets": rows,
     }
@@ -7722,6 +8000,46 @@ td {
         </div>
     </div>
 
+    <div class="combined-card">
+        <div class="combined-title">
+            10-COIN TOTAL DOMINANCE
+        </div>
+
+        <div class="combined-rule">
+            NO GAP FILTER • SHORT &gt; LONG = BUY • LONG &gt; SHORT = SELL
+        </div>
+
+        <div class="combined-main">
+            <div
+                class="combined-signal none"
+                id="totalDominanceSignal"
+            >
+                TOTAL NONE
+            </div>
+
+            <div
+                class="combined-counts"
+                id="totalDominanceCounts"
+            >
+                BUY 0/10 • SELL 0/10 • NONE 0/10
+            </div>
+
+            <div
+                class="combined-last"
+                id="totalDominanceLast"
+            >
+                Last Total: --
+            </div>
+
+            <div
+                class="combined-engine"
+                id="totalDominanceEngine"
+            >
+                TOTAL Engine: --
+            </div>
+        </div>
+    </div>
+
     <div class="card desktop-card">
         <table>
             <thead>
@@ -7754,7 +8072,8 @@ td {
 
     <div class="footer">
         Existing 1H feed + individual alert-engine protection remain unchanged.<br>
-        BTC/ETH/SOL 2-of-3 combined card uses the same $100K per-coin rule.<br>
+        BTC/ETH/SOL 2-of-3 uses the $100K per-coin rule.<br>
+        10-coin Total Dominance uses dominant side only — NO GAP FILTER.<br>
         LIVE • Browser refresh every 5 seconds
     </div>
 
@@ -8097,6 +8416,94 @@ function renderCombined(combined) {
         + status.cls;
 }
 
+function renderTotalDominance(total) {
+    const block =
+        total
+        && typeof total === "object"
+        ? total
+        : {};
+
+    const signal =
+        String(block.signal || "NONE").toUpperCase();
+
+    const signalEl =
+        document.getElementById(
+            "totalDominanceSignal"
+        );
+
+    signalEl.textContent =
+        "TOTAL " + signal;
+
+    signalEl.className =
+        "combined-signal "
+        + signalClass(signal);
+
+    document.getElementById(
+        "totalDominanceCounts"
+    ).textContent =
+        "BUY "
+        + Number(block.buy_count || 0)
+        + "/10 • SELL "
+        + Number(block.sell_count || 0)
+        + "/10 • NONE "
+        + Number(block.none_count || 0)
+        + "/10";
+
+    const engine =
+        block.alert_engine
+        && typeof block.alert_engine === "object"
+        ? block.alert_engine
+        : {};
+
+    const last =
+        engine.last_alert
+        && typeof engine.last_alert === "object"
+        ? engine.last_alert
+        : null;
+
+    if (last) {
+        const lastSignal =
+            String(last.signal || "--").toUpperCase();
+
+        document.getElementById(
+            "totalDominanceLast"
+        ).innerHTML =
+            'Last Total: <span class="'
+            + signalClass(lastSignal)
+            + '">'
+            + esc(lastSignal)
+            + '</span> • '
+            + esc(
+                compactTime(
+                    last.sent_at_ist
+                )
+            );
+    } else {
+        document.getElementById(
+            "totalDominanceLast"
+        ).textContent =
+            "Last Total: --";
+    }
+
+    const status =
+        alertEngineStatus(
+            engine
+        );
+
+    const engineEl =
+        document.getElementById(
+            "totalDominanceEngine"
+        );
+
+    engineEl.textContent =
+        "TOTAL Engine: "
+        + status.text;
+
+    engineEl.className =
+        "combined-engine "
+        + status.cls;
+}
+
 function metricHtml(label, value, cls) {
     return (
         '<div class="metric">'
@@ -8149,6 +8556,10 @@ async function refreshDashboard() {
 
         renderCombined(
             data.combined_2of3 || {}
+        );
+
+        renderTotalDominance(
+            data.total_dominance || {}
         );
 
         if (assets.length === 0) {
