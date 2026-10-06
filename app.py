@@ -5543,6 +5543,16 @@ def coinglass_liquidation_value_4h_webhook():
             rank = 999999
 
         try:
+            price_raw = item.get("price")
+            price_value = (
+                float(price_raw)
+                if price_raw is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            price_value = None
+
+        try:
             long_value = float(item.get("long"))
             short_value = float(item.get("short"))
         except (TypeError, ValueError):
@@ -5550,6 +5560,9 @@ def coinglass_liquidation_value_4h_webhook():
 
         if long_value < 0 or short_value < 0:
             continue
+
+        if price_value is not None and price_value < 0:
+            price_value = None
 
         difference = abs(
             long_value - short_value
@@ -5576,6 +5589,7 @@ def coinglass_liquidation_value_4h_webhook():
         assets.append({
             "rank": rank,
             "symbol": symbol,
+            "price": price_value,
             "long": long_value,
             "short": short_value,
             "difference": difference,
@@ -5722,6 +5736,7 @@ table { width: 100%; border-collapse: collapse; min-width: 780px; }
 th { background: #21262d; padding: 13px 8px; font-size: 12px; white-space: nowrap; }
 td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-size: 14px; }
 .asset { font-weight: 900; }
+.price { color: #f0f6fc; font-weight: 900; }
 .long { color: #f85149; }
 .short { color: #3fb950; }
 .buy { color: #3fb950; font-weight: 900; }
@@ -5749,6 +5764,8 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
     .metrics { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; font-size:12px; }
     .metric { display:flex; justify-content:space-between; gap:8px; }
     .metric span:first-child { color:#8b949e; }
+    .metric.price-row { grid-column: 1 / -1; border-bottom: 1px solid #30363d; padding-bottom: 7px; margin-bottom: 1px; }
+    .metric.price-row strong { color:#f0f6fc; font-size:14px; }
 }
 </style>
 </head>
@@ -5779,6 +5796,7 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
             <thead>
                 <tr>
                     <th>ASSET</th>
+                    <th>PRICE</th>
                     <th>LONG</th>
                     <th>SHORT</th>
                     <th>GAP</th>
@@ -5789,7 +5807,7 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
                 </tr>
             </thead>
             <tbody id="rows">
-                <tr><td colspan="8">Waiting for 4H Value feed...</td></tr>
+                <tr><td colspan="9">Waiting for 4H Value feed...</td></tr>
             </tbody>
         </table>
     </div>
@@ -5821,6 +5839,17 @@ function money(v) {
     if (a >= 1e6) return "$" + (n/1e6).toFixed(2) + "M";
     if (a >= 1e3) return "$" + (n/1e3).toFixed(1) + "K";
     return "$" + n.toFixed(0);
+}
+function price(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "--";
+    let maxDecimals = 2;
+    if (Math.abs(n) < 1) maxDecimals = 6;
+    else if (Math.abs(n) < 100) maxDecimals = 4;
+    return "$" + n.toLocaleString(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: maxDecimals
+    });
 }
 function signalClass(s) {
     s = String(s || "NONE").toUpperCase();
@@ -5874,6 +5903,7 @@ async function refresh() {
             const dom = String(x.stronger || 'EQUAL').toUpperCase();
             html += '<tr>'
                 + '<td class="asset">' + esc(x.symbol) + '</td>'
+                + '<td class="price">' + esc(price(x.price)) + '</td>'
                 + '<td class="long">' + esc(money(x.long)) + '</td>'
                 + '<td class="short">' + esc(money(x.short)) + '</td>'
                 + '<td class="' + gapClass(dom) + '"><strong>' + esc(money(x.difference)) + '</strong></td>'
@@ -5886,6 +5916,7 @@ async function refresh() {
             mobile += '<div class="asset-card">'
                 + '<div class="asset-head"><span>' + esc(x.symbol) + '</span><span class="' + signalClass(sig) + '">' + esc(sig) + '</span></div>'
                 + '<div class="metrics">'
+                + '<div class="metric price-row"><span>PRICE</span><strong>' + esc(price(x.price)) + '</strong></div>'
                 + '<div class="metric"><span>LONG</span><strong>' + esc(money(x.long)) + '</strong></div>'
                 + '<div class="metric"><span>SHORT</span><strong>' + esc(money(x.short)) + '</strong></div>'
                 + '<div class="metric"><span>GAP</span><strong class="' + gapClass(dom) + '">' + esc(money(x.difference)) + '</strong></div>'
