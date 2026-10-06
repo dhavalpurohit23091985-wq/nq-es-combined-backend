@@ -6915,11 +6915,14 @@ def coinglass_liquidation_value_alert_engine_data():
 # COINGLASS LIQUIDATION VALUE — 1H DOMINANCE DASHBOARD
 # DISPLAY ONLY.
 # Reads the EXISTING 1H Liquidation Value feed and 1H alert-engine heartbeat.
-# Dashboard signal is DOMINANCE ONLY:
-# SHORT > LONG = BUY | LONG > SHORT = SELL | EQUAL = NONE.
-# No $1M / $500K threshold is used here.
+# Dashboard signal uses 1H liquidation dominance with a $100K minimum gap:
+# SHORT > LONG and GAP >= $100K = BUY
+# LONG > SHORT and GAP >= $100K = SELL
+# GAP < $100K = NONE (dominant side is still shown).
 # 4H backend/feed routes are left untouched; they are simply not shown here.
 # ============================================================
+
+COINGLASS_VALUE_DOMINANCE_MIN_GAP = 100_000.0
 
 
 def _coinglass_value_combined_state():
@@ -6960,12 +6963,19 @@ def _coinglass_value_combined_state():
 
             if short_value > long_value:
                 stronger = "SHORT"
-                signal = "BUY"
             elif long_value > short_value:
                 stronger = "LONG"
-                signal = "SELL"
             else:
                 stronger = "EQUAL"
+
+            if difference >= COINGLASS_VALUE_DOMINANCE_MIN_GAP:
+                if stronger == "SHORT":
+                    signal = "BUY"
+                elif stronger == "LONG":
+                    signal = "SELL"
+                else:
+                    signal = "NONE"
+            else:
                 signal = "NONE"
         else:
             difference = None
@@ -7287,8 +7297,8 @@ td {
 
     <div class="subtitle">
         FIXED 8 + NEXT 2 COINGLASS RANKED<br>
-        DOMINANCE ONLY • NO $ GAP THRESHOLD<br>
-        SHORT &gt; LONG = BUY • LONG &gt; SHORT = SELL
+        DOMINANCE + MINIMUM $100K GAP<br>
+        SHORT &gt; LONG + GAP ≥ $100K = BUY • LONG &gt; SHORT + GAP ≥ $100K = SELL
     </div>
 
     <div class="update-strip">
@@ -7642,7 +7652,7 @@ async function refreshDashboard() {
                 + " "
                 + esc(symbol)
                 + "</div>"
-                + '<div class="mode-label">1H DOMINANCE</div>'
+                + '<div class="mode-label">1H • MIN GAP $100K</div>'
                 + "</div>"
 
                 + '<div class="tf-box">'
