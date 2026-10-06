@@ -5581,31 +5581,46 @@ def coinglass_liquidation_value_4h_webhook():
 
         seen.add(symbol)
 
-    selected_assets, selection_error = (
-        _select_coinglass_value_fixed8_plus2(
-            assets
-        )
+    final_4h_symbols = (
+        "BTC",
+        "ETH",
+        "SOL",
+        "XRP",
+        "NEAR",
+        "XAU",
+        "DOGE",
     )
 
-    if selection_error:
+    by_symbol = {
+        str(item.get("symbol", "")).strip().upper(): item
+        for item in assets
+        if isinstance(item, dict)
+    }
+
+    missing = [
+        symbol
+        for symbol in final_4h_symbols
+        if symbol not in by_symbol
+    ]
+
+    if missing:
         print(
-            "[COINGLASS VALUE 4H DASHBOARD REJECTED] "
-            + json.dumps(
-                selection_error,
-                sort_keys=True,
-            ),
+            "[COINGLASS VALUE 4H FINAL7 REJECTED] "
+            + json.dumps({"missing": missing}, sort_keys=True),
             flush=True,
         )
 
         return jsonify({
             "ok": False,
-            **selection_error,
-            "required_fixed": list(
-                COINGLASS_VALUE_FIXED_ASSETS
-            ),
+            "error": "final_4h_assets_missing",
+            "missing": missing,
+            "required": list(final_4h_symbols),
         }), 422
 
-    assets = selected_assets
+    assets = [
+        by_symbol[symbol]
+        for symbol in final_4h_symbols
+    ]
 
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(
@@ -5658,12 +5673,17 @@ def coinglass_liquidation_value_4h_webhook():
 
 @app.get("/coinglass-liquidation-value-4h-data")
 def coinglass_liquidation_value_4h_data():
+    state = _coinglass_value_4h_dashboard_load()
+    engine = _coinglass_value_alert_engine_load().get("4H", {})
+
     return jsonify({
         "ok": True,
-        **_coinglass_value_4h_dashboard_load(),
+        **state,
+        "alert_engine_4h": engine,
     })
 
 
+@app.get("/coinglass-liquidation-value")
 @app.get("/coinglass-liquidation-value-4h")
 def coinglass_liquidation_value_4h():
     html = r"""
@@ -5672,313 +5692,213 @@ def coinglass_liquidation_value_4h():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CoinGlass 4H Liquidation Value Dashboard</title>
-
+<title>CoinGlass Final 4H Liquidation Dominance</title>
 <style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
 body {
     margin: 0;
-    padding: 22px;
+    padding: 18px;
     background: #0d1117;
     color: #f0f6fc;
     font-family: Arial, Helvetica, sans-serif;
 }
-.container {
-    max-width: 1180px;
-    margin: 0 auto;
+.container { max-width: 1050px; margin: 0 auto; }
+h1 { text-align: center; margin: 0 0 6px; font-size: 28px; }
+.subtitle { text-align: center; color: #8b949e; line-height: 1.55; margin-bottom: 15px; }
+.status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.status-box {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 11px; text-align: center; color: #8b949e; line-height: 1.5; font-size: 13px;
 }
-h1 {
-    text-align: center;
-    margin: 0 0 7px;
-}
-.subtitle {
-    text-align: center;
-    color: #8b949e;
-    margin-bottom: 22px;
-    line-height: 1.6;
-}
-.card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 12px;
-    overflow-x: auto;
-}
-table {
-    width: 100%;
-    border-collapse: collapse;
-}
-th {
-    background: #21262d;
-    padding: 14px 10px;
-    font-size: 13px;
-}
-td {
-    padding: 14px 10px;
-    text-align: center;
-    border-top: 1px solid #30363d;
-    font-size: 15px;
-}
-.asset {
-    font-weight: 800;
-    font-size: 17px;
-}
-.long {
-    color: #3fb950;
-    font-weight: 700;
-}
-.short {
-    color: #f85149;
-    font-weight: 700;
-}
-.equal,
-.none {
-    color: #d29922;
-    font-weight: 700;
-}
-.fixed {
-    color: #58a6ff;
-}
-.buy {
-    color: #3fb950;
-    font-weight: 900;
-}
-.sell {
-    color: #f85149;
-    font-weight: 900;
-}
-.footer {
-    text-align: center;
-    color: #8b949e;
-    margin-top: 18px;
-    line-height: 1.8;
-}
-@media (max-width: 700px) {
+.status-box strong { color: #f0f6fc; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; min-width: 780px; }
+th { background: #21262d; padding: 13px 8px; font-size: 12px; white-space: nowrap; }
+td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-size: 14px; }
+.asset { font-weight: 900; }
+.long { color: #f85149; }
+.short { color: #3fb950; }
+.buy { color: #3fb950; font-weight: 900; }
+.sell { color: #f85149; font-weight: 900; }
+.none, .equal { color: #d29922; font-weight: 900; }
+.live { color: #3fb950; font-weight: 900; }
+.stale { color: #f85149; font-weight: 900; }
+.footer { text-align: center; color: #8b949e; font-size: 12px; line-height: 1.6; margin-top: 14px; }
+.mobile-list { display: none; }
+@media (max-width: 720px) {
     body { padding: 10px; }
-    h1 { font-size: 20px; }
-    th { font-size: 10px; }
-    td { font-size: 12px; padding: 11px 4px; }
+    h1 { font-size: 22px; }
+    .status-grid { grid-template-columns: 1fr; }
+    .desktop-card { display: none; }
+    .mobile-list { display: block; }
+    .asset-card {
+        background: #161b22; border: 1px solid #30363d; border-radius: 11px;
+        margin-bottom: 9px; padding: 12px;
+    }
+    .asset-head { display:flex; justify-content:space-between; gap:10px; font-weight:900; margin-bottom:8px; }
+    .metrics { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; font-size:12px; }
+    .metric { display:flex; justify-content:space-between; gap:8px; }
+    .metric span:first-child { color:#8b949e; }
 }
 </style>
 </head>
-
 <body>
 <div class="container">
-
-    <h1>COINGLASS LIQUIDATION VALUE — 4H</h1>
-
+    <h1>COINGLASS LIQUIDATION VALUE — FINAL 4H</h1>
     <div class="subtitle">
-        DEFAULT LIQUIDATION VALUE MODE • FIXED 8 + NEXT 2 RANKED<br>
-        BTC / ETH / SOL = $1M GAP • ALL OTHERS = $500K GAP
+        BTC / ETH / SOL: minimum gap $100K<br>
+        XRP / NEAR / XAU / DOGE: minimum gap $10K<br>
+        SHORT &gt; LONG = BUY • LONG &gt; SHORT = SELL • Strict BUY → SELL → BUY
     </div>
 
-    <div class="card">
+    <div class="status-grid">
+        <div class="status-box">
+            <strong>4H FEED</strong><br>
+            <span id="updated">--</span><br>
+            <span id="feedAge">--</span>
+        </div>
+        <div class="status-box">
+            <strong>4H ALERT ENGINE</strong><br>
+            <span id="engineUpdated">--</span><br>
+            <span id="engineAge">--</span>
+        </div>
+    </div>
+
+    <div class="card desktop-card">
         <table>
             <thead>
                 <tr>
-                    <th>RANK</th>
                     <th>ASSET</th>
-                    <th>4H LONG VALUE</th>
-                    <th>4H SHORT VALUE</th>
+                    <th>LONG</th>
+                    <th>SHORT</th>
                     <th>GAP</th>
-                    <th>THRESHOLD</th>
-                    <th>STRONGER</th>
+                    <th>MIN GAP</th>
+                    <th>DOMINANT</th>
                     <th>SIGNAL</th>
+                    <th>LAST ALERT</th>
                 </tr>
             </thead>
-
             <tbody id="rows">
-                <tr>
-                    <td colspan="8">
-                        Waiting for CoinGlass 4H Liquidation Value feed...
-                    </td>
-                </tr>
+                <tr><td colspan="8">Waiting for 4H Value feed...</td></tr>
             </tbody>
         </table>
     </div>
 
-    <div class="footer">
-        FIXED: BTC ETH SOL XRP NEAR DOGE ZEC XAU • NEXT 2 follow CoinGlass ranking<br>
-        SHORT-LONG threshold = BUY • LONG-SHORT threshold = SELL<br>
-        Feed update: <span id="updated">--</span> IST<br>
-        <span id="status">Loading...</span>
+    <div class="mobile-list" id="mobileRows">
+        <div class="asset-card">Waiting for 4H Value feed...</div>
     </div>
 
+    <div class="footer">
+        FINAL 4H ONLY • 7 COINS • Browser refresh every 5 seconds<br>
+        Last Alert updates only after successful Pushover HTTP 2xx.
+    </div>
 </div>
 
 <script>
-function esc(value) {
-    return String(value)
+function esc(v) {
+    return String(v ?? "")
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
 }
-
-function money(value) {
-    const n = Number(value);
-
-    if (!Number.isFinite(n)) {
-        return "--";
-    }
-
-    const abs = Math.abs(n);
-
-    if (abs >= 1000000000) {
-        return "$" + (n / 1000000000).toFixed(2) + "B";
-    }
-
-    if (abs >= 1000000) {
-        return "$" + (n / 1000000).toFixed(2) + "M";
-    }
-
-    if (abs >= 1000) {
-        return "$" + (n / 1000).toFixed(1) + "K";
-    }
-
-    return "$" + n.toFixed(2);
+function money(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "--";
+    const a = Math.abs(n);
+    if (a >= 1e9) return "$" + (n/1e9).toFixed(2) + "B";
+    if (a >= 1e6) return "$" + (n/1e6).toFixed(2) + "M";
+    if (a >= 1e3) return "$" + (n/1e3).toFixed(1) + "K";
+    return "$" + n.toFixed(0);
 }
-
-async function refreshDashboard() {
-    const status =
-        document.getElementById("status");
-
+function signalClass(s) {
+    s = String(s || "NONE").toUpperCase();
+    return s === "BUY" ? "buy" : s === "SELL" ? "sell" : "none";
+}
+function ageInfo(iso) {
+    if (!iso) return {text:"NO DATA", cls:"stale"};
+    const t = new Date(iso).getTime();
+    if (!Number.isFinite(t)) return {text:"NO DATA", cls:"stale"};
+    const m = Math.max(0, (Date.now() - t) / 60000);
+    return { text: (m < 5 ? "LIVE ✅ • " : "STALE ❌ • ") + m.toFixed(1) + " min", cls: m < 5 ? "live" : "stale" };
+}
+function compactTime(s) {
+    const m = String(s || "").match(/(\d{1,2}:\d{2})(?::\d{2})?$/);
+    return m ? m[1] : (s || "--");
+}
+function lastAlert(engine, symbol) {
+    const map = engine && typeof engine.last_alert_by_asset === "object" ? engine.last_alert_by_asset : {};
+    const x = map[symbol];
+    if (!x || typeof x !== "object") return "--";
+    const sig = String(x.signal || "--").toUpperCase();
+    return '<span class="' + signalClass(sig) + '">' + esc(sig) + '</span> • ' + esc(compactTime(x.sent_at_ist));
+}
+async function refresh() {
     try {
-        const response = await fetch(
-            "/coinglass-liquidation-value-4h-data?ts="
-            + Date.now(),
-            {cache: "no-store"}
-        );
+        const r = await fetch('/coinglass-liquidation-value-4h-data?ts=' + Date.now(), {cache:'no-store'});
+        const d = await r.json();
+        const assets = Array.isArray(d.assets) ? d.assets : [];
+        const engine = d.alert_engine_4h && typeof d.alert_engine_4h === 'object' ? d.alert_engine_4h : {};
 
-        const data =
-            await response.json();
+        document.getElementById('updated').textContent = d.updated_at_ist || '--';
+        const fa = ageInfo(d.updated_at_utc);
+        document.getElementById('feedAge').textContent = fa.text;
+        document.getElementById('feedAge').className = fa.cls;
 
-        const rows =
-            document.getElementById("rows");
+        document.getElementById('engineUpdated').textContent = engine.heartbeat_at_ist || '--';
+        const ea = ageInfo(engine.heartbeat_at_utc);
+        document.getElementById('engineAge').textContent = ea.text;
+        document.getElementById('engineAge').className = ea.cls;
 
-        if (
-            !Array.isArray(data.assets)
-            || data.assets.length === 0
-        ) {
-            rows.innerHTML =
-                '<tr><td colspan="8">'
-                + 'Waiting for CoinGlass 4H Liquidation Value feed...'
-                + '</td></tr>';
+        if (!assets.length) return;
 
-            status.textContent =
-                "No Liquidation Value feed received yet.";
+        let html = '';
+        let mobile = '';
+        for (const x of assets) {
+            const sig = String(x.signal || 'NONE').toUpperCase();
+            const dom = String(x.stronger || 'EQUAL').toUpperCase();
+            html += '<tr>'
+                + '<td class="asset">' + esc(x.symbol) + '</td>'
+                + '<td class="long">' + esc(money(x.long)) + '</td>'
+                + '<td class="short">' + esc(money(x.short)) + '</td>'
+                + '<td><strong>' + esc(money(x.difference)) + '</strong></td>'
+                + '<td>' + esc(money(x.threshold)) + '</td>'
+                + '<td class="' + (dom === 'SHORT' ? 'buy' : dom === 'LONG' ? 'sell' : 'equal') + '">' + esc(dom) + '</td>'
+                + '<td class="' + signalClass(sig) + '">' + esc(sig) + '</td>'
+                + '<td>' + lastAlert(engine, String(x.symbol || '').toUpperCase()) + '</td>'
+                + '</tr>';
 
-            return;
+            mobile += '<div class="asset-card">'
+                + '<div class="asset-head"><span>' + esc(x.symbol) + '</span><span class="' + signalClass(sig) + '">' + esc(sig) + '</span></div>'
+                + '<div class="metrics">'
+                + '<div class="metric"><span>LONG</span><strong>' + esc(money(x.long)) + '</strong></div>'
+                + '<div class="metric"><span>SHORT</span><strong>' + esc(money(x.short)) + '</strong></div>'
+                + '<div class="metric"><span>GAP</span><strong>' + esc(money(x.difference)) + '</strong></div>'
+                + '<div class="metric"><span>MIN GAP</span><strong>' + esc(money(x.threshold)) + '</strong></div>'
+                + '<div class="metric"><span>DOM</span><strong>' + esc(dom) + '</strong></div>'
+                + '<div class="metric"><span>LAST</span><strong>' + lastAlert(engine, String(x.symbol || '').toUpperCase()) + '</strong></div>'
+                + '</div></div>';
         }
-
-        let html = "";
-
-        data.assets.forEach(
-            (item, index) => {
-
-                const stronger =
-                    String(
-                        item.stronger || "EQUAL"
-                    ).toUpperCase();
-
-                const signal =
-                    String(
-                        item.signal || "NONE"
-                    ).toUpperCase();
-
-                const strongerCls =
-                    stronger === "LONG"
-                    ? "long"
-                    : stronger === "SHORT"
-                    ? "short"
-                    : "equal";
-
-                const signalCls =
-                    signal === "BUY"
-                    ? "buy"
-                    : signal === "SELL"
-                    ? "sell"
-                    : "none";
-
-                const fixed =
-                    [
-                        "BTC", "ETH", "SOL", "XRP", "NEAR",
-                        "DOGE", "ZEC", "XAU"
-                    ].includes(item.symbol)
-                    ? " fixed"
-                    : "";
-
-                html +=
-                    "<tr>"
-                    + "<td>"
-                    + esc(index + 1)
-                    + "</td>"
-                    + '<td class="asset'
-                    + fixed
-                    + '">'
-                    + esc(item.symbol)
-                    + "</td>"
-                    + '<td class="long">'
-                    + esc(money(item.long))
-                    + "</td>"
-                    + '<td class="short">'
-                    + esc(money(item.short))
-                    + "</td>"
-                    + "<td><strong>"
-                    + esc(money(item.difference))
-                    + "</strong></td>"
-                    + "<td>"
-                    + esc(money(item.threshold))
-                    + "</td>"
-                    + '<td class="'
-                    + strongerCls
-                    + '">'
-                    + esc(stronger)
-                    + "</td>"
-                    + '<td class="'
-                    + signalCls
-                    + '">'
-                    + esc(signal)
-                    + "</td>"
-                    + "</tr>";
-            }
-        );
-
-        rows.innerHTML = html;
-
-        document.getElementById(
-            "updated"
-        ).textContent =
-            data.updated_at_ist || "--";
-
-        status.textContent =
-            "LIVE • Browser refresh every 5 seconds";
-
-    } catch (error) {
-        status.textContent =
-            "Waiting for server...";
+        document.getElementById('rows').innerHTML = html;
+        document.getElementById('mobileRows').innerHTML = mobile;
+    } catch (e) {
+        document.getElementById('feedAge').textContent = 'Waiting for server...';
+        document.getElementById('feedAge').className = 'stale';
     }
 }
-
-refreshDashboard();
-
-setInterval(
-    refreshDashboard,
-    5000
-);
+refresh();
+setInterval(refresh, 5000);
 </script>
-
 </body>
 </html>
 """
 
     return html, 200, {
-        "Content-Type":
-            "text/html; charset=utf-8",
-        "Cache-Control":
-            "no-store, no-cache, must-revalidate",
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
     }
-
-
 
 # ============================================================
 # COINGLASS LIQUIDATION VALUE DASHBOARD — 1H
@@ -7635,7 +7555,6 @@ def coinglass_liquidation_value_combined_data():
     })
 
 
-@app.get("/coinglass-liquidation-value")
 @app.get("/coinglass-liquidation-value-combined")
 def coinglass_liquidation_value_combined():
     html = r"""
