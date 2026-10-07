@@ -5534,8 +5534,8 @@ def coinglass_liquidation_value_4h_total_data():
 # DATA ONLY: these routes NEVER send Pushover.
 #
 # Thresholds:
-#   BTC / ETH / SOL -> $100,000 gap
-#   XRP / NEAR / XAU / DOGE -> $10,000 gap
+#   BTC / ETH / SOL -> $1,000,000 gap
+#   XRP / NEAR / XAU / DOGE -> $100,000 gap
 #
 # Signal convention:
 #   SHORT liquidation value - LONG liquidation value >= threshold -> BUY
@@ -5573,10 +5573,10 @@ def _coinglass_value_4h_threshold(symbol):
     symbol = str(symbol or "").strip().upper()
 
     if symbol in COINGLASS_VALUE_TOP3:
-        return 100_000.0
+        return 1_000_000.0
 
     if symbol in {"XRP", "NEAR", "XAU", "DOGE"}:
-        return 10_000.0
+        return 100_000.0
 
     # Final 4H feed should contain only the seven configured assets.
     # Keep unknown assets non-triggering by assigning an effectively
@@ -6051,8 +6051,8 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
     <h1>COINGLASS LIQUIDATION VALUE — FINAL 4H</h1>
     <div class="subtitle">
         ALL MARKET 4H TOTAL: minimum gap $1.00M<br>
-        BTC / ETH / SOL: minimum gap $100K<br>
-        XRP / NEAR / XAU / DOGE: minimum gap $10K<br>
+        BTC / ETH / SOL: minimum gap $1M<br>
+        XRP / NEAR / XAU / DOGE: minimum gap $100K<br>
         SHORT &gt; LONG = BUY • LONG &gt; SHORT = SELL • Strict BUY → SELL → BUY
     </div>
 
