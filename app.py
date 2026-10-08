@@ -5326,209 +5326,6 @@ setInterval(
 # ============================================================
 
 # ============================================================
-# COINGLASS ALL MARKET — TOTAL LIQUIDATIONS 4H
-# Separate addition. Existing FINAL7 feed/alerts remain untouched.
-# Rule:
-#   GAP >= $1,000,000
-#   SHORT > LONG -> BUY
-#   LONG > SHORT -> SELL
-# Data route never sends Pushover; browser script handles alert/protection.
-# ============================================================
-
-COINGLASS_ALL_4H_TOTAL_STATE_FILE = os.path.join(
-    "/tmp",
-    "coinglass_all_market_4h_total.json",
-)
-COINGLASS_ALL_4H_TOTAL_LOCK = threading.Lock()
-COINGLASS_ALL_4H_TOTAL_MIN_GAP = 1_000_000.0
-
-
-def _coinglass_all_4h_total_load():
-    try:
-        with COINGLASS_ALL_4H_TOTAL_LOCK:
-            with open(
-                COINGLASS_ALL_4H_TOTAL_STATE_FILE,
-                "r",
-                encoding="utf-8",
-            ) as f:
-                data = json.load(f)
-
-        if isinstance(data, dict):
-            return data
-
-    except FileNotFoundError:
-        pass
-
-    except Exception as exc:
-        print(
-            f"[COINGLASS ALL 4H TOTAL READ ERROR] {exc}",
-            flush=True,
-        )
-
-    return {
-        "long": None,
-        "short": None,
-        "rekt": None,
-        "difference": None,
-        "stronger": "EQUAL",
-        "threshold": COINGLASS_ALL_4H_TOTAL_MIN_GAP,
-        "signal": "NONE",
-        "updated_at_utc": None,
-        "updated_at_ist": None,
-    }
-
-
-def _coinglass_all_4h_total_save(data):
-    os.makedirs(
-        os.path.dirname(
-            COINGLASS_ALL_4H_TOTAL_STATE_FILE
-        ),
-        exist_ok=True,
-    )
-
-    tmp = (
-        COINGLASS_ALL_4H_TOTAL_STATE_FILE
-        + f".{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-
-    with COINGLASS_ALL_4H_TOTAL_LOCK:
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(
-                    data,
-                    f,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(
-                tmp,
-                COINGLASS_ALL_4H_TOTAL_STATE_FILE,
-            )
-
-        finally:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-
-
-@app.post("/coinglass-liquidation-value-4h-total-webhook")
-def coinglass_liquidation_value_4h_total_webhook():
-    secret = request.args.get("secret", "")
-
-    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
-        return jsonify({
-            "ok": False,
-            "error": "unauthorized",
-        }), 401
-
-    data = request.get_json(silent=True) or {}
-
-    try:
-        long_value = float(data.get("long"))
-        short_value = float(data.get("short"))
-
-        rekt_raw = data.get("rekt")
-        rekt_value = (
-            float(rekt_raw)
-            if rekt_raw is not None
-            else long_value + short_value
-        )
-    except (TypeError, ValueError):
-        return jsonify({
-            "ok": False,
-            "error": "valid_long_short_required",
-        }), 400
-
-    if (
-        long_value < 0
-        or short_value < 0
-        or rekt_value < 0
-    ):
-        return jsonify({
-            "ok": False,
-            "error": "negative_values_not_allowed",
-        }), 400
-
-    difference = abs(long_value - short_value)
-
-    if long_value > short_value:
-        stronger = "LONG"
-    elif short_value > long_value:
-        stronger = "SHORT"
-    else:
-        stronger = "EQUAL"
-
-    if (
-        short_value - long_value
-        >= COINGLASS_ALL_4H_TOTAL_MIN_GAP
-    ):
-        signal = "BUY"
-    elif (
-        long_value - short_value
-        >= COINGLASS_ALL_4H_TOTAL_MIN_GAP
-    ):
-        signal = "SELL"
-    else:
-        signal = "NONE"
-
-    now_utc = datetime.now(timezone.utc)
-    now_ist = now_utc.astimezone(
-        ZoneInfo("Asia/Kolkata")
-    )
-
-    state = {
-        "long": long_value,
-        "short": short_value,
-        "rekt": rekt_value,
-        "difference": difference,
-        "stronger": stronger,
-        "threshold": COINGLASS_ALL_4H_TOTAL_MIN_GAP,
-        "signal": signal,
-        "updated_at_utc": now_utc.isoformat(),
-        "updated_at_ist": now_ist.strftime(
-            "%d-%m-%Y %H:%M:%S"
-        ),
-    }
-
-    try:
-        _coinglass_all_4h_total_save(state)
-    except Exception as exc:
-        print(
-            f"[COINGLASS ALL 4H TOTAL SAVE ERROR] {exc}",
-            flush=True,
-        )
-        return jsonify({
-            "ok": False,
-            "error": "save_failed",
-        }), 500
-
-    print(
-        "[COINGLASS ALL 4H TOTAL UPDATE] "
-        f"LONG={long_value:.2f} SHORT={short_value:.2f} "
-        f"GAP={difference:.2f} SIGNAL={signal}",
-        flush=True,
-    )
-
-    return jsonify({
-        "ok": True,
-        **state,
-        "pushover": False,
-    }), 200
-
-
-@app.get("/coinglass-liquidation-value-4h-total-data")
-def coinglass_liquidation_value_4h_total_data():
-    return jsonify({
-        "ok": True,
-        **_coinglass_all_4h_total_load(),
-    })
-
-
 # COINGLASS LIQUIDATION VALUE DASHBOARD — FINAL 4H
 # FINAL 7 ONLY: BTC, ETH, SOL, XRP, NEAR, XAU, DOGE.
 # DATA ONLY: these routes NEVER send Pushover.
@@ -5875,68 +5672,6 @@ def coinglass_liquidation_value_4h_webhook():
             "error": "save_failed",
         }), 500
 
-    # OPTIONAL ALL-MARKET 4H TOTAL CARD.
-    # Important: a parser miss here must NEVER break the existing FINAL7 feed.
-    total_raw = data.get("total_4h")
-    if isinstance(total_raw, dict):
-        try:
-            total_long = float(total_raw.get("long"))
-            total_short = float(total_raw.get("short"))
-            total_rekt_raw = total_raw.get("rekt")
-            total_rekt = (
-                float(total_rekt_raw)
-                if total_rekt_raw is not None
-                else total_long + total_short
-            )
-
-            if total_long >= 0 and total_short >= 0 and total_rekt >= 0:
-                total_gap = abs(total_long - total_short)
-                if total_long > total_short:
-                    total_stronger = "LONG"
-                elif total_short > total_long:
-                    total_stronger = "SHORT"
-                else:
-                    total_stronger = "EQUAL"
-
-                if (
-                    total_short - total_long
-                    >= COINGLASS_ALL_4H_TOTAL_MIN_GAP
-                ):
-                    total_signal = "BUY"
-                elif (
-                    total_long - total_short
-                    >= COINGLASS_ALL_4H_TOTAL_MIN_GAP
-                ):
-                    total_signal = "SELL"
-                else:
-                    total_signal = "NONE"
-
-                total_state = {
-                    "long": total_long,
-                    "short": total_short,
-                    "rekt": total_rekt,
-                    "difference": total_gap,
-                    "stronger": total_stronger,
-                    "threshold": COINGLASS_ALL_4H_TOTAL_MIN_GAP,
-                    "signal": total_signal,
-                    "updated_at_utc": now_utc.isoformat(),
-                    "updated_at_ist": now_ist.strftime(
-                        "%d-%m-%Y %H:%M:%S"
-                    ),
-                }
-                _coinglass_all_4h_total_save(total_state)
-                print(
-                    "[COINGLASS ALL 4H TOTAL UPDATE] "
-                    f"LONG={total_long:.2f} SHORT={total_short:.2f} "
-                    f"GAP={total_gap:.2f} SIGNAL={total_signal}",
-                    flush=True,
-                )
-        except Exception as exc:
-            print(
-                f"[COINGLASS ALL 4H TOTAL IGNORED] {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-
     print(
         "[COINGLASS VALUE 4H DASHBOARD UPDATE] "
         + ", ".join(
@@ -5965,7 +5700,6 @@ def coinglass_liquidation_value_4h_data():
     return jsonify({
         "ok": True,
         **state,
-        "total_4h": _coinglass_all_4h_total_load(),
         "alert_engine_4h": engine,
     })
 
@@ -5999,15 +5733,6 @@ h1 { text-align: center; margin: 0 0 6px; font-size: 28px; }
     padding: 11px; text-align: center; color: #8b949e; line-height: 1.5; font-size: 13px;
 }
 .status-box strong { color: #f0f6fc; }
-.total-card {
-    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-    padding: 14px; margin-bottom: 14px;
-}
-.total-head { display:flex; justify-content:space-between; align-items:center; gap:12px; font-weight:900; margin-bottom:10px; }
-.total-grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px 14px; }
-.total-metric { display:flex; justify-content:space-between; gap:10px; border-top:1px solid #30363d; padding-top:8px; font-size:13px; }
-.total-metric span:first-child { color:#8b949e; }
-@media (max-width: 720px) { .total-grid { grid-template-columns:1fr 1fr; } }
 .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; min-width: 780px; }
 th { background: #21262d; padding: 13px 8px; font-size: 12px; white-space: nowrap; }
@@ -6050,7 +5775,6 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
 <div class="container">
     <h1>COINGLASS LIQUIDATION VALUE — FINAL 4H</h1>
     <div class="subtitle">
-        ALL MARKET 4H TOTAL: minimum gap $1.00M<br>
         BTC / ETH / SOL: minimum gap $1M<br>
         XRP / NEAR / XAU / DOGE: minimum gap $100K<br>
         SHORT &gt; LONG = BUY • LONG &gt; SHORT = SELL • Strict BUY → SELL → BUY
@@ -6066,23 +5790,6 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
             <strong>4H ALERT ENGINE</strong><br>
             <span id="engineUpdated">--</span><br>
             <span id="engineAge">--</span>
-        </div>
-    </div>
-
-    <div class="total-card">
-        <div class="total-head">
-            <span>ALL MARKET — TOTAL LIQUIDATIONS 4H</span>
-            <span id="totalSignal" class="none">--</span>
-        </div>
-        <div class="total-grid">
-            <div class="total-metric"><span>LONG</span><strong id="totalLong">--</strong></div>
-            <div class="total-metric"><span>SHORT</span><strong id="totalShort">--</strong></div>
-            <div class="total-metric"><span>GAP</span><strong id="totalGap">--</strong></div>
-            <div class="total-metric"><span>MIN GAP</span><strong>$1.00M</strong></div>
-            <div class="total-metric"><span>DOM</span><strong id="totalDom">--</strong></div>
-            <div class="total-metric"><span>LAST</span><strong id="totalLast">--</strong></div>
-            <div class="total-metric"><span>UPDATED</span><strong id="totalUpdated">--</strong></div>
-            <div class="total-metric"><span>STATUS</span><strong id="totalAge">--</strong></div>
         </div>
     </div>
 
@@ -6188,39 +5895,6 @@ async function refresh() {
         const ea = ageInfo(engine.heartbeat_at_utc);
         document.getElementById('engineAge').textContent = ea.text;
         document.getElementById('engineAge').className = ea.cls;
-
-        const total = d.total_4h && typeof d.total_4h === 'object'
-            ? d.total_4h
-            : null;
-
-        if (
-            total &&
-            total.long !== null &&
-            total.short !== null &&
-            Number.isFinite(Number(total.long)) &&
-            Number.isFinite(Number(total.short))
-        ) {
-            const tsig = String(total.signal || 'NONE').toUpperCase();
-            const tdom = String(total.stronger || 'EQUAL').toUpperCase();
-            const tage = ageInfo(total.updated_at_utc);
-
-            document.getElementById('totalLong').textContent = money(total.long);
-            document.getElementById('totalShort').textContent = money(total.short);
-            document.getElementById('totalGap').textContent = money(total.difference);
-            document.getElementById('totalGap').className = gapClass(tdom);
-            document.getElementById('totalDom').textContent = tdom;
-            document.getElementById('totalDom').className =
-                tdom === 'SHORT' ? 'buy' : tdom === 'LONG' ? 'sell' : 'equal';
-            document.getElementById('totalSignal').textContent = tsig;
-            document.getElementById('totalSignal').className = signalClass(tsig);
-            document.getElementById('totalLast').innerHTML = lastAlert(engine, 'ALL');
-            document.getElementById('totalUpdated').textContent = total.updated_at_ist || '--';
-            document.getElementById('totalAge').textContent = tage.text;
-            document.getElementById('totalAge').className = tage.cls;
-        } else {
-            document.getElementById('totalAge').textContent = 'NO DATA';
-            document.getElementById('totalAge').className = 'stale';
-        }
 
         if (!assets.length) return;
 
