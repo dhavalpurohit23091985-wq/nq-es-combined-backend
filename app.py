@@ -5692,6 +5692,122 @@ def coinglass_liquidation_value_4h_webhook():
     }), 200
 
 
+# ============================================================
+# TRADINGVIEW CRYPTOCAP:TOTAL — 4H LEGEND CHANGE +/-10B
+# Telemetry only. Existing CoinGlass FINAL7 remains untouched.
+# Pushover is sent by the TradingView Tampermonkey userscript only.
+# ============================================================
+
+TRADINGVIEW_TOTAL_4H_STATE_FILE = os.path.join(
+    "/tmp", "tradingview_total_4h_value.json"
+)
+TRADINGVIEW_TOTAL_4H_LOCK = threading.Lock()
+
+
+def _tradingview_total_4h_load():
+    try:
+        with TRADINGVIEW_TOTAL_4H_LOCK:
+            with open(TRADINGVIEW_TOTAL_4H_STATE_FILE, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        if isinstance(payload, dict):
+            return payload
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print("[TV TOTAL 4H STATE READ ERROR] " + str(exc), flush=True)
+    return {
+        "open_display": None,
+        "close_display": None,
+        "change_b": None,
+        "change_text": None,
+        "signal": "WAITING",
+        "updated_at_utc": None,
+        "updated_at_ist": None,
+        "last_alert_signal": None,
+        "last_alert_ist": None,
+    }
+
+
+def _tradingview_total_4h_save(payload):
+    temp = (TRADINGVIEW_TOTAL_4H_STATE_FILE +
+            f".{os.getpid()}.{threading.get_ident()}.tmp")
+    with TRADINGVIEW_TOTAL_4H_LOCK:
+        try:
+            with open(temp, "w", encoding="utf-8") as file:
+                json.dump(payload, file, separators=(",", ":"), sort_keys=True)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp, TRADINGVIEW_TOTAL_4H_STATE_FILE)
+        finally:
+            try:
+                if os.path.exists(temp):
+                    os.remove(temp)
+            except OSError:
+                pass
+
+
+@app.post("/tradingview-total-4h-webhook")
+def tradingview_total_4h_webhook():
+    secret = request.args.get("secret", "")
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    incoming = request.get_json(silent=True)
+    if not isinstance(incoming, dict):
+        return jsonify({"ok": False, "error": "json_object_required"}), 400
+
+    if incoming.get("symbol") != "CRYPTOCAP:TOTAL" or incoming.get("timeframe") != "4h":
+        return jsonify({"ok": False, "error": "wrong_symbol_or_timeframe"}), 422
+
+    try:
+        change_b = float(incoming["change_b"])
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return jsonify({"ok": False, "error": "invalid_change_b"}), 400
+
+    # Bound obviously corrupt readings (NaN/inf or impossible market-cap changes).
+    import math
+    if not math.isfinite(change_b) or abs(change_b) > 10000:
+        return jsonify({"ok": False, "error": "invalid_change_b"}), 400
+
+    open_text = str(incoming.get("open_display") or "")[:32]
+    close_text = str(incoming.get("close_display") or "")[:32]
+    change_text = str(incoming.get("change_text") or "")[:32]
+
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", open_text, flags=re.I):
+        return jsonify({"ok": False, "error": "bad_open"}), 400
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", close_text, flags=re.I):
+        return jsonify({"ok": False, "error": "bad_close"}), 400
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    # Signal is computed independently server-side from the reported legend change.
+    signal = "BUY" if change_b >= 10 else "SELL" if change_b <= -10 else "NONE"
+    last_alert_signal = str(incoming.get("last_alert_signal") or "").upper()
+    if last_alert_signal not in {"BUY", "SELL"}:
+        last_alert_signal = None
+    last_alert_ist = str(incoming.get("last_alert_ist") or "")[:32] or None
+
+    payload = {
+        "open_display": open_text,
+        "close_display": close_text,
+        "change_b": round(change_b, 6),
+        "change_text": change_text,
+        "signal": signal,
+        "updated_at_utc": now_utc.isoformat(),
+        "updated_at_ist": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+        "last_alert_signal": last_alert_signal,
+        "last_alert_ist": last_alert_ist,
+    }
+    try:
+        _tradingview_total_4h_save(payload)
+    except Exception as exc:
+        print("[TV TOTAL 4H STATE WRITE ERROR] " + str(exc), flush=True)
+        return jsonify({"ok": False, "error": "save_failed"}), 500
+
+    return jsonify({"ok": True, "signal": signal, "pushover": False}), 200
+
+
 @app.get("/coinglass-liquidation-value-4h-data")
 def coinglass_liquidation_value_4h_data():
     state = _coinglass_value_4h_dashboard_load()
@@ -5701,6 +5817,7 @@ def coinglass_liquidation_value_4h_data():
         "ok": True,
         **state,
         "alert_engine_4h": engine,
+        "tradingview_total_4h": _tradingview_total_4h_load(),
     })
 
 
@@ -5751,6 +5868,25 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
 .live { color: #3fb950; font-weight: 900; }
 .stale { color: #f85149; font-weight: 900; }
 .footer { text-align: center; color: #8b949e; font-size: 12px; line-height: 1.6; margin-top: 14px; }
+
+/* TradingView TOTAL card appears above the seven CoinGlass coin cards. */
+.tv-total-card {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 12px; padding: 14px; margin-bottom: 14px;
+}
+.tv-total-head { display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; font-weight: 900; font-size: 18px; margin-bottom: 12px; }
+.tv-total-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
+.tv-total-metric { display: flex; justify-content: space-between; gap: 10px;
+    padding-bottom: 8px; border-bottom: 1px solid #30363d; font-size: 14px; }
+.tv-total-metric span { color: #8b949e; }
+.tv-total-metric strong { text-align: right; }
+.tv-total-caption { color: #8b949e; font-size: 12px; line-height: 1.5; margin-top: 12px; }
+@media (max-width: 720px) {
+    .tv-total-head { font-size: 16px; }
+    .tv-total-metric { font-size: 12px; }
+    .tv-total-metrics { gap: 10px; }
+}
 .mobile-list { display: none; }
 @media (max-width: 720px) {
     body { padding: 10px; }
@@ -5791,6 +5927,22 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
             <span id="engineUpdated">--</span><br>
             <span id="engineAge">--</span>
         </div>
+    </div>
+
+    <div class="tv-total-card" id="tvTotalCard">
+        <div class="tv-total-head">
+            <span>TRADINGVIEW TOTAL — 4H</span>
+            <span id="tvTotalSignal" class="none">WAITING</span>
+        </div>
+        <div class="tv-total-metrics">
+            <div class="tv-total-metric"><span>OPEN</span><strong id="tvTotalOpen">--</strong></div>
+            <div class="tv-total-metric"><span>CURRENT</span><strong id="tvTotalCurrent">--</strong></div>
+            <div class="tv-total-metric"><span>CHANGE</span><strong id="tvTotalChange">--</strong></div>
+            <div class="tv-total-metric"><span>TRIGGER</span><strong>±$10B</strong></div>
+            <div class="tv-total-metric"><span>LAST ALERT</span><strong id="tvTotalLast">--</strong></div>
+            <div class="tv-total-metric"><span>STATUS</span><strong id="tvTotalStatus" class="stale">WAITING</strong></div>
+        </div>
+        <div class="tv-total-caption">Source: TradingView CRYPTOCAP:TOTAL 4H chart legend change • +10B BUY / −10B SELL. Display only; Pushover sent by Tampermonkey.</div>
     </div>
 
     <div class="card desktop-card">
@@ -5879,12 +6031,40 @@ function lastAlert(engine, symbol) {
     const sig = String(x.signal || "--").toUpperCase();
     return '<span class="' + signalClass(sig) + '">' + esc(sig) + '</span> • ' + esc(compactTime(x.sent_at_ist));
 }
+function renderTradingViewTotal(t) {
+    t = t && typeof t === 'object' ? t : {};
+    const status = document.getElementById('tvTotalStatus');
+    const time = t.updated_at_utc ? new Date(t.updated_at_utc).getTime() : NaN;
+    const elapsed = Number.isFinite(time) ? Math.max(0, (Date.now() - time)/60000) : null;
+    const fresh = elapsed !== null && elapsed < 1;
+    const sig = fresh ? String(t.signal || 'NONE').toUpperCase() : 'WAITING';
+    const sigEl = document.getElementById('tvTotalSignal');
+    sigEl.textContent = sig;
+    sigEl.className = signalClass(sig);
+    // Don't present old prices or a stale BUY/SELL signal as live.
+    document.getElementById('tvTotalOpen').textContent = fresh ? String(t.open_display || '--') : '--';
+    document.getElementById('tvTotalCurrent').textContent = fresh ? String(t.close_display || '--') : '--';
+    const ch = document.getElementById('tvTotalChange');
+    ch.textContent = fresh && Number.isFinite(Number(t.change_b))
+        ? (Number(t.change_b) >= 0 ? '+' : '') + Number(t.change_b).toFixed(2) + 'B'
+        : '--';
+    ch.className = fresh ? (Number(t.change_b) >= 0 ? 'buy' : 'sell') : 'none';
+    const last = t.last_alert_signal === 'BUY' || t.last_alert_signal === 'SELL'
+        ? t.last_alert_signal + (t.last_alert_ist ? ' • ' + t.last_alert_ist : '')
+        : '--';
+    document.getElementById('tvTotalLast').textContent = last;
+    status.textContent = elapsed === null ? 'WAITING FOR TV FEED'
+        : (fresh ? 'LIVE ✅ • ' : 'STALE ❌ • ') + elapsed.toFixed(1) + ' min';
+    status.className = fresh ? 'live' : 'stale';
+}
+
 async function refresh() {
     try {
         const r = await fetch('/coinglass-liquidation-value-4h-data?ts=' + Date.now(), {cache:'no-store'});
         const d = await r.json();
         const assets = Array.isArray(d.assets) ? d.assets : [];
         const engine = d.alert_engine_4h && typeof d.alert_engine_4h === 'object' ? d.alert_engine_4h : {};
+        renderTradingViewTotal(d.tradingview_total_4h);
 
         document.getElementById('updated').textContent = d.updated_at_ist || '--';
         const fa = ageInfo(d.updated_at_utc);
