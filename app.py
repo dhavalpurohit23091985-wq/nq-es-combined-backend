@@ -10155,4 +10155,4 @@ def _start_coinglass_feed_watchdog():
     thread.start()
 
 
-_start_coinglass_feed_watchdog()
+# _start_coinglass_feed_watchdog()
