@@ -5930,7 +5930,7 @@ def tradingview_xaut_4h_data():
 
 
 # ============================================================
-# TRADINGVIEW CRYPTOCAP:QQQB — 4H LEGEND CHANGE +/-10K
+# TRADINGVIEW CRYPTOCAP:QQQB — 4H LEGEND CHANGE +/-100K
 # Dashboard telemetry only; Tampermonkey sends Pushover independently.
 # This does not change the CoinGlass FINAL7 or TOTAL feed/alert logic.
 # ============================================================
@@ -6018,7 +6018,7 @@ def tradingview_qqqb_4h_webhook():
 
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
-    signal = "BUY" if change_k >= 10 else "SELL" if change_k <= -10 else "NONE"
+    signal = "BUY" if change_k >= 100 else "SELL" if change_k <= -100 else "NONE"
     last_alert_signal = str(incoming.get("last_alert_signal") or "").upper()
     if last_alert_signal not in {"BUY", "SELL"}:
         last_alert_signal = None
@@ -6214,11 +6214,11 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
             <div class="tv-total-metric"><span>OPEN</span><strong id="tvQqqbOpen">--</strong></div>
             <div class="tv-total-metric"><span>CURRENT</span><strong id="tvQqqbCurrent">--</strong></div>
             <div class="tv-total-metric"><span>CHANGE</span><strong id="tvQqqbChange">--</strong></div>
-            <div class="tv-total-metric"><span>TRIGGER</span><strong>±$10K</strong></div>
+            <div class="tv-total-metric"><span>TRIGGER</span><strong>±$100K</strong></div>
             <div class="tv-total-metric"><span>LAST ALERT</span><strong id="tvQqqbLast">--</strong></div>
             <div class="tv-total-metric"><span>STATUS</span><strong id="tvQqqbStatus" class="stale">WAITING</strong></div>
         </div>
-        <div class="tv-total-caption">Source: TradingView CRYPTOCAP:QQQB 4H displayed legend change • +10K BUY / −10K SELL. Display only; Pushover sent by Tampermonkey. The legend change may use previous candle close, not exact current candle open.</div>
+        <div class="tv-total-caption">Source: TradingView CRYPTOCAP:QQQB 4H displayed legend change • +100K BUY / −100K SELL. Display only; Pushover sent by Tampermonkey. The legend change may use previous candle close, not exact current candle open.</div>
     </div>
 
     <div class="card desktop-card">
