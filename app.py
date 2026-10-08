@@ -5808,6 +5808,127 @@ def tradingview_total_4h_webhook():
     return jsonify({"ok": True, "signal": signal, "pushover": False}), 200
 
 
+# ============================================================
+# TRADINGVIEW CRYPTOCAP:XAUT — 4H LEGEND CHANGE +/-10M
+# Dashboard telemetry only; Tampermonkey sends Pushover independently.
+# This does not change the CoinGlass FINAL7 or TOTAL feed/alert logic.
+# ============================================================
+
+TRADINGVIEW_XAUT_4H_STATE_FILE = os.path.join(
+    "/tmp", "tradingview_xaut_4h_value.json"
+)
+TRADINGVIEW_XAUT_4H_LOCK = threading.Lock()
+
+
+def _tradingview_xaut_4h_load():
+    try:
+        with TRADINGVIEW_XAUT_4H_LOCK:
+            with open(TRADINGVIEW_XAUT_4H_STATE_FILE, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        if isinstance(payload, dict):
+            return payload
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print("[TV XAUT 4H STATE READ ERROR] " + str(exc), flush=True)
+    return {
+        "open_display": None,
+        "close_display": None,
+        "change_m": None,
+        "change_text": None,
+        "signal": "WAITING",
+        "updated_at_utc": None,
+        "updated_at_ist": None,
+        "last_alert_signal": None,
+        "last_alert_ist": None,
+    }
+
+
+def _tradingview_xaut_4h_save(payload):
+    temp = (TRADINGVIEW_XAUT_4H_STATE_FILE +
+            f".{os.getpid()}.{threading.get_ident()}.tmp")
+    with TRADINGVIEW_XAUT_4H_LOCK:
+        try:
+            with open(temp, "w", encoding="utf-8") as file:
+                json.dump(payload, file, separators=(",", ":"), sort_keys=True)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp, TRADINGVIEW_XAUT_4H_STATE_FILE)
+        finally:
+            try:
+                if os.path.exists(temp):
+                    os.remove(temp)
+            except OSError:
+                pass
+
+
+@app.post("/tradingview-xaut-4h-webhook")
+def tradingview_xaut_4h_webhook():
+    # Unlike older feed endpoints, keep the secret out of the URL/query logs.
+    import hmac
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if not WEBHOOK_SECRET or not hmac.compare_digest(secret, WEBHOOK_SECRET):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    incoming = request.get_json(silent=True)
+    if not isinstance(incoming, dict):
+        return jsonify({"ok": False, "error": "json_object_required"}), 400
+
+    if incoming.get("symbol") != "CRYPTOCAP:XAUT" or incoming.get("timeframe") != "4h":
+        return jsonify({"ok": False, "error": "wrong_symbol_or_timeframe"}), 422
+
+    try:
+        change_m = float(incoming["change_m"])
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return jsonify({"ok": False, "error": "invalid_change_m"}), 400
+
+    import math
+    if not math.isfinite(change_m) or abs(change_m) > 1000000:
+        return jsonify({"ok": False, "error": "invalid_change_m"}), 400
+
+    open_text = str(incoming.get("open_display") or "")[:32]
+    close_text = str(incoming.get("close_display") or "")[:32]
+    change_text = str(incoming.get("change_text") or "")[:32]
+
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", open_text, flags=re.I):
+        return jsonify({"ok": False, "error": "bad_open"}), 400
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", close_text, flags=re.I):
+        return jsonify({"ok": False, "error": "bad_close"}), 400
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+    signal = "BUY" if change_m >= 10 else "SELL" if change_m <= -10 else "NONE"
+    last_alert_signal = str(incoming.get("last_alert_signal") or "").upper()
+    if last_alert_signal not in {"BUY", "SELL"}:
+        last_alert_signal = None
+    last_alert_ist = str(incoming.get("last_alert_ist") or "")[:40] or None
+
+    payload = {
+        "open_display": open_text,
+        "close_display": close_text,
+        "change_m": round(change_m, 6),
+        "change_text": change_text,
+        "signal": signal,
+        "updated_at_utc": now_utc.isoformat(),
+        "updated_at_ist": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+        "last_alert_signal": last_alert_signal,
+        "last_alert_ist": last_alert_ist,
+    }
+
+    try:
+        _tradingview_xaut_4h_save(payload)
+    except Exception as exc:
+        print("[TV XAUT 4H STATE WRITE ERROR] " + str(exc), flush=True)
+        return jsonify({"ok": False, "error": "save_failed"}), 500
+
+    return jsonify({"ok": True, "signal": signal, "pushover": False}), 200
+
+
+@app.get("/tradingview-xaut-4h-data")
+def tradingview_xaut_4h_data():
+    return jsonify({"ok": True, **_tradingview_xaut_4h_load()})
+
+
 @app.get("/coinglass-liquidation-value-4h-data")
 def coinglass_liquidation_value_4h_data():
     state = _coinglass_value_4h_dashboard_load()
@@ -5818,6 +5939,7 @@ def coinglass_liquidation_value_4h_data():
         **state,
         "alert_engine_4h": engine,
         "tradingview_total_4h": _tradingview_total_4h_load(),
+        "tradingview_xaut_4h": _tradingview_xaut_4h_load(),
     })
 
 
@@ -5945,6 +6067,22 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
         <div class="tv-total-caption">Source: TradingView CRYPTOCAP:TOTAL 4H chart legend change • +10B BUY / −10B SELL. Display only; Pushover sent by Tampermonkey.</div>
     </div>
 
+    <div class="tv-total-card" id="tvXautCard">
+        <div class="tv-total-head">
+            <span>TRADINGVIEW XAUT — 4H</span>
+            <span id="tvXautSignal" class="none">WAITING</span>
+        </div>
+        <div class="tv-total-metrics">
+            <div class="tv-total-metric"><span>OPEN</span><strong id="tvXautOpen">--</strong></div>
+            <div class="tv-total-metric"><span>CURRENT</span><strong id="tvXautCurrent">--</strong></div>
+            <div class="tv-total-metric"><span>CHANGE</span><strong id="tvXautChange">--</strong></div>
+            <div class="tv-total-metric"><span>TRIGGER</span><strong>±$10M</strong></div>
+            <div class="tv-total-metric"><span>LAST ALERT</span><strong id="tvXautLast">--</strong></div>
+            <div class="tv-total-metric"><span>STATUS</span><strong id="tvXautStatus" class="stale">WAITING</strong></div>
+        </div>
+        <div class="tv-total-caption">Source: TradingView CRYPTOCAP:XAUT 4H displayed legend change • +10M BUY / −10M SELL. Display only; Pushover sent by Tampermonkey. The legend change may use previous candle close, not exact current candle open.</div>
+    </div>
+
     <div class="card desktop-card">
         <table>
             <thead>
@@ -6058,6 +6196,32 @@ function renderTradingViewTotal(t) {
     status.className = fresh ? 'live' : 'stale';
 }
 
+function renderTradingViewXaut(t) {
+    t = t && typeof t === 'object' ? t : {};
+    const time = t.updated_at_utc ? new Date(t.updated_at_utc).getTime() : NaN;
+    const elapsed = Number.isFinite(time) ? Math.max(0, (Date.now() - time)/60000) : null;
+    const fresh = elapsed !== null && elapsed < 1;
+    const sig = fresh ? String(t.signal || 'NONE').toUpperCase() : 'WAITING';
+    const sigEl = document.getElementById('tvXautSignal');
+    sigEl.textContent = sig;
+    sigEl.className = signalClass(sig);
+    document.getElementById('tvXautOpen').textContent = fresh ? String(t.open_display || '--') : '--';
+    document.getElementById('tvXautCurrent').textContent = fresh ? String(t.close_display || '--') : '--';
+    const changeEl = document.getElementById('tvXautChange');
+    changeEl.textContent = fresh && Number.isFinite(Number(t.change_m))
+        ? (Number(t.change_m) >= 0 ? '+' : '') + Number(t.change_m).toFixed(2) + 'M'
+        : '--';
+    changeEl.className = fresh ? (Number(t.change_m) >= 0 ? 'buy' : 'sell') : 'none';
+    const last = t.last_alert_signal === 'BUY' || t.last_alert_signal === 'SELL'
+        ? t.last_alert_signal + (t.last_alert_ist ? ' • ' + t.last_alert_ist : '')
+        : '--';
+    document.getElementById('tvXautLast').textContent = last;
+    const status = document.getElementById('tvXautStatus');
+    status.textContent = elapsed === null ? 'WAITING FOR XAUT FEED'
+        : (fresh ? 'LIVE ✅ • ' : 'STALE ❌ • ') + elapsed.toFixed(1) + ' min';
+    status.className = fresh ? 'live' : 'stale';
+}
+
 async function refresh() {
     try {
         const r = await fetch('/coinglass-liquidation-value-4h-data?ts=' + Date.now(), {cache:'no-store'});
@@ -6065,6 +6229,7 @@ async function refresh() {
         const assets = Array.isArray(d.assets) ? d.assets : [];
         const engine = d.alert_engine_4h && typeof d.alert_engine_4h === 'object' ? d.alert_engine_4h : {};
         renderTradingViewTotal(d.tradingview_total_4h);
+        renderTradingViewXaut(d.tradingview_xaut_4h);
 
         document.getElementById('updated').textContent = d.updated_at_ist || '--';
         const fa = ageInfo(d.updated_at_utc);
