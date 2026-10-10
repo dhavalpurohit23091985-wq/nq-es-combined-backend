@@ -5773,9 +5773,9 @@ def tradingview_total_4h_webhook():
     close_text = str(incoming.get("close_display") or "")[:32]
     change_text = str(incoming.get("change_text") or "")[:32]
 
-    if not re.fullmatch(r"[0-9][0-9,.]*(?:\s*[TBMK])?", open_text, flags=re.I):
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", open_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_open"}), 400
-    if not re.fullmatch(r"[0-9][0-9,.]*(?:\s*[TBMK])?", close_text, flags=re.I):
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", close_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_close"}), 400
 
     now_utc = datetime.now(timezone.utc)
@@ -5890,9 +5890,9 @@ def tradingview_xaut_4h_webhook():
     close_text = str(incoming.get("close_display") or "")[:32]
     change_text = str(incoming.get("change_text") or "")[:32]
 
-    if not re.fullmatch(r"[0-9][0-9,.]*(?:\s*[TBMK])?", open_text, flags=re.I):
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", open_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_open"}), 400
-    if not re.fullmatch(r"[0-9][0-9,.]*(?:\s*[TBMK])?", close_text, flags=re.I):
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", close_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_close"}), 400
 
     now_utc = datetime.now(timezone.utc)
@@ -5930,32 +5930,32 @@ def tradingview_xaut_4h_data():
 
 
 # ============================================================
-# TRADINGVIEW CRYPTOCAP:QQQB — 4H LEGEND CHANGE +/-100K
+# TRADINGVIEW NASDAQ:QQQ — 4H LEGEND CHANGE +/-10K
 # Dashboard telemetry only; Tampermonkey sends Pushover independently.
 # This does not change the CoinGlass FINAL7 or TOTAL feed/alert logic.
 # ============================================================
 
-TRADINGVIEW_QQQB_4H_STATE_FILE = os.path.join(
-    "/tmp", "tradingview_qqqb_4h_value.json"
+TRADINGVIEW_QQQ_4H_STATE_FILE = os.path.join(
+    "/tmp", "tradingview_qqq_4h_value.json"
 )
-TRADINGVIEW_QQQB_4H_LOCK = threading.Lock()
+TRADINGVIEW_QQQ_4H_LOCK = threading.Lock()
 
 
-def _tradingview_qqqb_4h_load():
+def _tradingview_qqq_4h_load():
     try:
-        with TRADINGVIEW_QQQB_4H_LOCK:
-            with open(TRADINGVIEW_QQQB_4H_STATE_FILE, "r", encoding="utf-8") as file:
+        with TRADINGVIEW_QQQ_4H_LOCK:
+            with open(TRADINGVIEW_QQQ_4H_STATE_FILE, "r", encoding="utf-8") as file:
                 payload = json.load(file)
         if isinstance(payload, dict):
             return payload
     except FileNotFoundError:
         pass
     except Exception as exc:
-        print("[TV QQQB 4H STATE READ ERROR] " + str(exc), flush=True)
+        print("[TV QQQ 4H STATE READ ERROR] " + str(exc), flush=True)
     return {
         "open_display": None,
         "close_display": None,
-        "change_k": None,
+        "change_usd": None,
         "change_text": None,
         "signal": "WAITING",
         "updated_at_utc": None,
@@ -5965,16 +5965,16 @@ def _tradingview_qqqb_4h_load():
     }
 
 
-def _tradingview_qqqb_4h_save(payload):
-    temp = (TRADINGVIEW_QQQB_4H_STATE_FILE +
+def _tradingview_qqq_4h_save(payload):
+    temp = (TRADINGVIEW_QQQ_4H_STATE_FILE +
             f".{os.getpid()}.{threading.get_ident()}.tmp")
-    with TRADINGVIEW_QQQB_4H_LOCK:
+    with TRADINGVIEW_QQQ_4H_LOCK:
         try:
             with open(temp, "w", encoding="utf-8") as file:
                 json.dump(payload, file, separators=(",", ":"), sort_keys=True)
                 file.flush()
                 os.fsync(file.fileno())
-            os.replace(temp, TRADINGVIEW_QQQB_4H_STATE_FILE)
+            os.replace(temp, TRADINGVIEW_QQQ_4H_STATE_FILE)
         finally:
             try:
                 if os.path.exists(temp):
@@ -5983,8 +5983,8 @@ def _tradingview_qqqb_4h_save(payload):
                 pass
 
 
-@app.post("/tradingview-qqqb-4h-webhook")
-def tradingview_qqqb_4h_webhook():
+@app.post("/tradingview-qqq-4h-webhook")
+def tradingview_qqq_4h_webhook():
     # Unlike older feed endpoints, keep the secret out of the URL/query logs.
     import hmac
     secret = request.headers.get("X-Webhook-Secret", "")
@@ -5995,30 +5995,30 @@ def tradingview_qqqb_4h_webhook():
     if not isinstance(incoming, dict):
         return jsonify({"ok": False, "error": "json_object_required"}), 400
 
-    if incoming.get("symbol") != "CRYPTOCAP:QQQB" or incoming.get("timeframe") != "4h":
+    if incoming.get("symbol") != "NASDAQ:QQQ" or incoming.get("timeframe") != "4h":
         return jsonify({"ok": False, "error": "wrong_symbol_or_timeframe"}), 422
 
     try:
-        change_k = float(incoming["change_k"])
+        change_usd = float(incoming["change_usd"])
     except (TypeError, ValueError, KeyError, OverflowError):
-        return jsonify({"ok": False, "error": "invalid_change_k"}), 400
+        return jsonify({"ok": False, "error": "invalid_change_usd"}), 400
 
     import math
-    if not math.isfinite(change_k) or abs(change_k) > 1000000000:
-        return jsonify({"ok": False, "error": "invalid_change_k"}), 400
+    if not math.isfinite(change_usd) or abs(change_usd) > 1000000000:
+        return jsonify({"ok": False, "error": "invalid_change_usd"}), 400
 
     open_text = str(incoming.get("open_display") or "")[:32]
     close_text = str(incoming.get("close_display") or "")[:32]
     change_text = str(incoming.get("change_text") or "")[:32]
 
-    if not re.fullmatch(r"[0-9][0-9,.]*(?:\s*[TBMK])?", open_text, flags=re.I):
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]?", open_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_open"}), 400
-    if not re.fullmatch(r"[0-9][0-9,.]*(?:\s*[TBMK])?", close_text, flags=re.I):
+    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]?", close_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_close"}), 400
 
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
-    signal = "BUY" if change_k >= 100 else "SELL" if change_k <= -100 else "NONE"
+    signal = "NONE"  # Pushover state is supplied by Tampermonkey; dashboard is display-only
     last_alert_signal = str(incoming.get("last_alert_signal") or "").upper()
     if last_alert_signal not in {"BUY", "SELL"}:
         last_alert_signal = None
@@ -6027,7 +6027,7 @@ def tradingview_qqqb_4h_webhook():
     payload = {
         "open_display": open_text,
         "close_display": close_text,
-        "change_k": round(change_k, 6),
+        "change_usd": round(change_usd, 6),
         "change_text": change_text,
         "signal": signal,
         "updated_at_utc": now_utc.isoformat(),
@@ -6037,17 +6037,17 @@ def tradingview_qqqb_4h_webhook():
     }
 
     try:
-        _tradingview_qqqb_4h_save(payload)
+        _tradingview_qqq_4h_save(payload)
     except Exception as exc:
-        print("[TV QQQB 4H STATE WRITE ERROR] " + str(exc), flush=True)
+        print("[TV QQQ 4H STATE WRITE ERROR] " + str(exc), flush=True)
         return jsonify({"ok": False, "error": "save_failed"}), 500
 
     return jsonify({"ok": True, "signal": signal, "pushover": False}), 200
 
 
-@app.get("/tradingview-qqqb-4h-data")
-def tradingview_qqqb_4h_data():
-    return jsonify({"ok": True, **_tradingview_qqqb_4h_load()})
+@app.get("/tradingview-qqq-4h-data")
+def tradingview_qqq_4h_data():
+    return jsonify({"ok": True, **_tradingview_qqq_4h_load()})
 
 
 @app.get("/coinglass-liquidation-value-4h-data")
@@ -6061,7 +6061,7 @@ def coinglass_liquidation_value_4h_data():
         "alert_engine_4h": engine,
         "tradingview_total_4h": _tradingview_total_4h_load(),
         "tradingview_xaut_4h": _tradingview_xaut_4h_load(),
-        "tradingview_qqqb_4h": _tradingview_qqqb_4h_load(),
+        "tradingview_qqq_4h": _tradingview_qqq_4h_load(),
     })
 
 
@@ -6205,20 +6205,20 @@ td { padding: 13px 8px; text-align: center; border-top: 1px solid #30363d; font-
         <div class="tv-total-caption">Source: TradingView CRYPTOCAP:XAUT 4H displayed legend change • +10M BUY / −10M SELL. Display only; Pushover sent by Tampermonkey. The legend change may use previous candle close, not exact current candle open.</div>
     </div>
 
-    <div class="tv-total-card" id="tvQqqbCard">
+    <div class="tv-total-card" id="tvQqqCard">
         <div class="tv-total-head">
-            <span>TRADINGVIEW QQQB — 4H</span>
-            <span id="tvQqqbSignal" class="none">WAITING</span>
+            <span>TRADINGVIEW QQQ — 4H</span>
+            <span id="tvQqqSignal" class="none">WAITING</span>
         </div>
         <div class="tv-total-metrics">
-            <div class="tv-total-metric"><span>OPEN</span><strong id="tvQqqbOpen">--</strong></div>
-            <div class="tv-total-metric"><span>CURRENT</span><strong id="tvQqqbCurrent">--</strong></div>
-            <div class="tv-total-metric"><span>CHANGE</span><strong id="tvQqqbChange">--</strong></div>
-            <div class="tv-total-metric"><span>TRIGGER</span><strong>±$100K</strong></div>
-            <div class="tv-total-metric"><span>LAST ALERT</span><strong id="tvQqqbLast">--</strong></div>
-            <div class="tv-total-metric"><span>STATUS</span><strong id="tvQqqbStatus" class="stale">WAITING</strong></div>
+            <div class="tv-total-metric"><span>OPEN</span><strong id="tvQqqOpen">--</strong></div>
+            <div class="tv-total-metric"><span>CURRENT</span><strong id="tvQqqCurrent">--</strong></div>
+            <div class="tv-total-metric"><span>CHANGE</span><strong id="tvQqqChange">--</strong></div>
+            <div class="tv-total-metric"><span>TRIGGER</span><strong>±$1</strong></div>
+            <div class="tv-total-metric"><span>LAST ALERT</span><strong id="tvQqqLast">--</strong></div>
+            <div class="tv-total-metric"><span>STATUS</span><strong id="tvQqqStatus" class="stale">WAITING</strong></div>
         </div>
-        <div class="tv-total-caption">Source: TradingView CRYPTOCAP:QQQB 4H displayed legend change • +100K BUY / −100K SELL. Display only; Pushover sent by Tampermonkey. The legend change may use previous candle close, not exact current candle open.</div>
+        <div class="tv-total-caption">Source: TradingView NASDAQ:QQQ 4H • OPEN-based ±$1 with $1 round grid • alternating BUY/SELL • Pushover by Tampermonkey.</div>
     </div>
 
     <div class="card desktop-card">
@@ -6360,28 +6360,28 @@ function renderTradingViewXaut(t) {
     status.className = fresh ? 'live' : 'stale';
 }
 
-function renderTradingViewQqqb(t) {
+function renderTradingViewQqq(t) {
     t = t && typeof t === 'object' ? t : {};
     const time = t.updated_at_utc ? new Date(t.updated_at_utc).getTime() : NaN;
     const elapsed = Number.isFinite(time) ? Math.max(0, (Date.now() - time)/60000) : null;
     const fresh = elapsed !== null && elapsed < 1;
     const sig = fresh ? String(t.signal || 'NONE').toUpperCase() : 'WAITING';
-    const sigEl = document.getElementById('tvQqqbSignal');
+    const sigEl = document.getElementById('tvQqqSignal');
     sigEl.textContent = sig;
     sigEl.className = signalClass(sig);
-    document.getElementById('tvQqqbOpen').textContent = fresh ? String(t.open_display || '--') : '--';
-    document.getElementById('tvQqqbCurrent').textContent = fresh ? String(t.close_display || '--') : '--';
-    const changeEl = document.getElementById('tvQqqbChange');
-    changeEl.textContent = fresh && Number.isFinite(Number(t.change_k))
-        ? (Number(t.change_k) >= 0 ? '+' : '') + Number(t.change_k).toFixed(2) + 'K'
+    document.getElementById('tvQqqOpen').textContent = fresh ? String(t.open_display || '--') : '--';
+    document.getElementById('tvQqqCurrent').textContent = fresh ? String(t.close_display || '--') : '--';
+    const changeEl = document.getElementById('tvQqqChange');
+    changeEl.textContent = fresh && Number.isFinite(Number(t.change_usd))
+        ? (Number(t.change_usd) >= 0 ? '+' : '') + Number(t.change_usd).toFixed(2) + ' USD'
         : '--';
-    changeEl.className = fresh ? (Number(t.change_k) >= 0 ? 'buy' : 'sell') : 'none';
+    changeEl.className = fresh ? (Number(t.change_usd) >= 0 ? 'buy' : 'sell') : 'none';
     const last = t.last_alert_signal === 'BUY' || t.last_alert_signal === 'SELL'
         ? t.last_alert_signal + (t.last_alert_ist ? ' • ' + t.last_alert_ist : '')
         : '--';
-    document.getElementById('tvQqqbLast').textContent = last;
-    const status = document.getElementById('tvQqqbStatus');
-    status.textContent = elapsed === null ? 'WAITING FOR QQQB FEED'
+    document.getElementById('tvQqqLast').textContent = last;
+    const status = document.getElementById('tvQqqStatus');
+    status.textContent = elapsed === null ? 'WAITING FOR QQQ FEED'
         : (fresh ? 'LIVE ✅ • ' : 'STALE ❌ • ') + elapsed.toFixed(1) + ' min';
     status.className = fresh ? 'live' : 'stale';
 }
@@ -6394,7 +6394,7 @@ async function refresh() {
         const engine = d.alert_engine_4h && typeof d.alert_engine_4h === 'object' ? d.alert_engine_4h : {};
         renderTradingViewTotal(d.tradingview_total_4h);
         renderTradingViewXaut(d.tradingview_xaut_4h);
-        renderTradingViewQqqb(d.tradingview_qqqb_4h);
+        renderTradingViewQqq(d.tradingview_qqq_4h);
 
         document.getElementById('updated').textContent = d.updated_at_ist || '--';
         const fa = ageInfo(d.updated_at_utc);
@@ -10155,4 +10155,4 @@ def _start_coinglass_feed_watchdog():
     thread.start()
 
 
-# _start_coinglass_feed_watchdog()
+_start_coinglass_feed_watchdog()
