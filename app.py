@@ -6346,10 +6346,12 @@ function renderTradingViewXaut(t) {
     document.getElementById('tvXautOpen').textContent = fresh ? String(t.open_display || '--') : '--';
     document.getElementById('tvXautCurrent').textContent = fresh ? String(t.close_display || '--') : '--';
     const changeEl = document.getElementById('tvXautChange');
-    changeEl.textContent = fresh && Number.isFinite(Number(t.change_m))
-        ? (Number(t.change_m) >= 0 ? '+' : '') + Number(t.change_m).toFixed(2) + 'M'
-        : '--';
-    changeEl.className = fresh ? (Number(t.change_m) >= 0 ? 'buy' : 'sell') : 'none';
+    // Display the exact TradingView XAUT legend CHANGE, not a rounded M value.
+    const exactChange = String(t.change_text || '').trim();
+    changeEl.textContent = fresh && exactChange ? exactChange : '--';
+    changeEl.className = fresh && exactChange
+        ? (/^[\-\u2212\u2013]/.test(exactChange) ? 'sell' : 'buy')
+        : 'none';
     const last = t.last_alert_signal === 'BUY' || t.last_alert_signal === 'SELL'
         ? t.last_alert_signal + (t.last_alert_ist ? ' • ' + t.last_alert_ist : '')
         : '--';
