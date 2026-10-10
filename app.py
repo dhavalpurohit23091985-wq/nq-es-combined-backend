@@ -6321,10 +6321,12 @@ function renderTradingViewTotal(t) {
     document.getElementById('tvTotalOpen').textContent = fresh ? String(t.open_display || '--') : '--';
     document.getElementById('tvTotalCurrent').textContent = fresh ? String(t.close_display || '--') : '--';
     const ch = document.getElementById('tvTotalChange');
-    ch.textContent = fresh && Number.isFinite(Number(t.change_b))
-        ? (Number(t.change_b) >= 0 ? '+' : '') + Number(t.change_b).toFixed(2) + 'B'
-        : '--';
-    ch.className = fresh ? (Number(t.change_b) >= 0 ? 'buy' : 'sell') : 'none';
+    // Show the source-provided change text without dashboard rounding.
+    const totalChangeText = String(t.change_text || '').trim();
+    ch.textContent = fresh && totalChangeText ? totalChangeText : '--';
+    ch.className = fresh && totalChangeText
+        ? (totalChangeText.startsWith('-') || totalChangeText.startsWith('−') ? 'sell' : 'buy')
+        : 'none';
     const last = t.last_alert_signal === 'BUY' || t.last_alert_signal === 'SELL'
         ? t.last_alert_signal + (t.last_alert_ist ? ' • ' + t.last_alert_ist : '')
         : '--';
