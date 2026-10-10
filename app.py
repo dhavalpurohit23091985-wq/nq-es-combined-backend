@@ -5773,9 +5773,9 @@ def tradingview_total_4h_webhook():
     close_text = str(incoming.get("close_display") or "")[:32]
     change_text = str(incoming.get("change_text") or "")[:32]
 
-    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", open_text, flags=re.I):
+    if not re.fullmatch(r"(?:[0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*[TBMK])?", open_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_open"}), 400
-    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", close_text, flags=re.I):
+    if not re.fullmatch(r"(?:[0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*[TBMK])?", close_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_close"}), 400
 
     now_utc = datetime.now(timezone.utc)
@@ -5890,9 +5890,9 @@ def tradingview_xaut_4h_webhook():
     close_text = str(incoming.get("close_display") or "")[:32]
     change_text = str(incoming.get("change_text") or "")[:32]
 
-    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", open_text, flags=re.I):
+    if not re.fullmatch(r"(?:[0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*[TBMK])?", open_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_open"}), 400
-    if not re.fullmatch(r"[0-9][0-9,.]*\s*[TBMK]", close_text, flags=re.I):
+    if not re.fullmatch(r"(?:[0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*[TBMK])?", close_text, flags=re.I):
         return jsonify({"ok": False, "error": "bad_close"}), 400
 
     now_utc = datetime.now(timezone.utc)
